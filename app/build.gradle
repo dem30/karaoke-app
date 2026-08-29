@@ -1,5 +1,6 @@
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
 }
 
 android {
@@ -27,16 +28,22 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 }
 
 dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.core:core:1.13.1")
-    // WebRTC: neu aichatvn2 dang dung thu vien nao (vd io.getstream:stream-webrtc-android,
-    // hoac org.webrtc:google-webrtc), them dong tuong ung o day sau khi copy code sang.
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // WebRTC: them khi vao Phase 5 (vd org.webrtc:google-webrtc:1.0.+)
+}
+
+// Fix xung dot 2 phien ban kotlin-stdlib (kotlin-stdlib 1.8.22 da gop san chuc nang cua
+// kotlin-stdlib-jdk7/jdk8 1.6.21 ma appcompat keo vao) - da xac nhan qua GitHub Actions.
 configurations.all {
     exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'
     exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
-}
-
 }
