@@ -34,4 +34,9 @@ dependencies {
     implementation("androidx.core:core:1.13.1")
     // WebRTC: neu aichatvn2 dang dung thu vien nao (vd io.getstream:stream-webrtc-android,
     // hoac org.webrtc:google-webrtc), them dong tuong ung o day sau khi copy code sang.
+configurations.all {
+    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'
+    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
+}
+
 }
