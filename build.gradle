@@ -1,0 +1,4 @@
+// Top-level build file. Chỉ khai báo version plugin dùng chung.
+plugins {
+    id("com.android.application") version "8.5.0" apply false
+}
