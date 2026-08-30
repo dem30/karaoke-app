@@ -4,6 +4,10 @@
 <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+<!-- ✅ MOI: bat buoc phai co de PlaybackCaptureService.acquireWakeLock() khong
+     bi throw SecurityException. Dung PARTIAL_WAKE_LOCK de giu CPU thuc khi
+     capture chay nen, khong lien quan gi toi man hinh. -->
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
 <!--  Can tren Android 13+ de notification cua PlaybackCaptureService hien
          ra duoc - chua xin runtime permission nay o Phase 1 (service van
          chay binh thuong khong co no, chi notification bi an)  -->

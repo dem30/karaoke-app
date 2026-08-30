@@ -24,23 +24,32 @@ import com.karaokeapp.audio.music.PlaybackCaptureService
 /**
  * Entry point tam thoi, chua co UI dep - chi du dung de test tung phase.
  *
- * Phase 1: nut "Test Capture" xin quyen RECORD_AUDIO -> xin quyen
- * MediaProjection (dialog he thong) -> start PlaybackCaptureService.
+ * ✅ CAP NHAT: khong con cho nguoi dung bam nut "Test Capture" nua - toan bo
+ * flow xin quyen (RECORD_AUDIO -> dialog MediaProjection he thong -> start
+ * PlaybackCaptureService) duoc tu dong kich hoat ngay trong onCreate(), moi
+ * lan mo app. Ly do: MediaProjection la loai quyen Android BAT BUOC nguoi
+ * dung phai tu tay bam dong y dialog he thong moi lan (khong co API nao cho
+ * phep app tu xin ngam quyen nay, day la co che chong app len quay man hinh
+ * cua chinh Android, khong lien quan gi toi code cua app). Vi vay day la muc
+ * tu dong hoa GAN NHAT co the dat duoc: "mo app la thay dialog xin quyen
+ * ngay", thay vi phai tim nut bam trong app truoc.
  *
- * Man hinh co 1 khung log cuon duoc + nut "Copy Log" - vi nguoi dung build
- * app qua GitHub Actions va chi thao tac tren dien thoai, khong co
- * adb/Logcat de xem log ngoai app.
- *
- * ✅ DEBUG: da them log chi tiet o CA 2 nhanh (thanh cong/tu choi) cua
- * screenCaptureLauncher, va log noi dung serviceIntent TRUOC khi goi
- * startForegroundService - de xac dinh chinh xac du lieu bi mat o dau neu
- * PlaybackCaptureService bao "Thieu resultCode/resultData".
+ * Nut "Test Capture" cu van duoc GIU LAI (doi ten thanh "Xin quyen lai") de
+ * nguoi dung chu dong bam lai neu vi ly do gi day flow tu dong luc mo app
+ * khong chay (vi du: nguoi dung tu choi quyen luc dau, hoac quay lai app
+ * sau khi service da bi OS kill va muon thu lai ma khong can khoi dong lai
+ * app).
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var logText: TextView
     private lateinit var logScrollView: ScrollView
+
+    // ✅ MOI: co danh dau da tu dong kich hoat flow xin quyen trong lan
+    // onCreate() nay chua - tranh goi lai nhieu lan neu onCreate() bi goi lai
+    // (vi du xoay man hinh) trong khi flow dang cho ket qua dialog.
+    private var autoStartTriggered = false
 
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -71,7 +80,7 @@ class MainActivity : AppCompatActivity() {
                     "resultCode trong extra=${serviceIntent.getIntExtra(PlaybackCaptureService.EXTRA_RESULT_CODE, -999)}"
             )
             ContextCompat.startForegroundService(this, serviceIntent)
-            statusText.text = "Dang capture... mo YouTube phat nhac roi xem log ben duoi"
+            statusText.text = "Dang capture... mo YouTube (qua Chrome neu can chay nen) roi xem log ben duoi"
         } else {
             CaptureLogBus.log("[Activity] ❌ Bi tu choi hoac data null - KHONG start service")
             Toast.makeText(this, "Da tu choi chia se man hinh/audio", Toast.LENGTH_LONG).show()
@@ -86,8 +95,10 @@ class MainActivity : AppCompatActivity() {
             setPadding(24, 24, 24, 8)
         }
 
-        val testButton = Button(this).apply {
-            text = "Test Capture"
+        // ✅ SUA: doi ten nut cho dung ban chat moi - day gio la nut "xin lai"
+        // du phong, khong phai buoc bat buoc dau tien nua.
+        val retryButton = Button(this).apply {
+            text = "Xin quyen lai"
             setOnClickListener { onTestCaptureClicked() }
         }
 
@@ -106,7 +117,7 @@ class MainActivity : AppCompatActivity() {
 
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(testButton)
+            addView(retryButton)
             addView(copyButton)
             addView(clearButton)
         }
@@ -135,6 +146,14 @@ class MainActivity : AppCompatActivity() {
 
         logText.text = CaptureLogBus.getAllLogsText()
         scrollLogToBottom()
+
+        // ✅ MOI: tu dong kich hoat toan bo flow xin quyen ngay khi mo app,
+        // khong doi nguoi dung bam nut nua. Chi chay 1 lan moi onCreate().
+        if (!autoStartTriggered) {
+            autoStartTriggered = true
+            CaptureLogBus.log("[Activity] Tu dong kich hoat flow xin quyen ngay khi mo app")
+            onTestCaptureClicked()
+        }
     }
 
     override fun onResume() {
@@ -168,7 +187,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onTestCaptureClicked() {
-        CaptureLogBus.log("[Activity] Bam Test Capture")
+        CaptureLogBus.log("[Activity] Bat dau flow xin quyen (tu dong hoac bam lai thu cong)")
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
