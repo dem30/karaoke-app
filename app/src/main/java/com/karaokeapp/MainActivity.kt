@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
-import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -30,11 +29,12 @@ import com.karaokeapp.audio.music.PlaybackCaptureService
  *
  * Man hinh co 1 khung log cuon duoc + nut "Copy Log" - vi nguoi dung build
  * app qua GitHub Actions va chi thao tac tren dien thoai, khong co
- * adb/Logcat de xem log ngoai app. Log lay tu CaptureLogBus (xem file do
- * de biet co che truyen log tu Service ve day).
+ * adb/Logcat de xem log ngoai app.
  *
- * Dung AppCompatActivity (khong phai Activity thuan) vi can
- * registerForActivityResult() - chi co tren ComponentActivity tro len.
+ * ✅ DEBUG: da them log chi tiet o CA 2 nhanh (thanh cong/tu choi) cua
+ * screenCaptureLauncher, va log noi dung serviceIntent TRUOC khi goi
+ * startForegroundService - de xac dinh chinh xac du lieu bi mat o dau neu
+ * PlaybackCaptureService bao "Thieu resultCode/resultData".
  */
 class MainActivity : AppCompatActivity() {
 
@@ -45,6 +45,7 @@ class MainActivity : AppCompatActivity() {
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
+        CaptureLogBus.log("[Activity] Ket qua xin RECORD_AUDIO: granted=$granted")
         if (granted) {
             launchScreenCapturePicker()
         } else {
@@ -55,14 +56,24 @@ class MainActivity : AppCompatActivity() {
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
+        CaptureLogBus.log(
+            "[Activity] Ket qua MediaProjection dialog: resultCode=${result.resultCode} " +
+                "(RESULT_OK=${Activity.RESULT_OK}), data=${result.data}"
+        )
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             val serviceIntent = Intent(this, PlaybackCaptureService::class.java).apply {
                 putExtra(PlaybackCaptureService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(PlaybackCaptureService.EXTRA_RESULT_DATA, result.data)
             }
+            CaptureLogBus.log(
+                "[Activity] serviceIntent truoc khi start: extras keys=" +
+                    "${serviceIntent.extras?.keySet()?.joinToString()}, " +
+                    "resultCode trong extra=${serviceIntent.getIntExtra(PlaybackCaptureService.EXTRA_RESULT_CODE, -999)}"
+            )
             ContextCompat.startForegroundService(this, serviceIntent)
             statusText.text = "Dang capture... mo YouTube phat nhac roi xem log ben duoi"
         } else {
+            CaptureLogBus.log("[Activity] ❌ Bi tu choi hoac data null - KHONG start service")
             Toast.makeText(this, "Da tu choi chia se man hinh/audio", Toast.LENGTH_LONG).show()
         }
     }
@@ -103,14 +114,14 @@ class MainActivity : AppCompatActivity() {
         logText = TextView(this).apply {
             setPadding(16, 16, 16, 16)
             textSize = 12f
-            setTextIsSelectable(true) // cho phep bam giu de tu chon/copy 1 phan neu can
+            setTextIsSelectable(true)
             movementMethod = ScrollingMovementMethod()
         }
 
         logScrollView = ScrollView(this).apply {
             addView(logText)
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f // chiem het khong gian con lai
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         }
 
@@ -122,15 +133,12 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(rootLayout)
 
-        // Hien lai log da tich luy tu truoc (vd Service van dang chay ngam
-        // tu lan mo man hinh truoc), khong bi mat khi xoay man hinh/mo lai app.
         logText.text = CaptureLogBus.getAllLogsText()
         scrollLogToBottom()
     }
 
     override fun onResume() {
         super.onResume()
-        // Dang ky nhan log moi realtime trong luc man hinh dang hien.
         CaptureLogBus.setListener { line ->
             runOnUiThread {
                 logText.append("\n$line")
@@ -141,8 +149,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        // Go dang ky de tranh giu tham chieu Activity da bi huy (memory leak)
-        // - Service van tiep tuc chay va tich log vao buffer nhu binh thuong.
         CaptureLogBus.setListener(null)
     }
 
@@ -162,6 +168,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onTestCaptureClicked() {
+        CaptureLogBus.log("[Activity] Bam Test Capture")
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {

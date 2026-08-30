@@ -48,10 +48,14 @@ class PlaybackCaptureService : Service() {
         // Phai goi startForeground() ngay lap tuc (trong vai giay), truoc khi
         // lam bat cu viec gi khac - yeu cau bat buoc cua Android voi foreground service.
         startForeground(NOTIFICATION_ID, buildNotification())
-        logBoth("Service started, dang xu ly resultCode/resultData...")
+        logBoth(
+            "Service started. intent=$intent, hasExtras=${intent?.extras != null}, " +
+                "keys=${intent?.extras?.keySet()?.joinToString()}"
+        )
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
         val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        logBoth("resultCode doc duoc=$resultCode, resultData doc duoc=$resultData")
 
         if (resultCode == -1 || resultData == null) {
             logBoth("❌ Thieu resultCode/resultData, khong the tao MediaProjection", isError = true)
