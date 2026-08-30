@@ -1,34 +1,23 @@
-<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-
-    <application
-        android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="@string/app_name"
-        android:theme="@style/Theme.KaraokeApp"
-        android:supportsRtl="true">
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
-        <!-- Service se can khi xin MediaProjection consent de AudioPlaybackCapture -->
-        <service
-            android:name=".audio.music.PlaybackCaptureService"
-            android:foregroundServiceType="mediaProjection"
-            android:exported="false" />
-
-    </application>
+<uses-permission android:name="android.permission.RECORD_AUDIO"/>
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+<!--  Can tren Android 13+ de notification cua PlaybackCaptureService hien
+         ra duoc - chua xin runtime permission nay o Phase 1 (service van
+         chay binh thuong khong co no, chi notification bi an)  -->
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true">
+<activity android:name=".MainActivity" android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.MAIN"/>
+<category android:name="android.intent.category.LAUNCHER"/>
+</intent-filter>
+</activity>
+<!--  Phase 1: nhan resultCode/resultData tu dialog MediaProjection
+             (MainActivity), tao MediaProjection that va bat dau capture qua
+             MusicInput.  -->
+<service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection" android:exported="false"/>
+</application>
 </manifest>
