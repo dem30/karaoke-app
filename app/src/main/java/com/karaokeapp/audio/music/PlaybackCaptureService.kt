@@ -13,35 +13,38 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * Foreground service bat buoc de dung MediaProjection cho AudioPlaybackCapture.
- * Duoc start tu MainActivity ngay sau khi nguoi dung dong y chia se man
- * hinh/audio qua dialog he thong (MediaProjectionManager.createScreenCaptureIntent()).
  *
- * KHONG tu y start service nay ma khong co resultCode/resultData hop le -
- * MediaProjection chi tao duoc tu ket qua that cua dialog xin quyen.
+ * ✅ CAP NHAT (sua bug MusicInput chay song song): onStartCommand() gio LUON
+ * dung han session cu (neu co) truoc khi tao session moi - truoc day ghi de
+ * truc tiep bien mediaProjection/musicInput, bo mac coroutine cu chay tiep tren
+ * AudioRecord da bi vo hieu hoa ngam, sinh loi -2 lap lai vo han xen ke voi
+ * session moi dang chay dung.
  *
- * ✅ CAP NHAT (chong OEM kill khi chay nen): them WakeLock (PARTIAL_WAKE_LOCK)
- * va onTaskRemoved(), tham khao tu ky thuat da dung trong aichatvn2's
- * WebhookGatewayService. Muc tieu la NGAN tien trinh bi kill tu dau, KHONG
- * PHAI tu phuc hoi capture sau khi chet that su - vi MediaProjection la
- * quyen dung 1 lan (one-time consent token), mot khi TIEN TRINH thuc su bi
- * giet (khong chi Activity bi dong), token nay khong the tai su dung duoc
- * nua du co Intent extras cu hay khong. Neu dieu do xay ra, cach duy nhat la
- * mo lai MainActivity de xin dialog moi (MainActivity da duoc cap nhat de tu
- * dong kich hoat lai flow nay ngay khi mo app, xem MainActivity.kt).
+ * ✅ CAP NHAT (chan MainActivity kich hoat lai flow khi da dang capture): them
+ * companion isCapturing() de MainActivity kiem tra TRUOC khi tu dong bam lai
+ * flow xin quyen trong onCreate() - tranh tao session MediaProjection thua
+ * moi lan Activity duoc tao lai (xoay man hinh, mo lai app trong khi service
+ * van con song...) trong khi capture hien tai van con dang chay tot.
+ *
+ * ✅ CAP NHAT (kiem chung "dong bang" khi chay nen): notification gio hien thi
+ * thoi diem nhan amplitude GAN NHAT (cap nhat moi giay tu MusicInput). Neu
+ * dong bang tien trinh that su xay ra, dong chu nay se NGUNG cap nhat va
+ * "dung yen" trong notification shade - xem duoc TRUC TIEP tu man hinh khoa
+ * hoac keo notification xuong, KHONG can mo lai app (mo lai app se lam mat co
+ * hoi quan sat vi kich hoat lai flow xin quyen).
  */
 class PlaybackCaptureService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var musicInput: MusicInput? = null
-
-    // ✅ MOI: giu CPU thuc ngay ca khi man hinh tat / may idle, de coroutine
-    // doc AudioRecord trong MusicInput khong bi he thong dong bang CPU giua
-    // chung. Dung PARTIAL_WAKE_LOCK (chi giu CPU, khong giu man hinh sang) -
-    // dung loai nay vi capture nhac khong can man hinh bat.
     private var wakeLock: PowerManager.WakeLock? = null
+
+    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     companion object {
         private const val TAG = "PlaybackCaptureService"
@@ -51,6 +54,14 @@ class PlaybackCaptureService : Service() {
 
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
+
+        // ✅ MOI: co static don gian bao hieu service co dang giu 1 session
+        // capture hop le hay khong - MainActivity doc co nay truoc khi tu dong
+        // kich hoat lai flow xin quyen trong onCreate().
+        @Volatile
+        private var capturingActive = false
+
+        fun isCapturing(): Boolean = capturingActive
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -88,15 +99,25 @@ class PlaybackCaptureService : Service() {
         }
     }
 
+    /** Dung han session capture hien tai (neu co) mot cach an toan, day du. */
+    private fun stopCurrentSessionIfAny() {
+        if (musicInput != null || mediaProjection != null) {
+            logBoth("⚠️ Phat hien session capture cu con song - dung han truoc khi tao session moi.")
+        }
+        musicInput?.stopCapture()
+        musicInput = null
+        mediaProjection?.stop()
+        mediaProjection = null
+        capturingActive = false
+    }
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Phai goi startForeground() ngay lap tuc (trong vai giay), truoc khi
-        // lam bat cu viec gi khac - yeu cau bat buoc cua Android voi foreground service.
-        startForeground(NOTIFICATION_ID, buildNotification())
+        startForeground(NOTIFICATION_ID, buildNotification("Dang khoi dong..."))
         acquireWakeLock()
 
         logBoth(
@@ -108,19 +129,21 @@ class PlaybackCaptureService : Service() {
         val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         logBoth("resultCode doc duoc=$resultCode, resultData doc duoc=$resultData")
 
-        // ✅ resultCode Int.MIN_VALUE lam gia tri "khong tim thay extra" - Activity.RESULT_OK
-        // (-1) khong the trung voi gia tri nay, khac voi truoc day dung -1 gay nham lan.
         if (resultCode == Int.MIN_VALUE || resultData == null) {
             logBoth(
                 "❌ Thieu resultCode/resultData, khong the tao MediaProjection. " +
-                    "Neu day la lan restart sau khi tien trinh bi kill (khong phai lan dau), " +
-                    "day la gioi han khong the tranh cua Android: MediaProjection can duoc " +
-                    "xin lai tu dau qua dialog he thong - mo lai MainActivity de xin lai.",
+                    "Neu day la lan restart sau khi tien trinh bi kill, day la gioi han " +
+                    "khong the tranh cua Android - mo lai MainActivity de xin lai.",
                 isError = true
             )
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // ✅ SUA LOI CHINH: dung han session cu TRUOC KHI tao session moi - khong
+        // con ghi de truc tiep len bien nhu truoc, tranh coroutine cu chay mai
+        // (xem giai thich day du trong MusicInput.kt va comment dau file).
+        stopCurrentSessionIfAny()
 
         val projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -132,62 +155,43 @@ class PlaybackCaptureService : Service() {
             return START_NOT_STICKY
         }
 
-        // Bat buoc dang ky callback truoc khi dung MediaProjection de capture
-        // (tu Android 14/API 34), neu khong se bi throw IllegalStateException.
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 logBoth("MediaProjection.onStop() - he thong da thu hoi quyen capture")
                 musicInput?.stopCapture()
+                musicInput = null
+                capturingActive = false
                 stopSelf()
             }
         }, null)
 
         mediaProjection = projection
-        musicInput = MusicInput(projection).apply { startCapture() }
+        musicInput = MusicInput(projection) { avgAmplitude ->
+            // ✅ MOI: cap nhat notification real-time moi giay - xem giai thich o
+            // comment dau file ve muc dich kiem chung "dong bang" tien trinh.
+            val now = timeFormat.format(java.util.Date())
+            updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
+        }.apply { startCapture() }
+        capturingActive = true
 
-        // ✅ GIU NGUYEN START_NOT_STICKY (khong doi sang START_STICKY): neu OS kill roi tu
-        // restart service voi Intent RONG, van roi vao nhanh loi resultCode/resultData o tren
-        // ngay lap tuc - khong co tac dung thuc te gi de "tu phuc hoi", chi lam log nhieu rac
-        // roi tu stopSelf() lai. Muc tieu that su la NGAN bi kill tu dau (WakeLock +
-        // onTaskRemoved ben duoi), khong phai co gang restart sau khi da chet.
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        musicInput?.stopCapture()
-        mediaProjection?.stop()
-        mediaProjection = null
+        stopCurrentSessionIfAny()
         releaseWakeLock()
         logBoth("Service destroyed")
         super.onDestroy()
     }
 
-    // ✅ MOI: tham khao tu aichatvn2's WebhookGatewayService.onTaskRemoved(). Khi nguoi dung
-    // vuot xoa app khoi man hinh da nhiem, nhieu OEM (bao gom Honor) mac dinh kill LUON tien
-    // trinh dung nay tru khi service tu "phan ung" ngay tai day. CO GANG khoi dong lai
-    // foreground service ngay lap tuc de giam kha nang bi OS don don tien trinh hoan toan -
-    // NHUNG can hieu ro: Intent restartServiceIntent o day KHONG mang theo resultCode/
-    // resultData cu (khong the dinh kem lai MediaProjection cu da bi thu hoi), nen sau khi
-    // restart, service se roi vao nhanh "Thieu resultCode/resultData" va tu dung lai ngay -
-    // day la KY VONG DUNG, khong phai bug. Tac dung thuc su cua ham nay la giu foreground
-    // service instance (va do do ca tien trinh) song sot qua HANH DONG vuot xoa cu the, cho
-    // truong hop nguoi dung vo tinh vuot nham trong khi dang hat (WakeLock + startForeground
-    // lai ngay giup MediaProjection dang chay KHONG bi ngat giua chung boi chinh hanh dong
-    // vuot xoa nay).
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        val stillCapturing = mediaProjection != null && musicInput != null
+        val stillCapturing = capturingActive
         logBoth("Task removed (app bi vuot xoa khoi da nhiem). Dang capture=$stillCapturing")
 
         if (stillCapturing) {
-            // Van dang capture that su - CHI can dam bao foreground service + WakeLock
-            // khong bi OS don theo task, KHONG can/KHONG the tao Intent moi voi
-            // resultCode/resultData (van con nguyen trong bien mediaProjection/musicInput
-            // hien tai cua chinh instance Service nay, khong mat gi ca). Goi lai
-            // startForeground() de "khang cao" uu tien voi OS, ep no khong don tien trinh
-            // theo task nay.
             try {
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(NOTIFICATION_ID, buildNotification("Dang tiep tuc capture sau khi app bi vuot xoa..."))
                 logBoth("✅ Da tai khang dinh foreground service ngay sau khi task bi vuot xoa, van tiep tuc capture.")
             } catch (e: Exception) {
                 logBoth("❌ Loi khi tai khang dinh foreground service sau onTaskRemoved: ${e.message}", isError = true)
@@ -210,11 +214,18 @@ class PlaybackCaptureService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(contentText: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Karaoke App")
-            .setContentText("Dang test capture nhac (Phase 1)")
+            .setContentTitle("Karaoke App - Phase 1")
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
+    }
+
+    private fun updateNotification(contentText: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIFICATION_ID, buildNotification(contentText))
     }
 }

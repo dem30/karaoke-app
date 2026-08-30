@@ -147,12 +147,24 @@ class MainActivity : AppCompatActivity() {
         logText.text = CaptureLogBus.getAllLogsText()
         scrollLogToBottom()
 
-        // ✅ MOI: tu dong kich hoat toan bo flow xin quyen ngay khi mo app,
-        // khong doi nguoi dung bam nut nua. Chi chay 1 lan moi onCreate().
+        // ✅ SUA LOI QUAN TRONG: chi tu dong kich hoat flow xin quyen NEU service
+        // CHUA dang giu 1 session capture hop le - truoc day luon tu kich hoat
+        // vo dieu kien, khien moi lan mo lai app (ke ca khi capture dang chay
+        // tot tu truoc) deu tao 1 MediaProjection MOI, bo lai session cu chay
+        // "zombie" gay loi -2 lap lai vo han (xem giai thich day du trong
+        // PlaybackCaptureService.kt va MusicInput.kt).
         if (!autoStartTriggered) {
             autoStartTriggered = true
-            CaptureLogBus.log("[Activity] Tu dong kich hoat flow xin quyen ngay khi mo app")
-            onTestCaptureClicked()
+            if (PlaybackCaptureService.isCapturing()) {
+                CaptureLogBus.log(
+                    "[Activity] Service dang capture san (isCapturing=true) - " +
+                        "BO QUA tu dong xin quyen lai, chi hien lai log cu."
+                )
+                statusText.text = "Dang capture (session cu van con song)... xem log ben duoi"
+            } else {
+                CaptureLogBus.log("[Activity] Chua co session capture nao - tu dong kich hoat flow xin quyen")
+                onTestCaptureClicked()
+            }
         }
     }
 
