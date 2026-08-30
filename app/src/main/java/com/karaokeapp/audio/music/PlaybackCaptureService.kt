@@ -53,11 +53,15 @@ class PlaybackCaptureService : Service() {
                 "keys=${intent?.extras?.keySet()?.joinToString()}"
         )
 
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Int.MIN_VALUE) ?: Int.MIN_VALUE
         val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         logBoth("resultCode doc duoc=$resultCode, resultData doc duoc=$resultData")
 
-        if (resultCode == -1 || resultData == null) {
+        // ✅ SUA LOI: truoc day dung -1 lam gia tri "khong tim thay extra",
+        // nhung Activity.RESULT_OK CUNG LA -1 -> moi lan thanh cong deu bi
+        // hieu nham la "thieu du lieu". Doi sang Int.MIN_VALUE, khong the
+        // trung voi bat ky resultCode hop le nao cua Android.
+        if (resultCode == Int.MIN_VALUE || resultData == null) {
             logBoth("❌ Thieu resultCode/resultData, khong the tao MediaProjection", isError = true)
             stopSelf()
             return START_NOT_STICKY
