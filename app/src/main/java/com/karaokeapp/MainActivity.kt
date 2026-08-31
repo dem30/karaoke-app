@@ -19,8 +19,10 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.music.CaptureLogBus
 import com.karaokeapp.audio.music.PlaybackCaptureService
+import com.karaokeapp.audio.output.OutputRouter
 
 /**
  * Entry point tam thoi, chua co UI dep - chi du dung de test tung phase.
@@ -51,6 +53,13 @@ class MainActivity : AppCompatActivity() {
     // onCreate() nay chua - tranh goi lai nhieu lan neu onCreate() bi goi lai
     // (vi du xoay man hinh) trong khi flow dang cho ket qua dialog.
     private var autoStartTriggered = false
+
+    // ✅ MOI (Phase 2): mic loopback test doc lap, KHONG lien quan gi toi
+    // PlaybackCaptureService/MusicInput cua Phase 1 - chi de do latency
+    // mic -> loa theo dung task Phase 2 trong PLAN.md.
+    private var micInput: MicInput? = null
+    private var outputRouter: OutputRouter? = null
+    private var micLoopbackRunning = false
 
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -147,11 +156,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // ✅ MOI (Phase 2): nut bat/tat mic loopback (mic -> loa truc tiep,
+        // chua co mixer) - dung de vo tay truoc mic va do do tre bang video
+        // quay slow-motion, theo dung tieu chi Phase 2 trong PLAN.md.
+        val micLoopbackButton = Button(this).apply {
+            text = "Bat Mic Loopback"
+            setOnClickListener { toggleMicLoopback(this) }
+        }
+
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(retryButton)
             addView(copyButton)
             addView(clearButton)
+        }
+
+        val buttonRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(micLoopbackButton)
         }
 
         logText = TextView(this).apply {
@@ -172,6 +194,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             addView(statusText)
             addView(buttonRow)
+            addView(buttonRow2)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -245,5 +268,47 @@ class MainActivity : AppCompatActivity() {
         val projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
+    }
+
+    // ✅ MOI (Phase 2): bat/tat mic -> loa truc tiep de do latency. Doc lap
+    // hoan toan voi flow Phase 1 (khong dung chung permission RECORD_AUDIO -
+    // neu chua co, xin luon tai day).
+    private fun toggleMicLoopback(button: Button) {
+        if (micLoopbackRunning) {
+            micInput?.stopCapture()
+            outputRouter?.stop()
+            micInput = null
+            outputRouter = null
+            micLoopbackRunning = false
+            button.text = "Bat Mic Loopback"
+            CaptureLogBus.log("[Activity] Da tat Mic Loopback")
+            return
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "Can quyen RECORD_AUDIO - hay bam 'Xin quyen lai' truoc", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        CaptureLogBus.log("[Activity] Bat dau Mic Loopback (Phase 2 - do latency)")
+        val router = OutputRouter().apply { start() }
+        val mic = MicInput(this)
+        outputRouter = router
+        micInput = mic
+        mic.startCapture { buffer, size ->
+            router.write(buffer, size)
+        }
+        micLoopbackRunning = true
+        button.text = "Tat Mic Loopback"
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // ✅ Don dep mic loopback neu Activity bi huy trong luc dang bat -
+        // day la test thu cong, khong can chay nen nhu PlaybackCaptureService.
+        micInput?.stopCapture()
+        outputRouter?.stop()
     }
 }
