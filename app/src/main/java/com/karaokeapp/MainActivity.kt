@@ -293,7 +293,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         CaptureLogBus.log("[Activity] Bat dau Mic Loopback (Phase 2 - do latency)")
-        val router = OutputRouter().apply { start() }
+        val router = OutputRouter(this).apply { start() }
         val mic = MicInput(this)
         outputRouter = router
         micInput = mic

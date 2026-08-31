@@ -1,7 +1,9 @@
 package com.karaokeapp.audio.output
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.os.Build
@@ -13,30 +15,43 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * ra AudioTrack o che do streaming, chi de nghe duoc tieng minh noi qua
  * loa/tai nghe NGAY LAP TUC phuc vu do latency.
  *
- * ✅ CAP NHAT (do latency tu dong qua timestamp): them totalFramesWritten
- * (dem tong so frame/sample da ghi ra tu luc start()) va
- * estimatePresentationNanoTime(targetFrame) - dung API chinh thuc
- * AudioTrack.getTimestamp() de biet CHINH XAC thoi diem phan cung THAT SU
- * phat ra 1 vi tri frame cu the, khong chi la luc write() tra ve (write()
- * chi bao du lieu da vao HANG DOI, chua chac da phat).
+ * ✅ CAP NHAT QUAN TRONG (sua bug latency ~584ms do chinh code gay ra, PHAT
+ * HIEN qua so lieu LatencyProbe qua on dinh bat thuong o lan test truoc):
  *
- * ⚠️ GIOI HAN QUAN TRONG: getTimestamp() phan anh dung thoi diem phat thuc
- * te cho duong loa trong/day - day la co che chuan cua Android audio HAL.
- * Nhung VOI BLUETOOTH, do chinh xac PHU THUOC THIET BI: mot so chip/Android
- * version co bu tru dung do tre truyen Bluetooth vao gia tri tra ve, mot so
- * thi khong (chi phan anh luc du lieu roi khoi buffer phan mem, chua tinh
- * do tre thuc cua duong truyen Bluetooth phia sau). VI VAY: voi loa trong/
- * tai nghe day, so do duoc TU TIN SU DUNG TRUC TIEP. Voi Bluetooth, NEN doi
- * chieu it nhat 1 lan bang cach vo tay + quay video slow-motion de biet con
- * so tu dong nay co dang tin tren may Honor cu the hay khong.
+ * 1. Doi CHANNEL_OUT_MONO -> CHANNEL_OUT_STEREO: PERFORMANCE_MODE_LOW_LATENCY
+ *    cua Android CHI thuc su kich hoat duong "fast mixer" (buffer rat nho,
+ *    do tre thap) khi dung STEREO - dung MONO khien he thong am tham roi ve
+ *    duong xu ly thuong (buffer sau, do tre cao ~500ms+), DU van bao
+ *    STATE_INITIALIZED binh thuong khong loi gi ca. Vi buffer PCM dau vao
+ *    van la mono (tu MicInput), write() gio se tu nhan doi moi sample thanh
+ *    2 kenh (L=R) truoc khi ghi.
+ *
+ * 2. BO qua setBufferSizeInBytes() khi dang xin PERFORMANCE_MODE_LOW_LATENCY
+ *    (API 26+): truoc day code tu tinh "minBufferSize * 2" va ep AudioTrack
+ *    dung dung kich thuoc do - day CHINH LA nguyen nhan gay ra ~520ms do
+ *    tre (buffer qua lon so voi yeu cau cua duong fast mixer that su can).
+ *    Khong goi setBufferSizeInBytes() nua trong nhanh low-latency, de he
+ *    thong TU CHON kich thuoc buffer toi uu (thuong chi vai chuc frame,
+ *    tuong duong vai ms) - dung khuyen nghi chinh thuc cua Android cho
+ *    performance mode nay.
+ *
+ * ⚠️ Van con 1 yeu to co the anh huong them (CHUA sua trong lan nay, ghi
+ * chu de theo doi neu latency van con cao sau khi sua 2 diem tren): fast
+ * mixer con yeu cau sample rate TRUNG KHOP voi "native sample rate" that su
+ * cua thiet bi (doc qua AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE) - neu may
+ * Honor nay co native rate khac 44100 (vi du 48000 - kha pho bien), fast
+ * path van co the khong duoc cap du da sua STEREO + bo buffer size. Log gia
+ * tri nay ra de biet truoc, xem log "[OutputRouter] Native sample rate cua
+ * thiet bi".
  */
-class OutputRouter {
+class OutputRouter(private val context: Context) {
 
     private var audioTrack: AudioTrack? = null
 
-    // ✅ MOI: dem tong so frame (=so sample voi mono) da ghi ra tu luc
-    // start(). Dung de tinh "frame tuyet doi" tuong ung voi 1 sample cu the
-    // trong luong PCM, phuc vu doi chieu voi getTimestamp().
+    // Buffer stereo tam dung lai de tranh cap phat moi lan write() - kich
+    // thuoc se tu dong lon len neu can (xem write()).
+    private var stereoScratchBuffer = ShortArray(0)
+
     @Volatile
     var totalFramesWritten: Long = 0
         private set
@@ -44,7 +59,7 @@ class OutputRouter {
     companion object {
         private const val TAG = "OutputRouter"
         private const val SAMPLE_RATE = 44100
-        private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_MONO
+        private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_STEREO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val NANOS_PER_FRAME = 1_000_000_000L / SAMPLE_RATE
     }
@@ -54,13 +69,30 @@ class OutputRouter {
         CaptureLogBus.log("[OutputRouter] $msg")
     }
 
+    private fun logNativeAudioProperties() {
+        try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val nativeSampleRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
+            val nativeFramesPerBuffer = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+            logBoth("Native sample rate cua thiet bi: $nativeSampleRate Hz (dang dung $SAMPLE_RATE Hz)")
+            logBoth("Native frames per buffer cua thiet bi: $nativeFramesPerBuffer")
+            if (nativeSampleRate != null && nativeSampleRate.toIntOrNull() != SAMPLE_RATE) {
+                logBoth(
+                    "⚠️ Sample rate dang dung ($SAMPLE_RATE) KHONG khop native rate " +
+                        "cua may ($nativeSampleRate) - co the van chan duong fast mixer " +
+                        "du da sua STEREO + bo buffer size. Neu latency van cao sau ban " +
+                        "sua nay, day la nghi van tiep theo can xu ly.",
+                    isError = false
+                )
+            }
+        } catch (e: Exception) {
+            logBoth("Khong doc duoc native audio properties: ${e.message}")
+        }
+    }
+
     fun start() {
         totalFramesWritten = 0
-        val minBufferSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT)
-        if (minBufferSize <= 0) {
-            logBoth("❌ AudioTrack.getMinBufferSize khong hop le: $minBufferSize", isError = true)
-            return
-        }
+        logNativeAudioProperties()
 
         val builder = AudioTrack.Builder()
             .setAudioAttributes(
@@ -76,11 +108,24 @@ class OutputRouter {
                     .setChannelMask(CHANNEL_CONFIG_OUT)
                     .build()
             )
-            .setBufferSizeInBytes(minBufferSize * 2)
             .setTransferMode(AudioTrack.MODE_STREAM)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // ✅ SUA LOI CHINH: KHONG goi setBufferSizeInBytes() o day nua - de
+            // he thong tu chon buffer toi uu cho fast mixer path. Goi ham nay
+            // voi 1 gia tri lon (nhu truoc day) se VO HIEU HOA duong low
+            // latency that su, du khong bao loi gi ca.
             builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+        } else {
+            // Truoc API 26 khong co performance mode - buoc phai tu dat buffer,
+            // dung dung minBufferSize (KHONG nhan doi) de giu do tre thap nhat
+            // co the trong dieu kien khong co fast mixer.
+            val minBufferSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT)
+            if (minBufferSize <= 0) {
+                logBoth("❌ AudioTrack.getMinBufferSize khong hop le: $minBufferSize", isError = true)
+                return
+            }
+            builder.setBufferSizeInBytes(minBufferSize)
         }
 
         val track = builder.build()
@@ -92,31 +137,40 @@ class OutputRouter {
 
         audioTrack = track
         track.play()
-        logBoth("✅ Da bat dau output, sampleRate=$SAMPLE_RATE, minBufferSize=$minBufferSize")
+        logBoth("✅ Da bat dau output (stereo, low-latency), sampleRate=$SAMPLE_RATE")
     }
 
     /**
-     * Ghi 1 buffer PCM ra output. QUAN TRONG cho tinh nang do latency: goi
-     * ham nay SAU KHI da doc totalFramesWritten (vi du de tinh vi tri frame
-     * tuyet doi cua 1 sample trong buffer NAY truoc khi no duoc cong don) -
-     * xem MainActivity.toggleMicLoopback() de biet thu tu goi dung.
+     * Ghi 1 buffer PCM MONO ra output STEREO - tu dong nhan doi moi sample
+     * thanh 2 kenh L=R truoc khi ghi (xem giai thich o dau file ve ly do can
+     * doi sang stereo).
      */
     fun write(buffer: ShortArray, size: Int) {
         val track = audioTrack ?: return
-        val written = track.write(buffer, 0, size)
+
+        val requiredStereoSize = size * 2
+        if (stereoScratchBuffer.size < requiredStereoSize) {
+            stereoScratchBuffer = ShortArray(requiredStereoSize)
+        }
+        for (i in 0 until size) {
+            stereoScratchBuffer[i * 2] = buffer[i]
+            stereoScratchBuffer[i * 2 + 1] = buffer[i]
+        }
+
+        val written = track.write(stereoScratchBuffer, 0, requiredStereoSize)
         if (written < 0) {
             logBoth("❌ AudioTrack.write() loi, code=$written", isError = true)
         } else {
-            totalFramesWritten += written
+            // written la so SAMPLE stereo (ca 2 kenh) - chia 2 de ra so FRAME
+            // (1 frame = 1 cap L+R) tuong ung voi so sample mono goc da ghi.
+            totalFramesWritten += written / 2
         }
     }
 
     /**
-     * Uoc tinh thoi diem (System.nanoTime() cung khong gian voi
-     * MicInput) phan cung THAT SU phat ra frame o vi tri targetFrame, dua
-     * tren AudioTrack.getTimestamp(). Tra ve null neu chua co du du lieu de
-     * tinh (vi du moi bat dau phat, chua co frame nao thuc su ra khoi loa) -
-     * noi goi nen bao nguoi dung vo tay lai sau vai giay.
+     * Uoc tinh thoi diem (System.nanoTime() cung khong gian voi MicInput)
+     * phan cung THAT SU phat ra frame o vi tri targetFrame, dua tren
+     * AudioTrack.getTimestamp().
      */
     fun estimatePresentationNanoTime(targetFrame: Long): Long? {
         val track = audioTrack ?: return null
