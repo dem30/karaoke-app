@@ -21,13 +21,24 @@ import com.karaokeapp.audio.music.CaptureLogBus
  *
  * Uu tien MediaRecorder.AudioSource.UNPROCESSED (tu dong tat AEC/NS/AGC neu
  * thiet bi ho tro). Fallback ve MediaRecorder.AudioSource.MIC thuong neu
- * UNPROCESSED khong duoc ho tro (kiem tra qua AudioManager.getProperty
- * truoc, VA du phong bang cach thu khoi tao that, vi mot so thiet bi bao
- * ho tro qua property nhung van khoi tao that bai tren thuc te).
+ * UNPROCESSED khong duoc ho tro.
  *
  * Dung chung sample rate/format voi MusicInput (44100Hz, PCM_16BIT, mono)
- * de sau nay LowLatencyMixer (Phase 3) cong 2 nguon PCM truc tiep duoc,
- * khong can resample.
+ * de sau nay LowLatencyMixer (Phase 3) cong 2 nguon PCM truc tiep duoc.
+ *
+ * ✅ CAP NHAT (do latency tu dong qua timestamp, khong can quay video):
+ * them tham so onTransientDetected - phat hien 1 tieng vo tay (bien do vuot
+ * nguong dot ngot) trong buffer vua doc, bao cho noi goi biet CHINH XAC
+ * offset trong buffer VA thoi diem uoc tinh phan cung mic thuc su bat duoc
+ * am thanh do. Cach tinh: System.nanoTime() ngay luc record.read() tra ve
+ * la thoi diem SAMPLE CUOI CUNG trong buffer duoc thu; cac sample truoc do
+ * duoc thu SOM HON, tinh nguoc lai theo so sample con thieu chia cho sample
+ * rate. Noi goi (MainActivity) doi chieu voi
+ * OutputRouter.estimatePresentationNanoTime() de tinh do tre thuc, KHONG
+ * can vo tay + quay video slow-motion nua (chi con can cho truong hop
+ * Bluetooth, vi getTimestamp() cua AudioTrack co the khong bu chinh xac do
+ * tre rieng cua Bluetooth tren moi thiet bi - xem ghi chu trong
+ * OutputRouter.kt).
  */
 class MicInput(private val context: Context) {
 
@@ -38,11 +49,27 @@ class MicInput(private val context: Context) {
     @Volatile
     private var shouldStop = false
 
+    // ✅ MOI: chong bat lien tuc nhieu lan cho CUNG 1 tieng vo tay (1 tieng
+    // vo thuong keo dai vai chuc ms, co the vuot nguong o nhieu sample lien
+    // tiep hoac o 2 buffer lien tiep) - chi lay diem DAU TIEN vuot nguong,
+    // bo qua moi phat hien khac trong khoang COOLDOWN_NANOS sau do.
+    private var lastDetectionNanoTime = 0L
+
     companion object {
         private const val TAG = "MicInput"
         private const val SAMPLE_RATE = 44100
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        private const val NANOS_PER_SAMPLE = 1_000_000_000L / SAMPLE_RATE
+
+        // Nguong bien do de coi la "tieng vo tay" - can du cao de khong bi
+        // kich hoat nham boi giong noi binh thuong (thuong chi vai tram toi
+        // ~2000), chi vo tay that manh moi vuot qua duoc.
+        private const val CLAP_THRESHOLD = 12000
+
+        // Thoi gian "nghi" sau 1 lan phat hien, tranh dem trung 1 tieng vo
+        // thanh nhieu lan hoac bat lien tuc khi con tieng vang/echo.
+        private const val COOLDOWN_NANOS = 1_500_000_000L
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -50,18 +77,12 @@ class MicInput(private val context: Context) {
         CaptureLogBus.log("[MicInput] $msg")
     }
 
-    /** Kiem tra thiet bi co bao ho tro AudioSource.UNPROCESSED hay khong (qua AudioManager). */
     private fun isUnprocessedSupportedByProperty(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
     }
 
-    /**
-     * Thu tao AudioRecord voi 1 audioSource cu the. Tra ve null neu khoi tao
-     * that bai (state != STATE_INITIALIZED) thay vi throw, de goi noi co the
-     * thu fallback sang source khac.
-     */
     @SuppressLint("MissingPermission") // RECORD_AUDIO da xin o MainActivity truoc khi toi day
     private fun tryBuildAudioRecord(audioSource: Int, minBufferSize: Int): AudioRecord? {
         val record = try {
@@ -86,14 +107,46 @@ class MicInput(private val context: Context) {
     }
 
     /**
-     * Bat dau capture mic. onPcmChunk duoc goi lai MOI LAN doc duoc 1 buffer -
-     * dung de OutputRouter (Phase 2) hoac LowLatencyMixer (Phase 3) tieu thu
-     * PCM ngay lap tuc, khong luu trung gian - giu do tre thap nhat co the.
-     *
-     * @param onPcmChunk callback(buffer, soLuongSampleThucDoc)
+     * Quet 1 buffer vua doc de tim tieng vo tay (sample dau tien vuot
+     * CLAP_THRESHOLD), tinh timestamp uoc luong that su cua sample do, roi
+     * goi callback. Bo qua neu con dang trong thoi gian cooldown.
      */
-    fun startCapture(onPcmChunk: (ShortArray, Int) -> Unit) {
+    private fun detectClapAndReport(
+        buffer: ShortArray,
+        read: Int,
+        bufferEndNanoTime: Long,
+        onTransientDetected: ((offsetInBuffer: Int, captureNanoTime: Long) -> Unit)?
+    ) {
+        if (onTransientDetected == null) return
+        val now = System.nanoTime()
+        if (now - lastDetectionNanoTime < COOLDOWN_NANOS) return
+
+        for (i in 0 until read) {
+            if (abs(buffer[i].toInt()) >= CLAP_THRESHOLD) {
+                val onsetNanoTime = bufferEndNanoTime - (read - i).toLong() * NANOS_PER_SAMPLE
+                lastDetectionNanoTime = now
+                logBoth("👏 Phat hien tieng vo tay tai sample offset=$i trong buffer (read=$read)")
+                onTransientDetected(i, onsetNanoTime)
+                return
+            }
+        }
+    }
+
+    /**
+     * Bat dau capture mic.
+     *
+     * @param onPcmChunk callback(buffer, soLuongSampleThucDoc) - goi MOI LAN
+     * doc duoc 1 buffer, dung de OutputRouter/Mixer tieu thu PCM ngay.
+     * @param onTransientDetected callback(offsetInBuffer, captureNanoTime) -
+     * optional, goi khi phat hien 1 tieng vo tay ro rang. Dung cho tinh nang
+     * do latency tu dong (xem MainActivity.toggleMicLoopback()).
+     */
+    fun startCapture(
+        onPcmChunk: (ShortArray, Int) -> Unit,
+        onTransientDetected: ((offsetInBuffer: Int, captureNanoTime: Long) -> Unit)? = null
+    ) {
         shouldStop = false
+        lastDetectionNanoTime = 0L
 
         val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
         if (minBufferSize <= 0) {
@@ -119,13 +172,16 @@ class MicInput(private val context: Context) {
         }
 
         if (record == null) {
-            logBoth("❌ Khong the khoi tao AudioRecord voi bat ky source nao (UNPROCESSED lan MIC deu that bai).", isError = true)
+            logBoth("❌ Khong the khoi tao AudioRecord voi bat ky source nao.", isError = true)
             return
         }
 
         audioRecord = record
         record.startRecording()
         logBoth("✅ Bat dau capture mic, source=$sourceUsed, sampleRate=$SAMPLE_RATE, minBufferSize=$minBufferSize")
+        if (onTransientDetected != null) {
+            logBoth("🎯 Che do do latency dang BAT - vo tay THAT MANH, ro rang truoc mic de kich hoat do (nguong=$CLAP_THRESHOLD).")
+        }
 
         captureJob = scope.launch {
             val buffer = ShortArray(minBufferSize / 2)
@@ -135,8 +191,18 @@ class MicInput(private val context: Context) {
 
             while (!shouldStop) {
                 val read = record.read(buffer, 0, buffer.size)
+                val bufferEndNanoTime = System.nanoTime()
+
                 if (read > 0) {
+                    // ✅ Phat hien clap TRUOC khi forward buffer xuong duoi -
+                    // dam bao tai thoi diem callback chay, ben nhan (OutputRouter
+                    // qua MainActivity) CHUA nhan buffer nay, nen "so frame da
+                    // ghi truoc do" con phan anh dung trang thai TRUOC buffer
+                    // hien tai.
+                    detectClapAndReport(buffer, read, bufferEndNanoTime, onTransientDetected)
+
                     onPcmChunk(buffer, read)
+
                     for (i in 0 until read) {
                         sumAmplitude += abs(buffer[i].toInt())
                     }

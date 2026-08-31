@@ -297,9 +297,27 @@ class MainActivity : AppCompatActivity() {
         val mic = MicInput(this)
         outputRouter = router
         micInput = mic
-        mic.startCapture { buffer, size ->
-            router.write(buffer, size)
-        }
+        // ✅ MOI: truyen them onTransientDetected de tu dong tinh latency khi
+        // phat hien tieng vo tay - xem giai thich chi tiet trong MicInput.kt
+        // va OutputRouter.kt. Thu tu QUAN TRONG: doc router.totalFramesWritten
+        // (frame TRUOC buffer nay) roi MOI goi router.write() cho buffer nay -
+        // MicInput da dam bao goi onTransientDetected TRUOC onPcmChunk nen thu
+        // tu nay tu nhien dung, khong can dong bo gi them.
+        mic.startCapture(
+            onPcmChunk = { buffer, size ->
+                router.write(buffer, size)
+            },
+            onTransientDetected = { offsetInBuffer, captureNanoTime ->
+                val targetFrame = router.totalFramesWritten + offsetInBuffer
+                val presentationNanoTime = router.estimatePresentationNanoTime(targetFrame)
+                if (presentationNanoTime != null) {
+                    val latencyMs = (presentationNanoTime - captureNanoTime) / 1_000_000.0
+                    CaptureLogBus.log("[LatencyProbe] 🎯 Do tre uoc tinh: %.1f ms".format(latencyMs))
+                } else {
+                    CaptureLogBus.log("[LatencyProbe] ⚠️ Chua tinh duoc (xem canh bao ben tren) - thu vo tay lai.")
+                }
+            }
+        )
         micLoopbackRunning = true
         button.text = "Tat Mic Loopback"
     }
