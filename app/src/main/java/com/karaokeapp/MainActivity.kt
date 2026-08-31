@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
 import android.widget.Button
@@ -56,10 +57,41 @@ class MainActivity : AppCompatActivity() {
     ) { granted ->
         CaptureLogBus.log("[Activity] Ket qua xin RECORD_AUDIO: granted=$granted")
         if (granted) {
-            launchScreenCapturePicker()
+            requestNotificationPermissionIfNeeded()
         } else {
             Toast.makeText(this, "Can quyen RECORD_AUDIO de test capture", Toast.LENGTH_LONG).show()
         }
+    }
+
+    // ✅ MOI: xin rieng quyen POST_NOTIFICATIONS (bat buoc tu Android 13/API 33
+    // tro len - chi khai bao trong AndroidManifest.xml la CHUA DU, phai xin
+    // runtime permission nhu RECORD_AUDIO). Thieu quyen nay thi Service van
+    // chay binh thuong (khong crash), nhung notification se bi AN HOAN TOAN -
+    // day chinh la ly do khong thay thong bao nao ca du code da dung.
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        CaptureLogBus.log("[Activity] Ket qua xin POST_NOTIFICATIONS: granted=$granted")
+        if (!granted) {
+            Toast.makeText(
+                this,
+                "Khong co quyen thong bao - se khong thay duoc trang thai capture khi chay nen",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        launchScreenCapturePicker()
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                return
+            }
+        }
+        launchScreenCapturePicker()
     }
 
     private val screenCaptureLauncher = registerForActivityResult(
@@ -205,7 +237,7 @@ class MainActivity : AppCompatActivity() {
         ) {
             requestRecordAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
         } else {
-            launchScreenCapturePicker()
+            requestNotificationPermissionIfNeeded()
         }
     }
 
