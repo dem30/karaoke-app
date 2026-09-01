@@ -11,22 +11,64 @@ import kotlinx.coroutines.launch
 import kotlin.math.min
 
 /**
+ * Ring buffer PCM don gian, dung ShortArray nguyen thuy (KHONG dung
+ * ArrayDeque<Short> - moi phan tu se bi "boxing" thanh 1 object rieng tren
+ * heap, cuc ky ton CPU/GC voi ~44100 sample/giay). Khi day (overflow), tu
+ * dong bo mau CU NHAT de nhuong cho mau moi - uu tien phat am thanh moi
+ * nhat thay vi de do tre phinh to vo han khi ben san xuat nhanh hon ben
+ * tieu thu.
+ */
+private class ShortRingBuffer(private val capacity: Int) {
+    private val buffer = ShortArray(capacity)
+    private var head = 0
+    private var count = 0
+
+    @Synchronized
+    fun push(src: ShortArray, size: Int) {
+        for (i in 0 until size) {
+            val writeIndex = (head + count) % capacity
+            buffer[writeIndex] = src[i]
+            if (count < capacity) {
+                count++
+            } else {
+                // Da day - bo mau cu nhat (tien head len 1) de nhuong cho mau moi.
+                head = (head + 1) % capacity
+            }
+        }
+    }
+
+    @Synchronized
+    fun size(): Int = count
+
+    /** Rut toi da "requestCount" sample vao dest (tu index 0). Tra ve so luong THAT SU lay duoc. */
+    @Synchronized
+    fun drain(dest: ShortArray, requestCount: Int): Int {
+        val available = min(requestCount, count)
+        for (i in 0 until available) {
+            dest[i] = buffer[(head + i) % capacity]
+        }
+        head = (head + available) % capacity
+        count -= available
+        return available
+    }
+
+    @Synchronized
+    fun clear() {
+        head = 0
+        count = 0
+    }
+}
+
+/**
  * Phase 3 - tron 2 nguon PCM (Music + Vocal) thanh 1 output stream.
  *
- * ✅ CAP NHAT (sua loi re/giat/rot rot phat hien qua test thuc te): thiet ke
- * BAN DAU dung dong ho co dinh (delay(20ms) roi rut DUNG CHUNK_SIZE tu ca 2
- * hang doi, doi 0 cho phan thieu) - moi lan 1 trong 2 nguon chua kip co du
- * du lieu (rat binh thuong khi 3 coroutine - MusicInput/MicInput/Mixer -
- * tranh CPU nhau tren Dispatchers.Default), phan doi 0 tao ra 1 "khoang
- * lang dot ngot" giua dong am thanh lien tuc - nghe ra dung tieng click/re.
- *
- * THIET KE MOI: vong lap KHONG con chay theo dong ho co dinh nua. Moi lan,
- * no CHO (poll voi delay ngan) den khi IT NHAT MOT trong 2 hang doi da co
- * du CHUNK_SIZE sample that su (khong gioi han ca 2 cung luc - vi 1 nguon
- * co the thuc su im lang that, khong phai lag), toi da MAX_WAIT_MS de
- * tranh treo vo han neu ca 2 nguon dung han. Nho vay gan nhu khong con phai
- * doi 0 "gia" do lech nhip CPU nua - chi doi 0 that (nguon do thuc su chua
- * co gi de gui, vi du im lang that hoac chua noi vao mic).
+ * ✅ CAP NHAT (sua loi "echo/lech 1 giay" phat hien qua test thuc te): 2
+ * hang doi truoc day dung ArrayDeque<Short> (boxing object, cham) va gioi
+ * han toi da 1 GIAY moi hang doi - khi xu ly cham hon du lieu den (rat de
+ * xay ra tren may bi gioi han hieu nang nen nhu Honor), du lieu don ung dan
+ * toi tran 1 giay, nghe ra dung nhu "2 nguon lech nhau ~1 giay". Doi sang
+ * ShortRingBuffer (mang nguyen thuy, khong boxing) VA giam tran xuong con
+ * ~200ms - neu co tut lai, do tre toi da cung chi ~200ms thay vi ca giay.
  */
 class LowLatencyMixer(private val outputRouter: OutputRouter) {
 
@@ -34,21 +76,15 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         private const val TAG = "LowLatencyMixer"
         private const val SAMPLE_RATE = 44100
 
-        // ✅ Tang tu 20ms len 40ms - cho them bien do chiu lech nhip CPU giua
-        // cac coroutine, giam tan suat phai xu ly khi du lieu chua kip toi.
         private const val CHUNK_MS = 40L
         private const val CHUNK_SIZE = (SAMPLE_RATE * CHUNK_MS / 1000L).toInt()
 
-        // Thoi gian poll ngan khi cho du lieu - can du nho de khong lam tang
-        // latency dang ke, nhung du lon de khong ton CPU vo ich.
         private const val POLL_INTERVAL_MS = 3L
-
-        // Cho toi da bao lau truoc khi danh chap nhan rut du lieu du chua du
-        // CHUNK_SIZE (vd 1 nguon thuc su dung han lau, khong phai lag ngan
-        // han) - tranh mixer treo vo han neu ca Music lan Vocal deu ngung.
         private const val MAX_WAIT_MS = 200L
 
-        private const val MAX_QUEUE_SIZE = SAMPLE_RATE
+        // ✅ Giam tu SAMPLE_RATE (1000ms) xuong ~200ms - chan do tre buffer
+        // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
+        private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
 
         fun mix(music: ShortArray, musicLen: Int, vocal: ShortArray, vocalLen: Int, outLength: Int): ShortArray {
             val out = ShortArray(outLength)
@@ -64,10 +100,8 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         }
     }
 
-    private val musicQueue = ArrayDeque<Short>()
-    private val vocalQueue = ArrayDeque<Short>()
-    private val musicLock = Any()
-    private val vocalLock = Any()
+    private val musicBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
+    private val vocalBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
 
     private var mixerJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default)
@@ -81,32 +115,11 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
     }
 
     fun pushMusic(buffer: ShortArray, size: Int) {
-        synchronized(musicLock) {
-            for (i in 0 until size) musicQueue.addLast(buffer[i])
-            while (musicQueue.size > MAX_QUEUE_SIZE) musicQueue.removeFirst()
-        }
+        musicBuffer.push(buffer, size)
     }
 
     fun pushVocal(buffer: ShortArray, size: Int) {
-        synchronized(vocalLock) {
-            for (i in 0 until size) vocalQueue.addLast(buffer[i])
-            while (vocalQueue.size > MAX_QUEUE_SIZE) vocalQueue.removeFirst()
-        }
-    }
-
-    private fun queueSize(queue: ArrayDeque<Short>, lock: Any): Int {
-        synchronized(lock) { return queue.size }
-    }
-
-    private fun drain(queue: ArrayDeque<Short>, lock: Any, count: Int): Pair<ShortArray, Int> {
-        synchronized(lock) {
-            val available = min(count, queue.size)
-            val out = ShortArray(count)
-            for (i in 0 until available) {
-                out[i] = queue.removeFirst()
-            }
-            return out to available
-        }
+        vocalBuffer.push(buffer, size)
     }
 
     fun start() {
@@ -115,27 +128,24 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
             return
         }
         running = true
-        synchronized(musicLock) { musicQueue.clear() }
-        synchronized(vocalLock) { vocalQueue.clear() }
+        musicBuffer.clear()
+        vocalBuffer.clear()
 
         mixerJob = scope.launch {
-            logBoth("✅ Bat dau mixer loop (che do cho du lieu that), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms)")
+            logBoth("✅ Bat dau mixer loop (ring buffer, khong boxing), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms), tran buffer=~${RING_BUFFER_CAPACITY}sample")
+            val musicChunk = ShortArray(CHUNK_SIZE)
+            val vocalChunk = ShortArray(CHUNK_SIZE)
+
             while (running) {
-                // ✅ Cho den khi IT NHAT MOT nguon co du CHUNK_SIZE sample that
-                // su, toi da MAX_WAIT_MS - xem giai thich chi tiet o dau file.
                 var waitedMs = 0L
-                while (running &&
-                    queueSize(musicQueue, musicLock) < CHUNK_SIZE &&
-                    queueSize(vocalQueue, vocalLock) < CHUNK_SIZE &&
-                    waitedMs < MAX_WAIT_MS
-                ) {
+                while (running && musicBuffer.size() < CHUNK_SIZE && vocalBuffer.size() < CHUNK_SIZE && waitedMs < MAX_WAIT_MS) {
                     delay(POLL_INTERVAL_MS)
                     waitedMs += POLL_INTERVAL_MS
                 }
                 if (!running) break
 
-                val (musicChunk, musicLen) = drain(musicQueue, musicLock, CHUNK_SIZE)
-                val (vocalChunk, vocalLen) = drain(vocalQueue, vocalLock, CHUNK_SIZE)
+                val musicLen = musicBuffer.drain(musicChunk, CHUNK_SIZE)
+                val vocalLen = vocalBuffer.drain(vocalChunk, CHUNK_SIZE)
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
             }
@@ -147,8 +157,8 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         running = false
         mixerJob?.cancel()
         mixerJob = null
-        synchronized(musicLock) { musicQueue.clear() }
-        synchronized(vocalLock) { vocalQueue.clear() }
+        musicBuffer.clear()
+        vocalBuffer.clear()
         logBoth("🛑 Da dung mixer")
     }
 }
