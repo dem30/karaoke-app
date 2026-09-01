@@ -76,6 +76,10 @@ class OutputRouter(
     // thuoc se tu dong lon len neu can (xem write()).
     private var stereoScratchBuffer = ShortArray(0)
 
+    // Dem so sample da qua ke tu lan log bien do cuoi - dung de log ~1 lan/s
+    // thay vi moi lan write() (tranh spam log).
+    private var outputAmplitudeLogCounter = 0
+
     @Volatile
     var totalFramesWritten: Long = 0
         private set
@@ -179,6 +183,19 @@ class OutputRouter(
         for (i in 0 until size) {
             stereoScratchBuffer[i * 2] = buffer[i]
             stereoScratchBuffer[i * 2 + 1] = buffer[i]
+        }
+
+        // Log bien do cua ban MIX CUOI CUNG thuc su ghi ra loa (khac voi log
+        // bien do input music/vocal rieng le o noi khac) - ~1 lan/giay de
+        // khong spam log. Day la diem gan nhat app co the do truoc khi mat
+        // dau vet vao AudioFlinger/HAL (noi co the bi OEM ap duck-gain).
+        outputAmplitudeLogCounter += size
+        if (outputAmplitudeLogCounter >= SAMPLE_RATE) {
+            outputAmplitudeLogCounter = 0
+            var sum = 0L
+            for (i in 0 until size) sum += kotlin.math.abs(buffer[i].toInt())
+            val avg = if (size > 0) sum / size else 0
+            logBoth("[OutputAmplitude] mixedAvg=$avg frame=$totalFramesWritten")
         }
 
         val written = track.write(stereoScratchBuffer, 0, requiredStereoSize)
