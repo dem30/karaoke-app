@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -29,6 +31,27 @@ import java.util.Locale
  * ben vung trong foreground service, khong phu thuoc Activity con song hay
  * khong - dung tinh than da xac lap tu Phase 1 (WakeLock + onTaskRemoved).
  *
+ * ✅ CAP NHAT (Phase 3 - production, thay the nut "Test Mute STREAM_MUSIC" +
+ * "Usage test" thu cong o MainActivity bang co che TU DONG): khi bat Mixer
+ * Test, service se:
+ *   1. Tu mute STREAM_MUSIC - da xac nhan qua test thu cong truoc do rang
+ *      AudioPlaybackCapture bat tin hieu TRUOC buoc ap volume he thong, nen
+ *      mute STREAM_MUSIC KHONG lam mat tin hieu MusicInput, chi lam YouTube
+ *      het tu phat truc tiep ra loa (tranh nghe DOI: vua YouTube goc vua
+ *      mixer).
+ *   2. Phat mixer qua usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) thay vi
+ *      USAGE_MEDIA mac dinh - vi STREAM_SYSTEM doc lap voi STREAM_MUSIC vua
+ *      mute o buoc 1 nen mixer khong bi im theo. Da test A/B qua Mic
+ *      Loopback (MainActivity): latency ngang MEDIA (~296-300ms ca 2), an
+ *      toan hon USAGE_VOICE_COMMUNICATION (khong co rui ro bi ep sang
+ *      Bluetooth SCO mono) va tot hon USAGE_ALARM (latency cao hon ~100ms +
+ *      co dau hieu de hu/feedback vi STREAM_ALARM luon o muc max).
+ *   3. Tam day STREAM_SYSTEM len max (vi mac dinh thuong thap, khong phai do
+ *      nguoi dung tung chinh tay) de mixer nghe du to, tuong tu bat buoc voi
+ *      MEDIA truoc day.
+ * Ca 2 stream duoc khoi phuc ve muc goc khi tat Mixer Test (hoac khi service
+ * bi huy dot ngot, qua stopCurrentSessionIfAny() -> stopMixerTestInternal()).
+ *
  * Dieu khien qua 2 Intent action rieng (KHONG dung chung voi flow
  * resultCode/resultData chinh de tranh xung dot):
  * - ACTION_START_MIXER_TEST: bat dau tron Music (dang chay san) + Mic moi.
@@ -47,6 +70,14 @@ class PlaybackCaptureService : Service() {
     private var micInput: MicInput? = null
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
+
+    // ✅ MOI (Phase 3 - production): luu muc goc cua 2 stream de mute/boost
+    // tu dong khi Mixer Test chay, khoi phuc khi tat - tranh nghe DOI
+    // (YouTube phat truc tiep + mixer phat lai) va tranh mixer nghe qua nho
+    // vi STREAM_SYSTEM mac dinh thap. Gia tri -1 nghia la "khong co gi dang
+    // can khoi phuc" - dung lam guard chong khoi phuc 2 lan.
+    private var savedStreamMusicVolume = -1
+    private var savedStreamSystemVolume = -1
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
@@ -126,7 +157,25 @@ class PlaybackCaptureService : Service() {
             return
         }
 
-        val router = OutputRouter(this).apply { start() }
+        // ✅ MOI: mute STREAM_MUSIC de YouTube khong tu phat ra loa song song voi
+        // mixer nua - da xac nhan qua "Test Mute STREAM_MUSIC" (MainActivity)
+        // rang MusicInput van capture binh thuong du STREAM_MUSIC = 0, vi capture
+        // tap TRUOC buoc ap volume he thong.
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        savedStreamMusicVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        logBoth("🔇 Da mute STREAM_MUSIC (muc goc=$savedStreamMusicVolume) - YouTube se im, chi con mixer phat ra loa.")
+
+        // ✅ MOI: usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) cho output mixer -
+        // da test latency ngang MEDIA (~296-300ms ca 2), khong dinh rui ro SCO
+        // nhu VOICE_COMMUNICATION, khong hu/cham nhu ALARM (xem test truoc).
+        // Doc lap voi STREAM_MUSIC vua mute o tren nen KHONG bi im theo.
+        savedStreamSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
+        val maxSystemVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
+        audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, maxSystemVolume, 0)
+        logBoth("🔊 Da day STREAM_SYSTEM len max=$maxSystemVolume (muc goc=$savedStreamSystemVolume) de mixer nghe du to.")
+
+        val router = OutputRouter(this, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).apply { start() }
         val mix = LowLatencyMixer(router).apply { start() }
         val mic = MicInput(this)
 
@@ -144,7 +193,7 @@ class PlaybackCaptureService : Service() {
             mix.pushVocal(buffer, size)
         })
 
-        logBoth("✅ Da bat dau Mixer Test (Phase 3) - dang tron Music + Mic, phat qua loa.")
+        logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
     }
 
     private fun stopMixerTestInternal() {
@@ -155,6 +204,22 @@ class PlaybackCaptureService : Service() {
         mixer = null
         mixerOutputRouter?.stop()
         mixerOutputRouter = null
+
+        // ✅ MOI: khoi phuc ca 2 stream da mute/boost o startMixerTestInternal() -
+        // guard bang >= 0 de tranh khoi phuc 2 lan neu ham nay bi goi lai (vd tu
+        // stopCurrentSessionIfAny() VA onDestroy() lien tiep).
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (savedStreamMusicVolume >= 0) {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedStreamMusicVolume, 0)
+            logBoth("Da khoi phuc STREAM_MUSIC ve muc goc=$savedStreamMusicVolume")
+            savedStreamMusicVolume = -1
+        }
+        if (savedStreamSystemVolume >= 0) {
+            audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, savedStreamSystemVolume, 0)
+            logBoth("Da khoi phuc STREAM_SYSTEM ve muc goc=$savedStreamSystemVolume")
+            savedStreamSystemVolume = -1
+        }
+
         logBoth("🛑 Da dung Mixer Test (Phase 3). MusicInput (Phase 1) khong bi anh huong, van tiep tuc chay.")
     }
 
