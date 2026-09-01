@@ -82,6 +82,11 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         private const val POLL_INTERVAL_MS = 3L
         private const val MAX_WAIT_MS = 200L
 
+        // ✅ MOI (giam log du thua): tang tu 1000ms -> 3000ms, dong bo voi
+        // MusicInput/MicInput - van du day do phan giai theo doi do sau
+        // queue, giam 3 lan so dong log.
+        private const val QUEUE_LOG_INTERVAL_MS = 3000L
+
         // ✅ Giam tu SAMPLE_RATE (1000ms) xuong ~200ms - chan do tre buffer
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
@@ -196,7 +201,7 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
                 // dao dong quanh 20-60ms) voi "producer/consumer lech toc do
                 // lien tuc" (1 ben tang dan toi gan RING_BUFFER_CAPACITY).
                 val now = System.currentTimeMillis()
-                if (now - lastQueueLogTime >= 1000) {
+                if (now - lastQueueLogTime >= QUEUE_LOG_INTERVAL_MS) {
                     val musicMs = musicBuffer.size() * 1000L / SAMPLE_RATE
                     val vocalMs = vocalBuffer.size() * 1000L / SAMPLE_RATE
                     logBoth("queue M=${musicMs}ms V=${vocalMs}ms (waited=${waitedMs}ms lan cuoi)")

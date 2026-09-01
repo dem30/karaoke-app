@@ -70,6 +70,11 @@ class MicInput(private val context: Context) {
         // Thoi gian "nghi" sau 1 lan phat hien, tranh dem trung 1 tieng vo
         // thanh nhieu lan hoac bat lien tuc khi con tieng vang/echo.
         private const val COOLDOWN_NANOS = 1_500_000_000L
+
+        // ✅ MOI (giam log du thua): tang tu 1000ms -> 3000ms, dong bo voi
+        // MusicInput - van du day do phan giai de thay xu huong, giam 3 lan
+        // so dong log.
+        private const val AMPLITUDE_LOG_INTERVAL_MS = 3000L
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -213,9 +218,9 @@ class MicInput(private val context: Context) {
                 }
 
                 val now = System.currentTimeMillis()
-                if (now - lastLogTime >= 1000) {
+                if (now - lastLogTime >= AMPLITUDE_LOG_INTERVAL_MS) {
                     val avg = if (sampleCount > 0) sumAmplitude / sampleCount else 0
-                    logBoth("amplitude mic trung binh 1s qua: $avg (sampleCount=$sampleCount)")
+                    logBoth("amplitude mic trung binh ${AMPLITUDE_LOG_INTERVAL_MS / 1000}s qua: $avg (sampleCount=$sampleCount)")
                     sumAmplitude = 0
                     sampleCount = 0
                     lastLogTime = now

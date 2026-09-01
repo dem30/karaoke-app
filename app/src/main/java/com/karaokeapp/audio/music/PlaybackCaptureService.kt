@@ -115,6 +115,16 @@ class PlaybackCaptureService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Default)
     private var volumeGuardJob: Job? = null
 
+    // ✅ MOI (giam log du thua): dem so lan vong lap guard da chay - dung de
+    // CHI in dong trang thai "[GuardTick] ..." day du moi
+    // GUARD_STATUS_LOG_EVERY_N_TICKS lan, thay vi MOI 300ms/lan (truoc day
+    // ra ~200 dong/phut, lam log 500 dong (MAX_LINES cua CaptureLogBus) day
+    // trong chua toi 3 phut va nguoi dung khong copy-paste noi de gui debug).
+    // Viec EP volume/unmute (phan quan trong that su) VAN chay du moi 300ms
+    // nhu cu - CHI co dong IN THONG TIN la bi gian cach, khong anh huong toc
+    // do phan ung cua guard.
+    private var guardTickCount = 0
+
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     companion object {
@@ -128,6 +138,13 @@ class PlaybackCaptureService : Service() {
 
         const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
+
+        // ✅ MOI: guard loop chay 300ms/lan (giu nguyen, can nhanh de bat kip
+        // AVRCP resync cua Bluetooth) nhung dong log trang thai day du chi in
+        // 1 lan trong so N lan chay - 10 lan * 300ms = ~3s/dong, van du day
+        // do phan giai de thay xu huong "nho dan qua thoi gian" nhung giam
+        // ~10 lan so luong dong log so voi truoc.
+        private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
 
         @Volatile
         private var capturingActive = false
@@ -257,6 +274,7 @@ class PlaybackCaptureService : Service() {
 
         // ✅ MOI: bat dau vong lap guard volume ~300ms/lan - xem giai thich
         // chi tiet o khai bao volumeGuardJob ben tren.
+        guardTickCount = 0
         volumeGuardJob = serviceScope.launch {
             while (isActive) {
                 reassertStreamSystemVolumeIfMixerRunning()
@@ -359,12 +377,19 @@ class PlaybackCaptureService : Service() {
         val musicMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val musicMuted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
 
-        logBoth(
-            "[GuardTick] STREAM_SYSTEM current=$current/$max isMuted=$isMuted | " +
-                "STREAM_MUSIC current=$musicCurrent/$musicMax isMuted=$musicMuted " +
-                "(ky vong STREAM_MUSIC LUON =0 trong luc Mixer Test chay - neu khac 0, " +
-                "day la bang chung xac nhan gia thuyet YouTube tu set lai volume)"
-        )
+        // ✅ MOI (giam log du thua): dong trang thai day du nay CHI in moi
+        // GUARD_STATUS_LOG_EVERY_N_TICKS lan (~3s/dong o 300ms/tick) - cac
+        // dong [AutoReassert] canh bao ben duoi (thuc su co su kien bat
+        // thuong xay ra) VAN in MOI LAN, khong bi anh huong boi throttle nay.
+        guardTickCount++
+        if (guardTickCount % GUARD_STATUS_LOG_EVERY_N_TICKS == 0) {
+            logBoth(
+                "[GuardTick] STREAM_SYSTEM current=$current/$max isMuted=$isMuted | " +
+                    "STREAM_MUSIC current=$musicCurrent/$musicMax isMuted=$musicMuted " +
+                    "(ky vong STREAM_MUSIC LUON =0 trong luc Mixer Test chay - neu khac 0, " +
+                    "day la bang chung xac nhan gia thuyet YouTube tu set lai volume)"
+            )
+        }
 
         // ✅ MOI: neu phat hien STREAM_MUSIC bi keo khac 0 (ngoai y muon cua
         // app - app chi set 1 LAN duy nhat luc bat dau, KHONG co vong lap

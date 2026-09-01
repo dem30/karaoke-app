@@ -55,6 +55,12 @@ class MusicInput(
         private const val SAMPLE_RATE = 44100
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+
+        // ✅ MOI (giam log du thua): tang tu 1000ms -> 3000ms. Van du day do
+        // phan giai de thay xu huong am luong tang/giam qua thoi gian, nhung
+        // giam 3 lan so dong log so voi truoc (dong log nay chay lien tuc
+        // suot ca session capture nhac, khong chi luc Mixer Test).
+        private const val AMPLITUDE_LOG_INTERVAL_MS = 3000L
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -123,9 +129,9 @@ class MusicInput(
                 }
 
                 val now = System.currentTimeMillis()
-                if (now - lastLogTime >= 1000) {
+                if (now - lastLogTime >= AMPLITUDE_LOG_INTERVAL_MS) {
                     val avg = if (sampleCount > 0) sumAmplitude / sampleCount else 0
-                    logBoth("amplitude trung binh 1s qua: $avg (sampleCount=$sampleCount)")
+                    logBoth("amplitude trung binh ${AMPLITUDE_LOG_INTERVAL_MS / 1000}s qua: $avg (sampleCount=$sampleCount)")
                     // ✅ SUA LOI GIAT/RE (phat hien qua test Phase 3): KHONG goi
                     // onAmplitudeTick truc tiep (dong bo) nua - callback nay
                     // cuoi cung goi toi NotificationManager.notify(), la 1 IPC
