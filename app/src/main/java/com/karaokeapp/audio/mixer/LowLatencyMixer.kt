@@ -136,9 +136,21 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
             val musicChunk = ShortArray(CHUNK_SIZE)
             val vocalChunk = ShortArray(CHUNK_SIZE)
 
+            var lastQueueLogTime = System.currentTimeMillis()
+
             while (running) {
                 var waitedMs = 0L
-                while (running && musicBuffer.size() < CHUNK_SIZE && vocalBuffer.size() < CHUNK_SIZE && waitedMs < MAX_WAIT_MS) {
+                // ✅ SUA LOI (dieu kien cho sai): truoc day dung "&&" giua 2
+                // buffer, nghia la vong lap CHI tiep tuc cho khi CA HAI deu
+                // chua du 1 chunk - hau qua la no THOAT NGAY khi CHI 1 ben du,
+                // roi drain ben con lai du thieu (bi zero-fill), gay hut/lech
+                // tieng. Doi sang "||": tiep tuc cho khi CON IT NHAT 1 ben
+                // CHUA du, tuc la chi thoat khi CA HAI da du (hoac het
+                // MAX_WAIT_MS de tranh treo mixer vinh vien neu 1 nguon chet).
+                while (running &&
+                    (musicBuffer.size() < CHUNK_SIZE || vocalBuffer.size() < CHUNK_SIZE) &&
+                    waitedMs < MAX_WAIT_MS
+                ) {
                     delay(POLL_INTERVAL_MS)
                     waitedMs += POLL_INTERVAL_MS
                 }
@@ -148,6 +160,18 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
                 val vocalLen = vocalBuffer.drain(vocalChunk, CHUNK_SIZE)
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
+
+                // ✅ MOI: log dinh ky (~1 lan/giay) do sau (tinh theo ms) cua
+                // ca 2 hang doi, giup phan biet "lech dong bo nhat thoi" (queue
+                // dao dong quanh 20-60ms) voi "producer/consumer lech toc do
+                // lien tuc" (1 ben tang dan toi gan RING_BUFFER_CAPACITY).
+                val now = System.currentTimeMillis()
+                if (now - lastQueueLogTime >= 1000) {
+                    val musicMs = musicBuffer.size() * 1000L / SAMPLE_RATE
+                    val vocalMs = vocalBuffer.size() * 1000L / SAMPLE_RATE
+                    logBoth("queue M=${musicMs}ms V=${vocalMs}ms (waited=${waitedMs}ms lan cuoi)")
+                    lastQueueLogTime = now
+                }
             }
             logBoth("Mixer loop da dung.")
         }
