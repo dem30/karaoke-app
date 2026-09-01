@@ -13,38 +13,43 @@ import kotlin.math.min
 /**
  * Phase 3 - tron 2 nguon PCM (Music + Vocal) thanh 1 output stream.
  *
- * Thiet ke: MusicInput va MicInput chay tren 2 coroutine doc lap, moi ben
- * KHONG goi truc tiep vao nhau - thay vao do day PCM vao 1 hang doi rieng
- * (pushMusic/pushVocal, thread-safe qua synchronized). 1 coroutine mixer
- * rieng chay theo NHIP CO DINH (~20ms/lan), rut ra dung so luong sample can
- * thiet tu MOI hang doi (dem 0 - "silence" - neu hang doi chua co du du
- * lieu, tranh mixer bi khoa cho 1 nguon cham hon nguon kia), cong lai qua
- * mix(), roi ghi ra OutputRouter.
+ * ✅ CAP NHAT (sua loi re/giat/rot rot phat hien qua test thuc te): thiet ke
+ * BAN DAU dung dong ho co dinh (delay(20ms) roi rut DUNG CHUNK_SIZE tu ca 2
+ * hang doi, doi 0 cho phan thieu) - moi lan 1 trong 2 nguon chua kip co du
+ * du lieu (rat binh thuong khi 3 coroutine - MusicInput/MicInput/Mixer -
+ * tranh CPU nhau tren Dispatchers.Default), phan doi 0 tao ra 1 "khoang
+ * lang dot ngot" giua dong am thanh lien tuc - nghe ra dung tieng click/re.
  *
- * Day la thiet ke DON GIAN cho Phase 3 (dung nguyen tac "khong toi uu som"
- * cua PLAN.md) - dung delay() co dinh thay vi dong bo chinh xac theo
- * AudioTrack, co the co jitter nho. Neu Phase 4/5 phat hien desync ro ret,
- * day la noi dau tien can quay lai cai thien.
+ * THIET KE MOI: vong lap KHONG con chay theo dong ho co dinh nua. Moi lan,
+ * no CHO (poll voi delay ngan) den khi IT NHAT MOT trong 2 hang doi da co
+ * du CHUNK_SIZE sample that su (khong gioi han ca 2 cung luc - vi 1 nguon
+ * co the thuc su im lang that, khong phai lag), toi da MAX_WAIT_MS de
+ * tranh treo vo han neu ca 2 nguon dung han. Nho vay gan nhu khong con phai
+ * doi 0 "gia" do lech nhip CPU nua - chi doi 0 that (nguon do thuc su chua
+ * co gi de gui, vi du im lang that hoac chua noi vao mic).
  */
 class LowLatencyMixer(private val outputRouter: OutputRouter) {
 
     companion object {
         private const val TAG = "LowLatencyMixer"
         private const val SAMPLE_RATE = 44100
-        private const val CHUNK_MS = 20L
 
-        // 20ms tai 44100Hz = 882 sample - kich thuoc 1 lan rut/mix/ghi.
+        // ✅ Tang tu 20ms len 40ms - cho them bien do chiu lech nhip CPU giua
+        // cac coroutine, giam tan suat phai xu ly khi du lieu chua kip toi.
+        private const val CHUNK_MS = 40L
         private const val CHUNK_SIZE = (SAMPLE_RATE * CHUNK_MS / 1000L).toInt()
 
-        // Gioi han do dai toi da moi hang doi (1 giay) - tranh phinh to vo han
-        // neu 1 nguon dung cung cap du lieu lau (vd YouTube bi pause) trong
-        // khi nguon kia van chay binh thuong.
+        // Thoi gian poll ngan khi cho du lieu - can du nho de khong lam tang
+        // latency dang ke, nhung du lon de khong ton CPU vo ich.
+        private const val POLL_INTERVAL_MS = 3L
+
+        // Cho toi da bao lau truoc khi danh chap nhan rut du lieu du chua du
+        // CHUNK_SIZE (vd 1 nguon thuc su dung han lau, khong phai lag ngan
+        // han) - tranh mixer treo vo han neu ca Music lan Vocal deu ngung.
+        private const val MAX_WAIT_MS = 200L
+
         private const val MAX_QUEUE_SIZE = SAMPLE_RATE
 
-        /**
-         * Cong 2 mang PCM theo tung sample, clamp ve khoang Short hop le de
-         * tranh clipping/tran so khi cong 2 gia tri lon.
-         */
         fun mix(music: ShortArray, musicLen: Int, vocal: ShortArray, vocalLen: Int, outLength: Int): ShortArray {
             val out = ShortArray(outLength)
             for (i in 0 until outLength) {
@@ -75,7 +80,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         CaptureLogBus.log("[LowLatencyMixer] $msg")
     }
 
-    /** Goi tu callback PCM cua MusicInput. */
     fun pushMusic(buffer: ShortArray, size: Int) {
         synchronized(musicLock) {
             for (i in 0 until size) musicQueue.addLast(buffer[i])
@@ -83,7 +87,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         }
     }
 
-    /** Goi tu callback PCM cua MicInput. */
     fun pushVocal(buffer: ShortArray, size: Int) {
         synchronized(vocalLock) {
             for (i in 0 until size) vocalQueue.addLast(buffer[i])
@@ -91,7 +94,10 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         }
     }
 
-    /** Rut toi da "count" sample tu 1 hang doi, dem 0 cho phan con thieu. Tra ve (mang, soLuongThatSuLayDuoc). */
+    private fun queueSize(queue: ArrayDeque<Short>, lock: Any): Int {
+        synchronized(lock) { return queue.size }
+    }
+
     private fun drain(queue: ArrayDeque<Short>, lock: Any, count: Int): Pair<ShortArray, Int> {
         synchronized(lock) {
             val available = min(count, queue.size)
@@ -113,13 +119,25 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         synchronized(vocalLock) { vocalQueue.clear() }
 
         mixerJob = scope.launch {
-            logBoth("✅ Bat dau mixer loop, chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms/lan)")
+            logBoth("✅ Bat dau mixer loop (che do cho du lieu that), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms)")
             while (running) {
+                // ✅ Cho den khi IT NHAT MOT nguon co du CHUNK_SIZE sample that
+                // su, toi da MAX_WAIT_MS - xem giai thich chi tiet o dau file.
+                var waitedMs = 0L
+                while (running &&
+                    queueSize(musicQueue, musicLock) < CHUNK_SIZE &&
+                    queueSize(vocalQueue, vocalLock) < CHUNK_SIZE &&
+                    waitedMs < MAX_WAIT_MS
+                ) {
+                    delay(POLL_INTERVAL_MS)
+                    waitedMs += POLL_INTERVAL_MS
+                }
+                if (!running) break
+
                 val (musicChunk, musicLen) = drain(musicQueue, musicLock, CHUNK_SIZE)
                 val (vocalChunk, vocalLen) = drain(vocalQueue, vocalLock, CHUNK_SIZE)
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
-                delay(CHUNK_MS)
             }
             logBoth("Mixer loop da dung.")
         }

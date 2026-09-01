@@ -300,6 +300,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // ✅ MOI: chan chay chong 2 pipeline mic/output cung luc - da xac nhan
+        // qua debug thuc te gay ra "re, rot rot" va mat tieng tung luc do 2
+        // AudioRecord/AudioTrack tranh gianh tai nguyen doc quyen cua mic/loa.
+        if (mixerTestRunning) {
+            Toast.makeText(
+                this,
+                "Dang chay Mixer Test - hay tat Mixer Test truoc khi bat Mic Loopback",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -349,6 +361,18 @@ class MainActivity : AppCompatActivity() {
     // dang chay - xem PlaybackCaptureService.ACTION_START_MIXER_TEST/
     // ACTION_STOP_MIXER_TEST de biet Service xu ly the nao.
     private fun toggleMixerTest(button: Button) {
+        // ✅ MOI: chan chay chong voi Mic Loopback (xem giai thich chi tiet
+        // trong toggleMicLoopback()) - chi kiem tra khi dang BAT mixer test
+        // (mixerTestRunning=false), khong chan luc TAT.
+        if (!mixerTestRunning && micLoopbackRunning) {
+            Toast.makeText(
+                this,
+                "Dang chay Mic Loopback - hay tat Mic Loopback truoc khi bat Mixer Test",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         if (!PlaybackCaptureService.isCapturing()) {
             Toast.makeText(
                 this,
