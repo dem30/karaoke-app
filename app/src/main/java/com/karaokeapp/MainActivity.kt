@@ -61,6 +61,12 @@ class MainActivity : AppCompatActivity() {
     private var outputRouter: OutputRouter? = null
     private var micLoopbackRunning = false
 
+    // ✅ MOI (Phase 3): trang thai bat/tat mixer test - chi gui Intent
+    // action toi Service, KHONG tu giu MicInput/Mixer o Activity (khac voi
+    // Mic Loopback cua Phase 2, vi mixer test can chay ben trong Service de
+    // song cung MusicInput dang capture nhac ngam).
+    private var mixerTestRunning = false
+
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -164,6 +170,14 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { toggleMicLoopback(this) }
         }
 
+        // ✅ MOI (Phase 3): nut bat/tat test tron Music + Mic. Chi co tac
+        // dung khi PlaybackCaptureService dang capture nhac (Phase 1) - neu
+        // chua, se bao loi qua log thay vi lam gi ca.
+        val mixerTestButton = Button(this).apply {
+            text = "Bat Mixer Test"
+            setOnClickListener { toggleMixerTest(this) }
+        }
+
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(retryButton)
@@ -174,6 +188,7 @@ class MainActivity : AppCompatActivity() {
         val buttonRow2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(micLoopbackButton)
+            addView(mixerTestButton)
         }
 
         logText = TextView(this).apply {
@@ -328,5 +343,38 @@ class MainActivity : AppCompatActivity() {
         // day la test thu cong, khong can chay nen nhu PlaybackCaptureService.
         micInput?.stopCapture()
         outputRouter?.stop()
+    }
+
+    // ✅ MOI (Phase 3): bat/tat mixer test qua Intent action gui toi Service
+    // dang chay - xem PlaybackCaptureService.ACTION_START_MIXER_TEST/
+    // ACTION_STOP_MIXER_TEST de biet Service xu ly the nao.
+    private fun toggleMixerTest(button: Button) {
+        if (!PlaybackCaptureService.isCapturing()) {
+            Toast.makeText(
+                this,
+                "Chua capture nhac (Phase 1) - bam 'Xin quyen lai' truoc khi test mixer",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "Can quyen RECORD_AUDIO", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val action = if (mixerTestRunning) {
+            PlaybackCaptureService.ACTION_STOP_MIXER_TEST
+        } else {
+            PlaybackCaptureService.ACTION_START_MIXER_TEST
+        }
+        val intent = Intent(this, PlaybackCaptureService::class.java).apply { this.action = action }
+        ContextCompat.startForegroundService(this, intent)
+
+        mixerTestRunning = !mixerTestRunning
+        button.text = if (mixerTestRunning) "Tat Mixer Test" else "Bat Mixer Test"
+        CaptureLogBus.log("[Activity] Gui action=$action toi Service (Mixer Test Phase 3)")
     }
 }

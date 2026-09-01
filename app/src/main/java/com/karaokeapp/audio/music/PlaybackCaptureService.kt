@@ -13,36 +13,40 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.karaokeapp.audio.mic.MicInput
+import com.karaokeapp.audio.mixer.LowLatencyMixer
+import com.karaokeapp.audio.output.OutputRouter
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 /**
  * Foreground service bat buoc de dung MediaProjection cho AudioPlaybackCapture.
  *
- * ✅ CAP NHAT (sua bug MusicInput chay song song): onStartCommand() gio LUON
- * dung han session cu (neu co) truoc khi tao session moi - truoc day ghi de
- * truc tiep bien mediaProjection/musicInput, bo mac coroutine cu chay tiep tren
- * AudioRecord da bi vo hieu hoa ngam, sinh loi -2 lap lai vo han xen ke voi
- * session moi dang chay dung.
+ * ✅ CAP NHAT (Phase 3): them kha nang bat/tat "mixer test" - chay them
+ * MicInput + LowLatencyMixer + OutputRouter NGAY TRONG service nay (khong
+ * phai trong Activity nhu Mic Loopback rieng le cua Phase 2), vi day moi la
+ * kien truc dung voi muc tieu cuoi: toan bo pipeline xu ly am thanh song
+ * ben vung trong foreground service, khong phu thuoc Activity con song hay
+ * khong - dung tinh than da xac lap tu Phase 1 (WakeLock + onTaskRemoved).
  *
- * ✅ CAP NHAT (chan MainActivity kich hoat lai flow khi da dang capture): them
- * companion isCapturing() de MainActivity kiem tra TRUOC khi tu dong bam lai
- * flow xin quyen trong onCreate() - tranh tao session MediaProjection thua
- * moi lan Activity duoc tao lai (xoay man hinh, mo lai app trong khi service
- * van con song...) trong khi capture hien tai van con dang chay tot.
- *
- * ✅ CAP NHAT (kiem chung "dong bang" khi chay nen): notification gio hien thi
- * thoi diem nhan amplitude GAN NHAT (cap nhat moi giay tu MusicInput). Neu
- * dong bang tien trinh that su xay ra, dong chu nay se NGUNG cap nhat va
- * "dung yen" trong notification shade - xem duoc TRUC TIEP tu man hinh khoa
- * hoac keo notification xuong, KHONG can mo lai app (mo lai app se lam mat co
- * hoi quan sat vi kich hoat lai flow xin quyen).
+ * Dieu khien qua 2 Intent action rieng (KHONG dung chung voi flow
+ * resultCode/resultData chinh de tranh xung dot):
+ * - ACTION_START_MIXER_TEST: bat dau tron Music (dang chay san) + Mic moi.
+ * - ACTION_STOP_MIXER_TEST: dung mixer test, MusicInput van tiep tuc chay
+ *   binh thuong (khong anh huong Phase 1).
  */
 class PlaybackCaptureService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var musicInput: MusicInput? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ✅ MOI (Phase 3): 3 thanh phan cua mixer test, doc lap voi session
+    // capture nhac chinh - co the bat/tat rieng ma khong lam gian doan
+    // MusicInput dang chay.
+    private var micInput: MicInput? = null
+    private var mixer: LowLatencyMixer? = null
+    private var mixerOutputRouter: OutputRouter? = null
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
@@ -55,9 +59,9 @@ class PlaybackCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
 
-        // ✅ MOI: co static don gian bao hieu service co dang giu 1 session
-        // capture hop le hay khong - MainActivity doc co nay truoc khi tu dong
-        // kich hoat lai flow xin quyen trong onCreate().
+        const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
+        const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
+
         @Volatile
         private var capturingActive = false
 
@@ -99,16 +103,59 @@ class PlaybackCaptureService : Service() {
         }
     }
 
-    /** Dung han session capture hien tai (neu co) mot cach an toan, day du. */
     private fun stopCurrentSessionIfAny() {
         if (musicInput != null || mediaProjection != null) {
             logBoth("⚠️ Phat hien session capture cu con song - dung han truoc khi tao session moi.")
         }
+        stopMixerTestInternal()
         musicInput?.stopCapture()
         musicInput = null
         mediaProjection?.stop()
         mediaProjection = null
         capturingActive = false
+    }
+
+    /** Phase 3: bat dau tron Music (dang chay) + Mic moi, phat ra qua OutputRouter rieng. */
+    private fun startMixerTestInternal() {
+        if (!capturingActive || musicInput == null) {
+            logBoth("❌ Chua co MusicInput dang chay - phai bat capture nhac (Phase 1) truoc khi test mixer.", isError = true)
+            return
+        }
+        if (mixer != null) {
+            logBoth("⚠️ Mixer test da chay roi, bo qua.")
+            return
+        }
+
+        val router = OutputRouter(this).apply { start() }
+        val mix = LowLatencyMixer(router).apply { start() }
+        val mic = MicInput(this)
+
+        mixerOutputRouter = router
+        mixer = mix
+        micInput = mic
+
+        // ✅ Noi MusicInput hien tai vao mixer: vi MusicInput da duoc tao TU
+        // TRUOC (o onStartCommand chinh) voi onPcmChunk da tro ve mixerRef
+        // (xem ham buildMusicPcmForwarder() ben duoi) - khong can lam gi them
+        // o day, chi can gan bien mixer o tren la MusicInput's callback se tu
+        // dong bat dau day du lieu vao no.
+
+        mic.startCapture { buffer, size ->
+            mix.pushVocal(buffer, size)
+        }
+
+        logBoth("✅ Da bat dau Mixer Test (Phase 3) - dang tron Music + Mic, phat qua loa.")
+    }
+
+    private fun stopMixerTestInternal() {
+        if (mixer == null && micInput == null && mixerOutputRouter == null) return
+        micInput?.stopCapture()
+        micInput = null
+        mixer?.stop()
+        mixer = null
+        mixerOutputRouter?.stop()
+        mixerOutputRouter = null
+        logBoth("🛑 Da dung Mixer Test (Phase 3). MusicInput (Phase 1) khong bi anh huong, van tiep tuc chay.")
     }
 
     override fun onCreate() {
@@ -117,6 +164,19 @@ class PlaybackCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // ✅ MOI (Phase 3): xu ly 2 action rieng cho mixer test TRUOC, khong
+        // dung chung nhanh xu ly resultCode/resultData ben duoi.
+        when (intent?.action) {
+            ACTION_START_MIXER_TEST -> {
+                startMixerTestInternal()
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_MIXER_TEST -> {
+                stopMixerTestInternal()
+                return START_NOT_STICKY
+            }
+        }
+
         startForeground(NOTIFICATION_ID, buildNotification("Dang khoi dong..."))
         acquireWakeLock()
 
@@ -140,9 +200,6 @@ class PlaybackCaptureService : Service() {
             return START_NOT_STICKY
         }
 
-        // ✅ SUA LOI CHINH: dung han session cu TRUOC KHI tao session moi - khong
-        // con ghi de truc tiep len bien nhu truoc, tranh coroutine cu chay mai
-        // (xem giai thich day du trong MusicInput.kt va comment dau file).
         stopCurrentSessionIfAny()
 
         val projectionManager =
@@ -158,6 +215,7 @@ class PlaybackCaptureService : Service() {
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 logBoth("MediaProjection.onStop() - he thong da thu hoi quyen capture")
+                stopMixerTestInternal()
                 musicInput?.stopCapture()
                 musicInput = null
                 capturingActive = false
@@ -166,12 +224,19 @@ class PlaybackCaptureService : Service() {
         }, null)
 
         mediaProjection = projection
-        musicInput = MusicInput(projection) { avgAmplitude ->
-            // ✅ MOI: cap nhat notification real-time moi giay - xem giai thich o
-            // comment dau file ve muc dich kiem chung "dong bang" tien trinh.
-            val now = timeFormat.format(java.util.Date())
-            updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
-        }.apply { startCapture() }
+        musicInput = MusicInput(
+            mediaProjection = projection,
+            onAmplitudeTick = { avgAmplitude ->
+                val now = timeFormat.format(java.util.Date())
+                updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
+            },
+            onPcmChunk = { buffer, size ->
+                // ✅ Phase 3: neu mixer test dang chay, day PCM nhac vao. Neu
+                // chua bat mixer, mixer == null nen dong nay khong lam gi ca -
+                // khong anh huong Phase 1 khi chua test mixer.
+                mixer?.pushMusic(buffer, size)
+            }
+        ).apply { startCapture() }
         capturingActive = true
 
         return START_NOT_STICKY

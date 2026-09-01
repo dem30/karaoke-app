@@ -7,6 +7,7 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
@@ -20,34 +21,32 @@ import kotlin.math.abs
  *
  * Pipeline: App phat nhac -> AudioPlaybackCaptureConfiguration -> AudioRecord -> PCM
  *
- * ✅ CAP NHAT: them tham so onAmplitudeTick (optional) - goi lai moi giay voi gia
- * tri amplitude trung binh vua tinh duoc, de PlaybackCaptureService co the cap
- * nhat notification REAL-TIME. Muc dich: cho phep nguoi dung kiem tra tu
- * notification shade (khong can mo lai app - mo lai app se kich hoat lai toan
- * bo flow xin quyen) xem capture co con dang chay that su khi app bi thu
- * xuong/man hinh tat hay khong, de phan biet 2 kha nang: (a) tien trinh van
- * chay binh thuong nen nhung khong co UI de xem log, hay (b) tien trinh da bi
- * OS "dong bang" (frozen) - luc do notification cung se NGUNG cap nhat, vi
- * chinh coroutine goi callback nay cung bi dong bang theo.
+ * ✅ CAP NHAT (Phase 3 - QUAN TRONG, chong vong lap phan hoi so): them
+ * .excludeUid(Process.myUid()) vao captureConfig. Ly do: AudioPlaybackCaptureConfiguration
+ * voi addMatchingUsage(USAGE_MEDIA) bat MOI audio co nhan USAGE_MEDIA tren
+ * may, KE CA audio do CHINH APP NAY tu phat ra (da xac nhan qua debug Phase
+ * 2 - MusicInput vo tinh bat lai chinh am thanh test tone cua OutputRouter).
+ * O Phase 3, OutputRouter se phat ra BAN MIX (nhac + giong hat) - neu khong
+ * loai tru chinh app minh, MusicInput se bat lai ban mix do, cong tiep vao
+ * chu ky mix tiep theo, tao vong lap phan hoi SO (khong phai vat ly) khien
+ * giong hat bi cong don lap lai vo han, bien do tang dan.
+ *
+ * ✅ CAP NHAT (Phase 3): them tham so onPcmChunk (optional) - goi lai voi PCM
+ * THO moi lan doc duoc 1 buffer, de LowLatencyMixer tieu thu truc tiep. Giu
+ * nguyen onAmplitudeTick (dung cho notification real-time tu Phase 1) -
+ * ca 2 callback cung ton tai song song, khong anh huong nhau.
  */
 @RequiresApi(Build.VERSION_CODES.Q)
 class MusicInput(
     private val mediaProjection: MediaProjection,
-    private val onAmplitudeTick: ((Long) -> Unit)? = null
+    private val onAmplitudeTick: ((Long) -> Unit)? = null,
+    private val onPcmChunk: ((ShortArray, Int) -> Unit)? = null
 ) {
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default)
 
-    // ✅ MOI: co bao hieu coroutine capture nen dung han (dat true trong
-    // stopCapture() TRUOC KHI release AudioRecord). Vong lap doc trong dung
-    // co nay thay vi chi kiem tra "audioRecord != null" - truoc day sau khi
-    // stopCapture() goi audioRecord = null, NEU coroutine dang o giua 1 lan
-    // goi record.read() (bien local "record" van con tro toi object cu, KHONG
-    // phai audioRecord field), no van tiep tuc doc tren object da release,
-    // sinh loi -2 (ERROR_BAD_VALUE) lien tuc mai mai vi khong co dieu kien nao
-    // trong vong lap kiem tra lai cong bang field da bi null hoa ca.
     @Volatile
     private var shouldStop = false
 
@@ -63,17 +62,16 @@ class MusicInput(
         CaptureLogBus.log("[MusicInput] $msg")
     }
 
-    /**
-     * Bat dau capture. Can duoc goi tu 1 Service (khong phai Activity truc
-     * tiep) vi MediaProjection yeu cau chay trong context foreground service
-     * theo quy dinh cua Android 10+.
-     */
     @SuppressLint("MissingPermission") // RECORD_AUDIO da xin o MainActivity truoc khi toi day
     fun startCapture() {
         shouldStop = false
 
         val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            // ✅ SUA LOI QUAN TRONG (xem giai thich dau file): loai tru chinh
+            // app nay ra khoi pham vi capture, tranh bat lai am thanh do
+            // chinh OutputRouter cua app tu phat ra.
+            .excludeUid(Process.myUid())
             .build()
 
         val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
@@ -102,7 +100,7 @@ class MusicInput(
 
         audioRecord = record
         record.startRecording()
-        logBoth("✅ Bat dau capture, sampleRate=$SAMPLE_RATE, minBufferSize=$minBufferSize")
+        logBoth("✅ Bat dau capture, sampleRate=$SAMPLE_RATE, minBufferSize=$minBufferSize, excludeUid=${Process.myUid()}")
 
         captureJob = scope.launch {
             val buffer = ShortArray(minBufferSize / 2)
@@ -110,25 +108,17 @@ class MusicInput(
             var sumAmplitude = 0L
             var sampleCount = 0L
 
-            // ✅ SUA LOI: dung "shouldStop" (dat true DUNG LUC trong stopCapture(),
-            // truoc khi release()) thay vi kiem tra "audioRecord != null" - tranh
-            // truong hop bien local "record" (da chup tham chieu tu truoc) van
-            // tiep tuc duoc goi read() sau khi object da bi release/thay the boi
-            // 1 session moi o ben ngoai, gay loi -2 lap lai vo han.
             while (!shouldStop) {
                 val read = record.read(buffer, 0, buffer.size)
                 if (read > 0) {
+                    onPcmChunk?.invoke(buffer, read)
+
                     for (i in 0 until read) {
                         sumAmplitude += abs(buffer[i].toInt())
                     }
                     sampleCount += read
                 } else if (read < 0) {
                     logBoth("❌ AudioRecord.read() loi, code=$read", isError = true)
-                    // ✅ MOI: read() tra ve loi (thay vi throw) thuong nghia la
-                    // AudioRecord nay da bi he thong thu hoi/vo hieu hoa ngam (vi
-                    // du co session capture MOI duoc tao) - KHONG con ly do gi de
-                    // tiep tuc vong lap voi toc do toi da (spam log + ton CPU vo
-                    // ich). Dung han ngay tai day thay vi de vong lap chay mai.
                     break
                 }
 
@@ -147,10 +137,6 @@ class MusicInput(
     }
 
     fun stopCapture() {
-        // ✅ Dat co DUNG truoc, de coroutine tu thoat vong lap o lan kiem tra
-        // tiep theo, TRUOC KHI release() ben duoi lam AudioRecord thanh khong
-        // hop le - tranh khoang thoi gian coroutine con doc tren object sap bi
-        // release song song voi thread nay dang release no.
         shouldStop = true
         captureJob?.cancel()
         captureJob = null
