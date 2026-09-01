@@ -89,7 +89,7 @@ class VocalProcessor(
          * Tinh he so cho Low Shelf filter (RBJ Cookbook).
          * Dung de boost/cut CAC tan so THAP HON freq (bass).
          */
-        fun lowShelf(target: Biquad, freq: Float, sampleRate: Int, gainDb: Float) {
+        private fun lowShelf(target: Biquad, freq: Float, sampleRate: Int, gainDb: Float) {
             val a = sqrt(dbToLinear(gainDb)) // "A" trong cong thuc RBJ (khong phai a1/a2)
             val w0 = 2f * PI.toFloat() * freq / sampleRate
             val cosW0 = cos(w0)
@@ -112,7 +112,7 @@ class VocalProcessor(
          * Tinh he so cho High Shelf filter (RBJ Cookbook).
          * Dung de boost/cut CAC tan so CAO HON freq (treble).
          */
-        fun highShelf(target: Biquad, freq: Float, sampleRate: Int, gainDb: Float) {
+        private fun highShelf(target: Biquad, freq: Float, sampleRate: Int, gainDb: Float) {
             val a = sqrt(dbToLinear(gainDb))
             val w0 = 2f * PI.toFloat() * freq / sampleRate
             val cosW0 = cos(w0)
@@ -136,7 +136,7 @@ class VocalProcessor(
          * Dung de boost/cut 1 dai tan HEP quanh freq, giu nguyen cac dai khac
          * (khong giong shelf - shelf anh huong toan bo 1 phia).
          */
-        fun peaking(target: Biquad, freq: Float, sampleRate: Int, q: Float, gainDb: Float) {
+        private fun peaking(target: Biquad, freq: Float, sampleRate: Int, q: Float, gainDb: Float) {
             val a = sqrt(dbToLinear(gainDb))
             val w0 = 2f * PI.toFloat() * freq / sampleRate
             val cosW0 = cos(w0)
