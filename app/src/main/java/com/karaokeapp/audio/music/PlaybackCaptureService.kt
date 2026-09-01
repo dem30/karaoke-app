@@ -140,9 +140,9 @@ class PlaybackCaptureService : Service() {
         // o day, chi can gan bien mixer o tren la MusicInput's callback se tu
         // dong bat dau day du lieu vao no.
 
-        mic.startCapture { buffer, size ->
+        mic.startCapture(onPcmChunk = { buffer, size ->
             mix.pushVocal(buffer, size)
-        }
+        })
 
         logBoth("✅ Da bat dau Mixer Test (Phase 3) - dang tron Music + Mic, phat qua loa.")
     }
