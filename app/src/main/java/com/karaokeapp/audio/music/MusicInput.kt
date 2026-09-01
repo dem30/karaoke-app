@@ -126,7 +126,18 @@ class MusicInput(
                 if (now - lastLogTime >= 1000) {
                     val avg = if (sampleCount > 0) sumAmplitude / sampleCount else 0
                     logBoth("amplitude trung binh 1s qua: $avg (sampleCount=$sampleCount)")
-                    onAmplitudeTick?.invoke(avg)
+                    // ✅ SUA LOI GIAT/RE (phat hien qua test Phase 3): KHONG goi
+                    // onAmplitudeTick truc tiep (dong bo) nua - callback nay
+                    // cuoi cung goi toi NotificationManager.notify(), la 1 IPC
+                    // toi system_server co the mat vai-vai chuc ms. Vi no nam
+                    // NGAY TRONG vong lap doc PCM real-time nay, moi giay 1 lan
+                    // no lam nghen viec doc am thanh dung khoang thoi gian do -
+                    // gay giat co chu ky. Tach ra 1 coroutine rieng (fire-and-
+                    // forget) de vong lap chinh khong phai cho no xong.
+                    val amplitudeSnapshot = avg
+                    if (onAmplitudeTick != null) {
+                        scope.launch { onAmplitudeTick.invoke(amplitudeSnapshot) }
+                    }
                     sumAmplitude = 0
                     sampleCount = 0
                     lastLogTime = now

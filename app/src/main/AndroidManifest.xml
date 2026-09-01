@@ -4,6 +4,15 @@
 <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+<!-- ✅ MOI (Phase 3 - fix mic bi tat tieng am tham): tu Android 11+, foreground
+     service muon dung mic khi app KHONG o foreground (dung y het truong hop
+     MicInput chay ben trong PlaybackCaptureService) bat buoc phai khai bao
+     ro loai service la "microphone". Thieu khai bao nay, Android KHONG bao
+     loi gi ca nhung se AM THAM tat tieng du lieu ghi duoc nhu 1 lop bao ve
+     quyen rieng tu - dung trieu chung da gap: AudioRecord "thanh cong" nhung
+     PCM toan gan bang 0. Permission nay bat buoc phai co tu API 34 khi khai
+     bao foregroundServiceType chua "microphone". -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
 <!-- ✅ MOI: bat buoc phai co de PlaybackCaptureService.acquireWakeLock() khong
      bi throw SecurityException. Dung PARTIAL_WAKE_LOCK de giu CPU thuc khi
      capture chay nen, khong lien quan gi toi man hinh. -->
@@ -22,6 +31,6 @@
 <!--  Phase 1: nhan resultCode/resultData tu dialog MediaProjection
              (MainActivity), tao MediaProjection that va bat dau capture qua
              MusicInput.  -->
-<service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection" android:exported="false"/>
+<service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false"/>
 </application>
 </manifest>
