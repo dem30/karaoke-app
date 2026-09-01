@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -66,6 +67,18 @@ class MainActivity : AppCompatActivity() {
     // Mic Loopback cua Phase 2, vi mixer test can chay ben trong Service de
     // song cung MusicInput dang capture nhac ngam).
     private var mixerTestRunning = false
+
+    // ✅ MOI (thu nghiem "co the mute YouTube nhung MusicInput van capture
+    // duoc khong?"): CHI mute/unmute STREAM_MUSIC cua he thong - KHONG dung
+    // gi toi Mixer/OutputRouter/PlaybackCaptureService. Muc dich duy nhat: xac
+    // nhan AudioPlaybackCapture co tap tin hieu TRUOC hay SAU buoc ap dung
+    // volume cua STREAM_MUSIC. Neu loa im nhung log amplitude cua MusicInput
+    // van dao dong theo nhac -> capture tap TRUOC volume, mo ra huong kien
+    // truc "app tu mute nguon, chi phat qua OutputRouter cua chinh minh".
+    // streamMusicMuteTestActive=true nghia la dang trong trang thai da tu
+    // ha volume xuong 0 do nut nay gay ra (de biet duong nao can khoi phuc).
+    private var streamMusicMuteTestActive = false
+    private var savedStreamMusicVolumeBeforeTest = -1
 
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -178,6 +191,15 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { toggleMixerTest(this) }
         }
 
+        // ✅ MOI: nut thu nghiem rieng, KHONG lien quan Mixer/OutputRouter -
+        // chi de kiem tra gia thuyet mute STREAM_MUSIC ve 0 co lam MusicInput
+        // mat tin hieu capture hay khong (xem giai thich chi tiet o khai bao
+        // bien streamMusicMuteTestActive ben tren).
+        val muteTestButton = Button(this).apply {
+            text = "Test Mute STREAM_MUSIC"
+            setOnClickListener { toggleStreamMusicMuteTest(this) }
+        }
+
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(retryButton)
@@ -189,6 +211,11 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             addView(micLoopbackButton)
             addView(mixerTestButton)
+        }
+
+        val buttonRow3 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(muteTestButton)
         }
 
         logText = TextView(this).apply {
@@ -210,6 +237,7 @@ class MainActivity : AppCompatActivity() {
             addView(statusText)
             addView(buttonRow)
             addView(buttonRow2)
+            addView(buttonRow3)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -355,6 +383,15 @@ class MainActivity : AppCompatActivity() {
         // day la test thu cong, khong can chay nen nhu PlaybackCaptureService.
         micInput?.stopCapture()
         outputRouter?.stop()
+
+        // ✅ AN TOAN: neu nguoi dung thoat app trong luc dang bat "Test Mute
+        // STREAM_MUSIC" ma quen bam nut khoi phuc, chu dong tra lai volume goc
+        // o day - tranh de may bi cam am luon sau khi thoat app.
+        if (streamMusicMuteTestActive && savedStreamMusicVolumeBeforeTest >= 0) {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedStreamMusicVolumeBeforeTest, 0)
+            CaptureLogBus.log("[Activity] [MuteTest] onDestroy: da tu dong khoi phuc STREAM_MUSIC (quen bam nut).")
+        }
     }
 
     // ✅ MOI (Phase 3): bat/tat mixer test qua Intent action gui toi Service
@@ -400,5 +437,63 @@ class MainActivity : AppCompatActivity() {
         mixerTestRunning = !mixerTestRunning
         button.text = if (mixerTestRunning) "Tat Mixer Test" else "Bat Mixer Test"
         CaptureLogBus.log("[Activity] Gui action=$action toi Service (Mixer Test Phase 3)")
+    }
+
+    /**
+     * ✅ MOI: thu nghiem doc lap - CHI mute/unmute STREAM_MUSIC, khong dung gi
+     * toi Mixer/OutputRouter. Yeu cau PlaybackCaptureService (Phase 1) dang
+     * capture san (isCapturing=true) de co the doc log amplitude cua
+     * MusicInput trong luc test.
+     *
+     * Cach doc ket qua: bam nut nay trong luc YouTube dang phat, quan sat 2
+     * dieu:
+     * 1) Loa co thuc su im khong (nghe bang tai).
+     * 2) Dong log "[MusicInput] amplitude trung binh 1s qua: ..." co CON dao
+     *    dong theo nhac (khac 0, thay doi lien tuc) hay tut ve 0/dung yen.
+     *
+     * Neu (1) im VA (2) van dao dong -> capture tap truoc buoc ap volume,
+     * mo duong cho kien truc "app tu mute nguon". Neu (2) cung ve 0/dung -
+     * capture tap SAU buoc ap volume, huong nay khong kha thi, phai chuyen
+     * sang Huong B (PLAN.md - tu phat nhac trong app, khong capture app
+     * ngoai nua).
+     */
+    private fun toggleStreamMusicMuteTest(button: Button) {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        if (streamMusicMuteTestActive) {
+            // Khoi phuc volume goc.
+            if (savedStreamMusicVolumeBeforeTest >= 0) {
+                audioManager.setStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    savedStreamMusicVolumeBeforeTest,
+                    0
+                )
+                CaptureLogBus.log(
+                    "[Activity] [MuteTest] Da khoi phuc STREAM_MUSIC ve muc goc=$savedStreamMusicVolumeBeforeTest"
+                )
+            }
+            savedStreamMusicVolumeBeforeTest = -1
+            streamMusicMuteTestActive = false
+            button.text = "Test Mute STREAM_MUSIC"
+            return
+        }
+
+        if (!PlaybackCaptureService.isCapturing()) {
+            Toast.makeText(
+                this,
+                "Chua capture nhac (Phase 1) - bam 'Xin quyen lai' va mo YouTube truoc khi test",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        savedStreamMusicVolumeBeforeTest = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        streamMusicMuteTestActive = true
+        button.text = "Khoi phuc STREAM_MUSIC"
+        CaptureLogBus.log(
+            "[Activity] [MuteTest] ✅ Da ha STREAM_MUSIC ve 0 (muc goc da luu=$savedStreamMusicVolumeBeforeTest). " +
+                "Quan sat: loa co im khong? Log amplitude cua MusicInput ben duoi co con dao dong theo nhac khong?"
+        )
     }
 }
