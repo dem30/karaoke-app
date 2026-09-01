@@ -338,6 +338,14 @@ class PlaybackCaptureService : Service() {
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
         val isMuted = audioManager.isStreamMute(AudioManager.STREAM_SYSTEM)
 
+        // ✅ MOI (debug tam thoi - CHUA xac dinh duoc nguyen nhan that qua
+        // suy luan tinh, can quan sat TRUC TIEP tai dung thoi diem chuyen
+        // app): log MOI LAN chay (khong chi khi bat thuong) de bat duoc bien
+        // dong tuc thoi (transient) co the da tu phuc hoi truoc khi lan poll
+        // tiep theo (300ms sau) kiem tra lai - neu chi log luc bat thuong,
+        // se BO LO chinh khoanh khac gay ra hien tuong "nghe nho".
+        logBoth("[GuardTick] STREAM_SYSTEM current=$current/$max, isMuted=$isMuted")
+
         if (isMuted) {
             logBoth(
                 "⚠️ [AutoReassert] Phat hien STREAM_SYSTEM dang bi MUTE FLAG " +
