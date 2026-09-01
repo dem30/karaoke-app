@@ -191,6 +191,15 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
 
             var lastQueueLogTime = System.currentTimeMillis()
 
+            // ✅ MOI (chan doan chuoi dieu tra MusicInput -> ring buffer ->
+            // Mixer -> OutputRouter): chi log khi CHUYEN TRANG THAI im lang
+            // <-> co am thanh CUA RIENG PHAN MUSIC tai Mixer, doc lap voi
+            // log CAPTURE SILENCE/RECOVERED cua MusicInput.kt. Neu MusicInput
+            // KHONG bao silence nhung o day van thay MIXER MUSIC SILENCE,
+            // nghia la PCM bi roi giua duong (ring buffer/scheduling), khong
+            // phai loi capture/AudioPlaybackCapture.
+            var wasMusicSilentAtMixer = false
+
             while (running) {
                 var waitedMs = 0L
                 // ✅ SUA LOI (dieu kien cho sai): truoc day dung "&&" giua 2
@@ -211,6 +220,32 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
 
                 val musicLen = musicBuffer.drain(musicChunk, CHUNK_SIZE)
                 val vocalLen = vocalBuffer.drain(vocalChunk, CHUNK_SIZE)
+
+                // ✅ MOI: do bien do trung binh cua rieng phan Music vua drain
+                // duoc, TRUOC khi mix - day la bang chung quyet dinh de biet
+                // PCM co toi duoc Mixer hay khong (xem giai thich o khai bao
+                // wasMusicSilentAtMixer o tren).
+                var musicAbs = 0L
+                for (i in 0 until musicLen) {
+                    musicAbs += kotlin.math.abs(musicChunk[i].toInt())
+                }
+                val musicAvg = if (musicLen > 0) musicAbs / musicLen else 0L
+                val musicSilentNow = musicLen == 0 || musicAvg == 0L
+                if (musicSilentNow && !wasMusicSilentAtMixer) {
+                    logBoth(
+                        "⚠️ MIXER MUSIC SILENCE: musicLen=$musicLen/$CHUNK_SIZE musicAvg=$musicAvg " +
+                            "vocalLen=$vocalLen queueM=${musicBuffer.size()} queueV=${vocalBuffer.size()} " +
+                            "waited=${waitedMs}ms"
+                    )
+                } else if (!musicSilentNow && wasMusicSilentAtMixer) {
+                    logBoth(
+                        "🔄 MIXER MUSIC RECOVERED: musicLen=$musicLen/$CHUNK_SIZE musicAvg=$musicAvg " +
+                            "vocalLen=$vocalLen queueM=${musicBuffer.size()} queueV=${vocalBuffer.size()} " +
+                            "waited=${waitedMs}ms"
+                    )
+                }
+                wasMusicSilentAtMixer = musicSilentNow
+
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
 

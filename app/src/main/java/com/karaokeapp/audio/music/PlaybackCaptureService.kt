@@ -161,6 +161,25 @@ class PlaybackCaptureService : Service() {
         // ~10 lan so luong dong log so voi truoc.
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
 
+        // ✅ MOI (cong cu chan doan - CO THE TAT de cach ly nghi van "dang
+        // gianh mute-flag STREAM_MUSIC voi YouTube la nguyen nhan/yeu to gay
+        // mat tieng khi seek"). Mac dinh TRUE (giu nguyen hanh vi hien tai,
+        // khong doi UX cua ban production).
+        //
+        // Cach doc ket qua sau khi build voi flag nay = true (mac dinh):
+        // - Neu log cho thay CAPTURE SILENCE (MusicInput) xay ra ma KHONG co
+        //   dong [AutoReassert] "STREAM_MUSIC bi GO MUTE FLAG ngoai y muon"
+        //   nao xung quanh cung thoi diem -> mute-guard KHONG lien quan, co
+        //   the giu flag nay = true va tap trung dieu tra huong khac
+        //   (AudioPlaybackCapture/session cua YouTube).
+        // - Neu CAPTURE SILENCE luon xay ra NGAY SAU/CUNG LUC voi dong
+        //   [AutoReassert] do -> rat co the day la nguyen nhan hoac yeu to
+        //   kich hoat chinh. Doi flag nay thanh false, build lai 1 lan nua
+        //   (chap nhan YouTube phat de ra loa song song voi mixer trong ban
+        //   build chan doan nay) de xac nhan: neu CAPTURE SILENCE bien mat
+        //   hoan toan khi seek, da xac nhan chac chan.
+        private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
+
         @Volatile
         private var capturingActive = false
 
@@ -237,16 +256,24 @@ class PlaybackCaptureService : Service() {
         // tiep ra loa nua (capture van hoat dong binh thuong vi xay ra
         // TRUOC ca buoc ap volume LAN buoc ap mute flag).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        streamMusicWasMutedBeforeMixerTest = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
-        if (!streamMusicWasMutedBeforeMixerTest) {
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+        if (ENABLE_MUSIC_STREAM_MUTE_GUARD) {
+            streamMusicWasMutedBeforeMixerTest = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
+            if (!streamMusicWasMutedBeforeMixerTest) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            }
+            musicMuteAppliedByMixerTest = true
+            logBoth(
+                "🔇 Da mute STREAM_MUSIC bang MUTE FLAG (KHONG doi so volume/index nua) - " +
+                    "YouTube se im, chi con mixer phat ra loa. (da mute san tu truoc=" +
+                    "$streamMusicWasMutedBeforeMixerTest)"
+            )
+        } else {
+            logBoth(
+                "🔬 [Chan doan] ENABLE_MUSIC_STREAM_MUTE_GUARD=false - KHONG mute STREAM_MUSIC. " +
+                    "YouTube se phat song song voi mixer (nghe trung tieng) - CHI dung de cach ly " +
+                    "nguyen nhan mat tieng khi seek, khong phai ban chay that."
+            )
         }
-        musicMuteAppliedByMixerTest = true
-        logBoth(
-            "🔇 Da mute STREAM_MUSIC bang MUTE FLAG (KHONG doi so volume/index nua) - " +
-                "YouTube se im, chi con mixer phat ra loa. (da mute san tu truoc=" +
-                "$streamMusicWasMutedBeforeMixerTest)"
-        )
 
         // ✅ MOI: usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) cho output mixer -
         // da test latency ngang MEDIA (~296-300ms ca 2), khong dinh rui ro SCO
@@ -435,7 +462,7 @@ class PlaybackCaptureService : Service() {
         // gio KHONG bi app dong vao 0 nua, nen kiem tra do se BAO SAI lien
         // tuc). CHI xu ly khi Mixer Test dang thuc su enforce mute
         // (musicMuteAppliedByMixerTest=true).
-        if (musicMuteAppliedByMixerTest && !musicMuted) {
+        if (ENABLE_MUSIC_STREAM_MUTE_GUARD && musicMuteAppliedByMixerTest && !musicMuted) {
             logBoth(
                 "⚠️ [AutoReassert] STREAM_MUSIC bi GO MUTE FLAG ngoai y muon " +
                     "(co the do YouTube tu unmute khi phat bai moi) - mute lai."

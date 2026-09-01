@@ -143,17 +143,51 @@ class MusicInput(
             var sumAmplitude = 0L
             var sampleCount = 0L
 
+            // ✅ MOI (chan doan mat tieng khi seek/doi bai): theo doi tung
+            // buffer xem co "im lang THAT SU" (maxAbs==0, tuc toan bo PCM
+            // doc duoc la 0) hay khong, va CHI log khi CHUYEN TRANG THAI
+            // (silent <-> co am thanh) - tranh spam log moi ~40ms neu im
+            // lang keo dai nhieu giay (se lam tran CaptureLogBus.MAX_LINES
+            // =500 rat nhanh, mat het log truoc do can doi chieu thoi diem
+            // voi [AutoReassert]/[GuardTick] ben PlaybackCaptureService).
+            var wasSilent = false
+
             while (!shouldStop) {
                 val read = record.read(buffer, 0, buffer.size)
                 if (read > 0) {
-                    onPcmChunk?.invoke(buffer, read)
-
+                    var maxAbs = 0
+                    var nonZero = 0
                     for (i in 0 until read) {
-                        sumAmplitude += abs(buffer[i].toInt())
+                        val value = abs(buffer[i].toInt())
+                        sumAmplitude += value
+                        if (value != 0) nonZero++
+                        if (value > maxAbs) maxAbs = value
                     }
                     sampleCount += read
+
+                    val silentNow = maxAbs == 0
+                    if (silentNow && !wasSilent) {
+                        logBoth(
+                            "⚠️ CAPTURE SILENCE: read=$read/${buffer.size}, nonZero=$nonZero, " +
+                                "maxAbs=$maxAbs, recordState=${record.state}, " +
+                                "recordingState=${record.recordingState}"
+                        )
+                    } else if (!silentNow && wasSilent) {
+                        logBoth(
+                            "🔄 CAPTURE RECOVERED: read=$read/${buffer.size}, nonZero=$nonZero, " +
+                                "maxAbs=$maxAbs, recordState=${record.state}, " +
+                                "recordingState=${record.recordingState}"
+                        )
+                    }
+                    wasSilent = silentNow
+
+                    onPcmChunk?.invoke(buffer, read)
                 } else if (read < 0) {
-                    logBoth("❌ AudioRecord.read() loi, code=$read", isError = true)
+                    logBoth(
+                        "❌ AudioRecord.read() loi, code=$read, state=${record.state}, " +
+                            "recordingState=${record.recordingState}",
+                        isError = true
+                    )
                     break
                 }
 
