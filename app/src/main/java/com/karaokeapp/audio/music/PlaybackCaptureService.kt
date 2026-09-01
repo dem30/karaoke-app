@@ -101,6 +101,39 @@ class PlaybackCaptureService : Service() {
     // reassertStreamSystemVolumeIfMixerRunning().
     private var savedStreamSystemVolume = -1
 
+    // ✅ MOI (chan doan gia thuyet "notification toi -> YouTube tu duck do
+    // mat audio focus tam thoi -> khong tu phuc hoi"): request focus KIEU
+    // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK CHI DE QUAN SAT callback
+    // onAudioFocusChange, KHONG dung de gianh/giu phat am thanh doc quyen -
+    // OutputRouter van hoan toan KHONG xin focus nhu truoc (xem giai thich
+    // trong OutputRouter.kt). Day la lop lang nghe THU DONG: xin 1 lan luc
+    // Mixer Test bat dau, giu nguyen suot phien, KHONG bao gio tu dong
+    // pause/lower gi khi nhan ONFOCUS_LOSS_TRANSIENT_CAN_DUCK - chi log lai
+    // de doi chieu thoi diem voi CAPTURE SILENCE ben MusicInput. Neu log cho
+    // thay onAudioFocusChange(LOSS_TRANSIENT_CAN_DUCK) xay ra NGAY TRUOC/
+    // CUNG LUC voi CAPTURE SILENCE khong tu phuc hoi, day la bang chung
+    // manh xac nhan giai thich: chinh YouTube (nguon dang bi capture) nhan
+    // duoc tin hieu nay tu he thong (vi du do 1 am thong bao khac phat) va
+    // tu ha am luong/dung phat noi bo cua no - dieu ma OutputRouter/
+    // MusicInput khong the thay duoc truc tiep, chi thay gian tiep qua PCM
+    // capture duoc tro thanh toan 0.
+    private var focusObserverRequest: android.media.AudioFocusRequest? = null
+    private val focusObserverListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        val label = when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> "AUDIOFOCUS_GAIN"
+            AudioManager.AUDIOFOCUS_LOSS -> "AUDIOFOCUS_LOSS"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "AUDIOFOCUS_LOSS_TRANSIENT"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK"
+            else -> "UNKNOWN($focusChange)"
+        }
+        logBoth(
+            "🎧 [FocusObserver] onAudioFocusChange=$label - CHI QUAN SAT, khong " +
+                "tu dong lam gi ca (khong pause/lower OutputRouter). Doi chieu " +
+                "thoi diem nay voi CAPTURE SILENCE/RECOVERED ben MusicInput de " +
+                "xac nhan gia thuyet YouTube tu duck khi mat focus tam thoi."
+        )
+    }
+
     // ✅ MOI (fix goc "Karaoke App tu dat am luong Bluetooth = 0" - xac nhan
     // qua thong bao he thong that cua Android, thay vi doan bang log nua):
     // truoc day dung setStreamVolume(STREAM_MUSIC, 0, 0) - hanh dong nay
@@ -293,6 +326,21 @@ class PlaybackCaptureService : Service() {
         audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, maxSystemVolume, 0)
         logBoth("🔊 Da day STREAM_SYSTEM len max=$maxSystemVolume (muc goc=$savedStreamSystemVolume) de mixer nghe du to.")
 
+        // ✅ MOI (chan doan - xem giai thich chi tiet o khai bao
+        // focusObserverRequest/focusObserverListener phia tren): dang ky
+        // listener QUAN SAT audio focus, KHONG anh huong toi viec OutputRouter
+        // van hoan toan khong xin focus doc quyen. Chi de log lai thoi diem
+        // he thong bao focus thay doi, doi chieu voi CAPTURE SILENCE.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setOnAudioFocusChangeListener(focusObserverListener)
+                .setWillPauseWhenDucked(false)
+                .build()
+            focusObserverRequest = request
+            val result = audioManager.requestAudioFocus(request)
+            logBoth("🎧 [FocusObserver] Da dang ky listener quan sat audio focus, requestAudioFocus() tra ve=$result (khong dung de gianh phat doc quyen).")
+        }
+
         val router = OutputRouter(this, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).apply { start() }
         val mix = LowLatencyMixer(router).apply { start() }
         val mic = MicInput(this)
@@ -347,6 +395,15 @@ class PlaybackCaptureService : Service() {
         // ✅ MOI: dung vong lap guard volume TRUOC khi don dep gi khac.
         volumeGuardJob?.cancel()
         volumeGuardJob = null
+
+        // ✅ MOI: go dang ky listener quan sat audio focus (xem giai thich o
+        // startMixerTestInternal()) - khong con can quan sat khi Mixer Test
+        // da tat.
+        focusObserverRequest?.let {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.abandonAudioFocusRequest(it)
+        }
+        focusObserverRequest = null
 
         micInput?.stopCapture()
         micInput = null
