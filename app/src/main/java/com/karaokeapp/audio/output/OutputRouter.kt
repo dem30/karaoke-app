@@ -44,7 +44,22 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * tri nay ra de biet truoc, xem log "[OutputRouter] Native sample rate cua
  * thiet bi".
  */
-class OutputRouter(private val context: Context) {
+class OutputRouter(
+    private val context: Context,
+    // ✅ MOI (thu nghiem thoat khoi STREAM_MUSIC de mixer khong bi anh huong
+    // boi lenh mute test o Activity): cho phep truyen usage khac, MAC DINH
+    // van la USAGE_MEDIA (STREAM_MUSIC) de KHONG lam thay doi hanh vi hien
+    // tai cua Mixer Test (Phase 3)/production - chi truyen usage khac khi
+    // GOI TU MainActivity de A/B test qua nut "Mic Loopback".
+    //
+    // ⚠️ TUYET DOI KHONG dung USAGE_VOICE_COMMUNICATION o day: usage nay
+    // mang ngu nghia "audio cuoc goi", tren nhieu thiet bi/OEM co the khien
+    // he thong tu chuyen route Bluetooth tu A2DP (stereo, chat luong nhac)
+    // sang SCO (mono, ~8-16kHz, chat luong thoai) - pha hong hoan toan chat
+    // luong am thanh karaoke qua loa BT. Day la ly do KHONG chon huong nay
+    // du no co ve la cach "sach" nhat de thoat STREAM_MUSIC.
+    private val usage: Int = AudioAttributes.USAGE_MEDIA
+) {
 
     private var audioTrack: AudioTrack? = null
 
@@ -97,7 +112,7 @@ class OutputRouter(private val context: Context) {
         val builder = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(usage)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
@@ -137,7 +152,7 @@ class OutputRouter(private val context: Context) {
 
         audioTrack = track
         track.play()
-        logBoth("✅ Da bat dau output (stereo, low-latency), sampleRate=$SAMPLE_RATE")
+        logBoth("✅ Da bat dau output (stereo, low-latency), sampleRate=$SAMPLE_RATE, usage=$usage")
     }
 
     /**

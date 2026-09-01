@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -79,6 +80,44 @@ class MainActivity : AppCompatActivity() {
     // ha volume xuong 0 do nut nay gay ra (de biet duong nao can khoi phuc).
     private var streamMusicMuteTestActive = false
     private var savedStreamMusicVolumeBeforeTest = -1
+
+    // ✅ MOI: danh sach usage candidate de A/B test qua loa Bluetooth, dung
+    // lai chinh nut "Mic Loopback" (Phase 2) da co san co che nghe + do
+    // latency bang vo tay - khong viet lai UI/luong test tu dau.
+    //
+    // ⚠️ CO Y bo qua AudioAttributes.USAGE_VOICE_COMMUNICATION khoi danh sach
+    // nay - xem giai thich chi tiet trong OutputRouter.kt (rui ro bi ep sang
+    // Bluetooth SCO mono chat luong thoai thay vi A2DP stereo).
+    // ✅ MOI: them legacyStream tuong ung voi moi usage - can de biet CHINH
+    // XAC stream nao phai tam thoi day len max khi test, vi moi usage khac
+    // MEDIA se di qua 1 thanh volume RIENG, doc lap voi "Am luong media" ma
+    // nguoi dung quen chinh hang ngay (da xac nhan qua test thuc te: voice/
+    // mixer nghe rat nho khi doi usage, KHONG phai do usage do te, ma do
+    // thanh volume tuong ung dang o muc mac dinh thap). usage=MEDIA khong
+    // can boost gi ca - giu nguyen thanh Media hien tai cua nguoi dung.
+    private data class UsageCandidate(val label: String, val usage: Int, val legacyStreamToBoost: Int?)
+    private val usageCandidates = listOf(
+        UsageCandidate("MEDIA (hien tai, STREAM_MUSIC)", AudioAttributes.USAGE_MEDIA, legacyStreamToBoost = null),
+        UsageCandidate(
+            "ASSISTANCE_SONIFICATION (STREAM_SYSTEM)",
+            AudioAttributes.USAGE_ASSISTANCE_SONIFICATION,
+            legacyStreamToBoost = AudioManager.STREAM_SYSTEM
+        ),
+        UsageCandidate(
+            "ALARM (STREAM_ALARM) ⚠️",
+            AudioAttributes.USAGE_ALARM,
+            legacyStreamToBoost = AudioManager.STREAM_ALARM
+        )
+    )
+    private var usageCandidateIndex = 0
+
+    // ✅ MOI: luu lai muc volume goc cua legacyStreamToBoost TRUOC khi boost,
+    // de khoi phuc dung luc tat loopback - QUAN TRONG nhat voi STREAM_ALARM
+    // (neu quen khoi phuc, bao thuc that cua may se keu rat to bat ngo lan
+    // sau). Khoi phuc o CA 2 noi: tat Mic Loopback binh thuong VA onDestroy()
+    // (phong truong hop Activity bi huy dot ngot).
+    private var savedBoostedStreamVolume: Int? = null
+    private var boostedLegacyStream: Int? = null
 
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -200,6 +239,15 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { toggleStreamMusicMuteTest(this) }
         }
 
+        // ✅ MOI: nut chon usage candidate cho OutputRouter khi test qua Mic
+        // Loopback - bam de doi vong qua danh sach usageCandidates, ten nut
+        // hien usage dang chon. Bam "Bat Mic Loopback" NGAY SAU do se dung
+        // dung usage nay de tao OutputRouter, test qua loa Bluetooth that.
+        val usageSelectButton = Button(this).apply {
+            text = "Usage test: ${usageCandidates[usageCandidateIndex].label}"
+            setOnClickListener { cycleUsageCandidate(this) }
+        }
+
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(retryButton)
@@ -216,6 +264,7 @@ class MainActivity : AppCompatActivity() {
         val buttonRow3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(muteTestButton)
+            addView(usageSelectButton)
         }
 
         logText = TextView(this).apply {
@@ -324,6 +373,7 @@ class MainActivity : AppCompatActivity() {
             outputRouter = null
             micLoopbackRunning = false
             button.text = "Bat Mic Loopback"
+            restoreBoostedStreamVolumeIfAny()
             CaptureLogBus.log("[Activity] Da tat Mic Loopback")
             return
         }
@@ -348,7 +398,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         CaptureLogBus.log("[Activity] Bat dau Mic Loopback (Phase 2 - do latency)")
-        val router = OutputRouter(this).apply { start() }
+        val selectedUsage = usageCandidates[usageCandidateIndex]
+        CaptureLogBus.log("[Activity] [UsageTest] Dang test voi usage=${selectedUsage.label}")
+        boostStreamVolumeForTestIfNeeded(selectedUsage)
+        val router = OutputRouter(this, selectedUsage.usage).apply { start() }
         val mic = MicInput(this)
         outputRouter = router
         micInput = mic
@@ -377,6 +430,64 @@ class MainActivity : AppCompatActivity() {
         button.text = "Tat Mic Loopback"
     }
 
+    /**
+     * ✅ MOI: neu usage dang test khac MEDIA (tuc di qua 1 stream RIENG, chua
+     * tung duoc nguoi dung chinh to), tam thoi day volume cua stream do len
+     * MUC MAX de A/B test cong bang voi STREAM_MUSIC - neu khong lam buoc
+     * nay, moi lan doi usage se nghe "nho" khong phai do usage do te, ma do
+     * thanh volume tuong ung dang o muc mac dinh thap (da xac nhan qua test
+     * thuc te tren may Honor).
+     */
+    private fun boostStreamVolumeForTestIfNeeded(candidate: UsageCandidate) {
+        val stream = candidate.legacyStreamToBoost ?: return
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        savedBoostedStreamVolume = audioManager.getStreamVolume(stream)
+        boostedLegacyStream = stream
+        val maxVolume = audioManager.getStreamMaxVolume(stream)
+        audioManager.setStreamVolume(stream, maxVolume, 0)
+        CaptureLogBus.log(
+            "[Activity] [UsageTest] ⚠️ Da tam day stream=$stream len max=$maxVolume " +
+                "(muc goc da luu=$savedBoostedStreamVolume) de test cong bang. " +
+                "SE tu khoi phuc khi tat Mic Loopback."
+        )
+    }
+
+    /**
+     * ✅ MOI: khoi phuc volume goc cua stream vua boost - goi khi tat Mic
+     * Loopback binh thuong VA trong onDestroy() (phong Activity bi huy dot
+     * ngot). QUAN TRONG nhat voi STREAM_ALARM: neu khong khoi phuc, bao thuc
+     * that cua nguoi dung se keu rat to bat ngo o lan sau.
+     */
+    private fun restoreBoostedStreamVolumeIfAny() {
+        val stream = boostedLegacyStream ?: return
+        val savedVolume = savedBoostedStreamVolume ?: return
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.setStreamVolume(stream, savedVolume, 0)
+        CaptureLogBus.log("[Activity] [UsageTest] Da khoi phuc stream=$stream ve muc goc=$savedVolume")
+        boostedLegacyStream = null
+        savedBoostedStreamVolume = null
+    }
+
+    /**
+     * ✅ MOI: doi vong qua danh sach usageCandidates - CHI cho phep doi khi
+     * Mic Loopback dang TAT (tranh doi usage giua chung 1 phien dang chay,
+     * gay nham lan khi doi chieu ket qua nghe/latency voi usage nao).
+     */
+    private fun cycleUsageCandidate(button: Button) {
+        if (micLoopbackRunning) {
+            Toast.makeText(
+                this,
+                "Hay tat Mic Loopback truoc khi doi usage test",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        usageCandidateIndex = (usageCandidateIndex + 1) % usageCandidates.size
+        val selected = usageCandidates[usageCandidateIndex]
+        button.text = "Usage test: ${selected.label}"
+        CaptureLogBus.log("[Activity] [UsageTest] Da doi sang usage=${selected.label} - bam 'Bat Mic Loopback' de test qua loa/BT that.")
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         // ✅ Don dep mic loopback neu Activity bi huy trong luc dang bat -
@@ -392,6 +503,11 @@ class MainActivity : AppCompatActivity() {
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedStreamMusicVolumeBeforeTest, 0)
             CaptureLogBus.log("[Activity] [MuteTest] onDestroy: da tu dong khoi phuc STREAM_MUSIC (quen bam nut).")
         }
+
+        // ✅ AN TOAN (dac biet voi STREAM_ALARM): neu Activity bi huy trong
+        // luc dang boost volume test ma quen tat Mic Loopback, khoi phuc o
+        // day - tranh de bao thuc that cua nguoi dung bi ket o muc max.
+        restoreBoostedStreamVolumeIfAny()
     }
 
     // ✅ MOI (Phase 3): bat/tat mixer test qua Intent action gui toi Service
