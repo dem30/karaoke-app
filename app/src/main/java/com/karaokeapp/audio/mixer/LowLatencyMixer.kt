@@ -1,13 +1,16 @@
 package com.karaokeapp.audio.mixer
 
+import android.os.Process
 import android.util.Log
 import com.karaokeapp.audio.music.CaptureLogBus
 import com.karaokeapp.audio.output.OutputRouter
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
 import kotlin.math.min
 
 /**
@@ -139,7 +142,22 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
     private val vocalBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
 
     private var mixerJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default)
+
+    // ✅ MOI (fix chung goc voi MusicInput/MicInput - xem giai thich chi
+    // tiet trong MusicInput.kt): vong lap mixer (drain 2 ring buffer + ghi
+    // ra OutputRouter moi ~40ms) cung la duong real-time, cung can thread
+    // rieng uu tien THREAD_PRIORITY_URGENT_AUDIO thay vi Dispatchers.Default
+    // dung chung, de khong bi tre khi app khac (YouTube) dang chiem CPU o
+    // foreground.
+    private val mixerDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        object : Thread(runnable, "LowLatencyMixerLoop") {
+            override fun run() {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                super.run()
+            }
+        }
+    }.asCoroutineDispatcher()
+    private val scope = CoroutineScope(mixerDispatcher)
 
     @Volatile
     private var running = false
@@ -218,6 +236,11 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         mixerJob = null
         musicBuffer.clear()
         vocalBuffer.clear()
+        // ✅ MOI: dong thread rieng, tranh ro ri (xem giai thich trong
+        // MusicInput.stopCapture()). mixerJob dang o trong delay()
+        // (cancellable) nen cancel() se ngat vong lap gan nhu ngay lap tuc,
+        // an toan de dong dispatcher tiep theo.
+        mixerDispatcher.close()
         logBoth("🛑 Da dung mixer")
     }
 }

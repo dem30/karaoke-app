@@ -7,11 +7,14 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import com.karaokeapp.audio.music.CaptureLogBus
 
@@ -44,7 +47,20 @@ class MicInput(private val context: Context) {
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default)
+
+    // ✅ MOI (fix chung goc voi MusicInput - xem giai thich chi tiet trong
+    // MusicInput.kt): mic cung la vong lap doc PCM real-time, cung can
+    // thread rieng uu tien THREAD_PRIORITY_URGENT_AUDIO thay vi dung chung
+    // Dispatchers.Default de khong bi tranh CPU voi app foreground khac.
+    private val captureDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        object : Thread(runnable, "MicInputCapture") {
+            override fun run() {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                super.run()
+            }
+        }
+    }.asCoroutineDispatcher()
+    private val scope = CoroutineScope(captureDispatcher)
 
     @Volatile
     private var shouldStop = false
@@ -239,6 +255,9 @@ class MicInput(private val context: Context) {
             release()
         }
         audioRecord = null
+        // ✅ MOI: dong thread rieng, tranh ro ri (xem giai thich trong
+        // MusicInput.stopCapture()).
+        captureDispatcher.close()
         logBoth("🛑 Da dung capture mic")
     }
 }

@@ -11,9 +11,11 @@ import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
 import kotlin.math.abs
 
 /**
@@ -45,7 +47,34 @@ class MusicInput(
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default)
+
+    // ✅ MOI (fix "nhac nho xiu dung luc doi bai tren YouTube" - nghi van moi
+    // dua tren quan sat thuc te: notification amplitude DUNG YEN khi YouTube
+    // dang thuc su o foreground, chay lai binh thuong khi keo thanh thong
+    // bao xuong hoac chuyen app khac): truoc day vong lap doc PCM chay tren
+    // Dispatchers.Default - 1 THREAD POOL DUNG CHUNG cho MOI coroutine
+    // Default khac trong toan bo app, VA bi Android xep vao cgroup uu tien
+    // scheduling THAP HON "top-app" (app dang thuc su o tren cung man hinh,
+    // vi du YouTube). Khi YouTube lam viec nang (decode video/audio bai
+    // moi...), scheduler co the tam nhuong CPU cho no truoc, khien thread
+    // doc AudioRecord cua chinh MusicInput bi tre - AudioRecord co buffer
+    // noi bo GIOI HAN, tre qua lau se lam MAT sample (khong bao loi ro
+    // rang) - giai thich dung hien tuong "nho xiu" dung luc do.
+    //
+    // Sua: dung 1 THREAD RIENG (khong dung chung pool), dat priority
+    // THREAD_PRIORITY_URGENT_AUDIO NGAY khi thread vua khoi tao - day la
+    // muc uu tien CAO NHAT Android danh rieng cho xu ly am thanh real-time
+    // (cung muc AudioFlinger/AudioRecord/AudioTrack noi bo dang dung), giup
+    // vong lap nay it bi tranh CPU voi app khac (nhu YouTube) hon nhieu.
+    private val captureDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        object : Thread(runnable, "MusicInputCapture") {
+            override fun run() {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                super.run()
+            }
+        }
+    }.asCoroutineDispatcher()
+    private val scope = CoroutineScope(captureDispatcher)
 
     @Volatile
     private var shouldStop = false
@@ -162,6 +191,13 @@ class MusicInput(
             release()
         }
         audioRecord = null
+        // ✅ MOI: dong thread rieng (captureDispatcher) - tranh ro ri thread
+        // neu MusicInput bi tao/huy nhieu lan (moi lan bat/tat capture Phase
+        // 1 se tao 1 instance moi). Goi SAU khi da stop()/release()
+        // AudioRecord (khien record.read() dang block se tra ve loi va thoat
+        // vong lap ngay), nen thread hau nhu chac chan da ranh truoc khi
+        // dong.
+        captureDispatcher.close()
         logBoth("🛑 Da dung capture")
     }
 }
