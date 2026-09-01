@@ -208,6 +208,15 @@ class PlaybackCaptureService : Service() {
         // Doc lap voi STREAM_MUSIC vua mute o tren nen KHONG bi im theo.
         savedStreamSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
         val maxSystemVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
+        // ✅ MOI: go co mute an (xem giai thich chi tiet trong
+        // reassertStreamSystemVolumeIfMixerRunning()) TRUOC khi ep volume len
+        // max - phong truong hop co mute da ton tai tu truoc do (vi du con
+        // sot lai tu lan Mixer Test truoc), tranh phai cho toi vong guard
+        // dau tien (~300ms sau) moi duoc go.
+        if (audioManager.isStreamMute(AudioManager.STREAM_SYSTEM)) {
+            logBoth("⚠️ STREAM_SYSTEM dang bi mute flag ngay luc bat dau - go ngay bang ADJUST_UNMUTE.")
+            audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
+        }
         audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, maxSystemVolume, 0)
         logBoth("🔊 Da day STREAM_SYSTEM len max=$maxSystemVolume (muc goc=$savedStreamSystemVolume) de mixer nghe du to.")
 
@@ -300,11 +309,43 @@ class PlaybackCaptureService : Service() {
      * Khong lam gi neu Mixer Test dang TAT (savedStreamSystemVolume == -1,
      * nghia la khong co gi dang can giu o muc boost ca).
      */
+    /**
+     * ✅ CAP NHAT QUAN TRONG (fix "nhac nho dan khong the tu phuc hoi, phai
+     * vao Settings bam lai" - xac dinh qua test thuc te voi log that): ban
+     * truoc CHI kiem tra so volume (0..15) roi ep lai bang setStreamVolume()
+     * - nhung Android co 2 co che TACH BIET nhau:
+     *   1. "Volume level" (0..15) - day la thu setStreamVolume() dieu khien.
+     *   2. "Mute flag" rieng (isStreamMute()) - mot co bat/tat DOC LAP voi
+     *      so volume, co the bi BAT (vi du do he thong tu dat khi app mat
+     *      focus tam thoi luc chuyen qua app khac roi quay lai) MA KHONG
+     *      lam thay doi so volume (van bao la 15/15 - nhu da xac nhan qua
+     *      log thuc te KHONG co dong [AutoReassert] nao ca, tuc "current <
+     *      max" luon la false, nhung nguoi dung van nghe nho).
+     * setStreamVolume() KHONG chac chan go duoc co mute nay tren moi OEM -
+     * day la ly do truoc day nguoi dung PHAI vao Settings > Am bao (Notification)
+     * bam lai 1 cai de "kich hoat" - thao tac do vo tinh goi toi co che unmute
+     * cua UI he thong ma code chua lam.
+     * Sua: goi THEM adjustStreamVolume(..., ADJUST_UNMUTE, ...) - day la API
+     * chinh thuc cua Android de go co mute, TACH BIET voi setStreamVolume().
+     * Goi ca 2 (unmute + ep lai max) MOI LAN vong lap chay (khong con dieu
+     * kien "current < max" nua), de dam bao du roi vao truong hop nao (tut
+     * so, hay chi bi mute flag ma so van 15/15) cung duoc xu ly.
+     */
     private fun reassertStreamSystemVolumeIfMixerRunning() {
         if (savedStreamSystemVolume < 0) return // Mixer Test dang tat, khong lien quan.
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val current = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
+        val isMuted = audioManager.isStreamMute(AudioManager.STREAM_SYSTEM)
+
+        if (isMuted) {
+            logBoth(
+                "⚠️ [AutoReassert] Phat hien STREAM_SYSTEM dang bi MUTE FLAG " +
+                    "(doc lap voi so volume, hien tai=$current/$max) - goi ADJUST_UNMUTE de go."
+            )
+            audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
+        }
+
         if (current < max) {
             logBoth(
                 "⚠️ [AutoReassert] Phat hien STREAM_SYSTEM bi tut con $current/$max " +
