@@ -417,8 +417,33 @@ class PlaybackCaptureService : Service() {
                     "(khong phai do app - co yeu to ben ngoai dang ha volume, vi du " +
                     "audio focus ducking khi chuyen app) - ep lai ve max."
             )
-            audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, max, 0)
         }
+
+        // ✅ MOI (fix goc trieu chung "nhac nho xiu khi doi bai tren YouTube,
+        // KHONG tu phuc hoi, phai vao app/Settings chinh volume 1 cai moi
+        // het"): log GuardTick thuc te cho thay STREAM_SYSTEM LUON bao
+        // 15/15, isMuted=false SUOT ca luc dang bi nho - tuc nguyen nhan
+        // KHONG nam o so index hay mute flag ma AudioManager bao cao, ma o
+        // gia tri AVRCP absolute-volume THUC SU gui cho loa Bluetooth, co
+        // the bi loa/driver BT tu doi rieng khi YouTube bat dau 1 track moi
+        // (xin audio focus/khoi tao session moi) - hoan toan KHONG lam thay
+        // doi index phia Android nen dieu kien "current < max" o tren KHONG
+        // BAO GIO bat duoc de sua.
+        //
+        // Bang chung: nguoi dung tu sua duoc bang cach GOI LAI setStreamVolume
+        // (chinh volume trong app, hoac phat 1 am bao he thong tren cung
+        // stream) - hanh dong do buoc AudioService gui LAI goi lenh AVRCP
+        // volume moi cho loa, du gia tri so KHONG doi. Truoc day code chi
+        // goi setStreamVolume() KHI current<max (tuc gan nhu khong bao gio,
+        // vi index khong tut) - nen app khong bao gio tu lam duoc dieu nguoi
+        // dung dang phai lam bang tay.
+        //
+        // Sua: goi setStreamVolume() VO DIEU KIEN moi tick (khong con gate
+        // theo current<max nua) - buoc AudioService "day lai" gia tri AVRCP
+        // cho loa BT dinh ky (~300ms/lan), tu dong lam thay thao tac thu
+        // cong cua nguoi dung. Day la lenh nhe (khong dung FLAG_PLAY_SOUND
+        // nen khong phat am bao/tieng click), an toan de goi lien tuc.
+        audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, max, 0)
     }
 
     override fun onCreate() {
