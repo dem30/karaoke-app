@@ -2,7 +2,6 @@ package com.karaokeapp.audio.output
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTimestamp
@@ -12,9 +11,10 @@ import android.util.Log
 import com.karaokeapp.audio.music.CaptureLogBus
 
 /**
- * Phase 2 - ban toi gian, CHUA co mixer: nhan thang PCM tu MicInput va ghi
- * ra AudioTrack o che do streaming, chi de nghe duoc tieng minh noi qua
- * loa/tai nghe NGAY LAP TUC phuc vu do latency.
+ * Phase 2/3 - nhan PCM (da mix nhac + mic, hoac mic don o Phase 2) va ghi
+ * ra AudioTrack o che do streaming, phat qua loa/tai nghe cua CHINH may
+ * dang chay app - day la stream OUTPUT rieng cua karaoke-app, khong phai
+ * mot app "phat nhac" canh tranh voi nguon khac.
  *
  * ✅ CAP NHAT QUAN TRONG (sua bug latency ~584ms do chinh code gay ra, PHAT
  * HIEN qua so lieu LatencyProbe qua on dinh bat thuong o lan test truoc):
@@ -44,14 +44,22 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * path van co the khong duoc cap du da sua STEREO + bo buffer size. Log gia
  * tri nay ra de biet truoc, xem log "[OutputRouter] Native sample rate cua
  * thiet bi".
+ *
+ * ❌ DA GO Audio Focus (fix lan nay): ban truoc co them requestAudioFocus()
+ * voi AUDIOFOCUS_GAIN + tu dong xin lai ngay khi mat focus. Day la sai lam -
+ * AUDIOFOCUS_GAIN la loai focus doc quyen, khien he thong coi day la nguon
+ * phat "chinh" va gui AUDIOFOCUS_LOSS cho app dang phat nhac nguon (vi du
+ * YouTube o Phase 1 khi dang test capture), buoc app do tu pause. Viec tu
+ * dong xin lai focus ngay khi mat con tao vong lap "giat" focus qua lai moi
+ * khi app nguon co gang phat lai. Vi OutputRouter o day CHI phat ra ket qua
+ * am thanh cuoi (nhac da capture + mic da mix), khong can va KHONG duoc xin
+ * Audio Focus doc quyen - da bo hoan toan phan nay. Van de "tut volume qua
+ * Bluetooth AVRCP" duoc xu ly rieng boi volumeGuardJob (khong thay doi),
+ * khong lien quan gi den Audio Focus.
  */
 class OutputRouter(
     private val context: Context,
-    // ✅ MOI (thu nghiem thoat khoi STREAM_MUSIC de mixer khong bi anh huong
-    // boi lenh mute test o Activity): cho phep truyen usage khac, MAC DINH
-    // van la USAGE_MEDIA (STREAM_MUSIC) de KHONG lam thay doi hanh vi hien
-    // tai cua Mixer Test (Phase 3)/production - chi truyen usage khac khi
-    // GOI TU MainActivity de A/B test qua nut "Mic Loopback".
+    // Cho phep truyen usage khac, MAC DINH van la USAGE_MEDIA (STREAM_MUSIC).
     //
     // ⚠️ TUYET DOI KHONG dung USAGE_VOICE_COMMUNICATION o day: usage nay
     // mang ngu nghia "audio cuoc goi", tren nhieu thiet bi/OEM co the khien
@@ -63,18 +71,6 @@ class OutputRouter(
 ) {
 
     private var audioTrack: AudioTrack? = null
-
-    // ✅ MOI (fix nghi van "nhac tu nho dan khi chuyen app qua lai"): app
-    // truoc gio KHONG he goi requestAudioFocus() - nghia la Android khong
-    // biet app dang "giu" quyen phat am thanh uu tien. Khi chuyen sang app
-    // khac (hoac chi 1 thong bao/am thanh he thong xin focus tam thoi kieu
-    // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK), he thong co the tu dong "duck"
-    // (ha nho) stream cua app minh de nhuong uu tien - va vi app khong co
-    // AudioFocusRequest/listener nao ca nen KHONG biet de tu phuc hoi, dan
-    // toi hien tuong nho dan qua nhieu lan chuyen app. Xin AUDIOFOCUS_GAIN
-    // (khong phai TRANSIENT) ngay khi bat dau phat - bao cho he thong biet
-    // day la nguon phat "chinh", giam nguy co bi duck boi cac nguon khac.
-    private var audioFocusRequest: AudioFocusRequest? = null
 
     // Buffer stereo tam dung lai de tranh cap phat moi lan write() - kich
     // thuoc se tu dong lon len neu can (xem write()).
@@ -118,81 +114,9 @@ class OutputRouter(
         }
     }
 
-    /**
-     * ✅ MOI: xin AUDIOFOCUS_GAIN (giu lau dai, khong phai TRANSIENT) truoc
-     * khi phat - xem giai thich chi tiet o khai bao audioFocusRequest ben
-     * tren.
-     *
-     * ✅ CAP NHAT (fix "nhac tu nho dan qua Bluetooth khi chuyen app" - da
-     * xac dinh ro hon qua test thuc te: CHI xay ra qua Bluetooth, loa trong
-     * may khong bi): nghi van chinh gio la AVRCP Absolute Volume - co che
-     * dong bo volume 2 chieu giua dien thoai va loa Bluetooth. Khi mat Audio
-     * Focus (thuong xay ra dung luc chuyen app), loa BT co the tu gui lai
-     * gia tri volume cua no de "dong bo", ghi de len STREAM_SYSTEM - thuong
-     * la thap hon. Truoc day chi LOG onAudioFocusChange ma khong lam gi -
-     * gio CHU DONG xin lai focus NGAY khi phat hien mat (AUDIOFOCUS_LOSS
-     * hoac LOSS_TRANSIENT), de giam thoi gian "khong giu focus" xuong toi
-     * thieu, giam kha nang loa BT kich hoat dong bo lai.
-     */
-    private var isRequestingFocus = false
-
-    private fun requestAudioFocus() {
-        if (isRequestingFocus) return // tranh de quy neu callback tu goi lai lien tuc
-        isRequestingFocus = true
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val result: Int
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val attrs = AudioAttributes.Builder()
-                .setUsage(usage)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build()
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(attrs)
-                .setAcceptsDelayedFocusGain(false)
-                .setOnAudioFocusChangeListener { change ->
-                    logBoth("🎧 onAudioFocusChange: $change (xem AudioManager.AUDIOFOCUS_* de doi chieu)")
-                    if (change == AudioManager.AUDIOFOCUS_LOSS ||
-                        change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-                    ) {
-                        logBoth("⚠️ Da mat AudioFocus - thu xin lai NGAY de giam thoi gian mat focus (nghi van gay tut volume qua Bluetooth AVRCP).")
-                        isRequestingFocus = false
-                        requestAudioFocus()
-                    }
-                }
-                .build()
-            audioFocusRequest = request
-            result = audioManager.requestAudioFocus(request)
-        } else {
-            @Suppress("DEPRECATION")
-            result = audioManager.requestAudioFocus(
-                null,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN
-            )
-        }
-        val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        logBoth(
-            "🎧 requestAudioFocus() ket qua=$result " +
-                "(${if (granted) "✅ GRANTED" else "⚠️ KHONG duoc cap - co the van bi duck boi app khac"})"
-        )
-        isRequestingFocus = false
-    }
-
-    private fun abandonAudioFocus() {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-            audioFocusRequest = null
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.abandonAudioFocus(null)
-        }
-    }
-
     fun start() {
         totalFramesWritten = 0
         logNativeAudioProperties()
-        requestAudioFocus()
 
         val builder = AudioTrack.Builder()
             .setAudioAttributes(
@@ -291,7 +215,6 @@ class OutputRouter(
         }
         audioTrack = null
         totalFramesWritten = 0
-        abandonAudioFocus()
         logBoth("🛑 Da dung output")
     }
 }
