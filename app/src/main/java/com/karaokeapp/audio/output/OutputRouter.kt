@@ -2,6 +2,7 @@ package com.karaokeapp.audio.output
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTimestamp
@@ -63,6 +64,18 @@ class OutputRouter(
 
     private var audioTrack: AudioTrack? = null
 
+    // ✅ MOI (fix nghi van "nhac tu nho dan khi chuyen app qua lai"): app
+    // truoc gio KHONG he goi requestAudioFocus() - nghia la Android khong
+    // biet app dang "giu" quyen phat am thanh uu tien. Khi chuyen sang app
+    // khac (hoac chi 1 thong bao/am thanh he thong xin focus tam thoi kieu
+    // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK), he thong co the tu dong "duck"
+    // (ha nho) stream cua app minh de nhuong uu tien - va vi app khong co
+    // AudioFocusRequest/listener nao ca nen KHONG biet de tu phuc hoi, dan
+    // toi hien tuong nho dan qua nhieu lan chuyen app. Xin AUDIOFOCUS_GAIN
+    // (khong phai TRANSIENT) ngay khi bat dau phat - bao cho he thong biet
+    // day la nguon phat "chinh", giam nguy co bi duck boi cac nguon khac.
+    private var audioFocusRequest: AudioFocusRequest? = null
+
     // Buffer stereo tam dung lai de tranh cap phat moi lan write() - kich
     // thuoc se tu dong lon len neu can (xem write()).
     private var stereoScratchBuffer = ShortArray(0)
@@ -105,9 +118,61 @@ class OutputRouter(
         }
     }
 
+    /**
+     * ✅ MOI: xin AUDIOFOCUS_GAIN (giu lau dai, khong phai TRANSIENT) truoc
+     * khi phat - xem giai thich chi tiet o khai bao audioFocusRequest ben
+     * tren. Khong xu ly callback onAudioFocusChange gi dac biet (chua can
+     * o Phase 3 nay - muc tieu CHINH la bao hieu "toi dang giu focus", giup
+     * giam kha nang bi he thong tu duck ngam), chi log ket qua de biet xin
+     * thanh cong hay khong.
+     */
+    private fun requestAudioFocus() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val result: Int
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(usage)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { change ->
+                    logBoth("🎧 onAudioFocusChange: $change (xem AudioManager.AUDIOFOCUS_* de doi chieu)")
+                }
+                .build()
+            audioFocusRequest = request
+            result = audioManager.requestAudioFocus(request)
+        } else {
+            @Suppress("DEPRECATION")
+            result = audioManager.requestAudioFocus(
+                null,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+        val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        logBoth(
+            "🎧 requestAudioFocus() ket qua=$result " +
+                "(${if (granted) "✅ GRANTED" else "⚠️ KHONG duoc cap - co the van bi duck boi app khac"})"
+        )
+    }
+
+    private fun abandonAudioFocus() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+    }
+
     fun start() {
         totalFramesWritten = 0
         logNativeAudioProperties()
+        requestAudioFocus()
 
         val builder = AudioTrack.Builder()
             .setAudioAttributes(
@@ -206,6 +271,7 @@ class OutputRouter(
         }
         audioTrack = null
         totalFramesWritten = 0
+        abandonAudioFocus()
         logBoth("🛑 Da dung output")
     }
 }

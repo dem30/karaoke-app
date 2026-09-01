@@ -86,12 +86,35 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
 
+        // ✅ MOI (fix "vocal qua nho so voi nhac", phat hien qua test Phase 3
+        // thuc te - amplitude MusicInput ~6000-8000, MicInput chi ~400-1200,
+        // chenh lech 6-8 lan): mic thu THO, chua qua compressor/gain (dung
+        // nguyen tac goc - VocalProcessor Phase 4 moi xu ly EQ/Compressor),
+        // trong khi nhac da qua mastering nen bien do cao san. Neu cong 1:1
+        // nhu truoc, giong hat gan nhu bi nhac lan at. Nhan gain CO DINH cho
+        // vocal truoc khi cong - muc 4.0 la diem khoi dau uoc luong tu ty le
+        // amplitude do duoc (~6-8x, chon thap hon mot chut de tranh clip qua
+        // nhieu), CAN nguoi dung tu tinh chinh lai sau khi nghe thu thuc te
+        // (vd tang len 5-6 neu van con nho, giam xuong neu bi rit/clip khi
+        // hat to). Day la gain THO tam thoi cho Phase 3 - Phase 4
+        // (Compressor) se thay the co che nay bang xu ly dong bo, chuyen
+        // nghiep hon.
+        private const val VOCAL_GAIN = 4.0f
+
         fun mix(music: ShortArray, musicLen: Int, vocal: ShortArray, vocalLen: Int, outLength: Int): ShortArray {
             val out = ShortArray(outLength)
             for (i in 0 until outLength) {
                 val m = if (i < musicLen) music[i].toInt() else 0
-                val v = if (i < vocalLen) vocal[i].toInt() else 0
-                var sum = m + v
+                // ✅ Ap VOCAL_GAIN truoc khi cong - clamp RIENG truoc, tranh
+                // truong hop gain lam vocal tu no da vuot Short.MAX_VALUE
+                // truoc ca khi cong voi music (se lam sai lech phep clamp
+                // tong sau do).
+                val vRaw = if (i < vocalLen) vocal[i].toInt() else 0
+                var vBoosted = (vRaw * VOCAL_GAIN).toInt()
+                if (vBoosted > Short.MAX_VALUE) vBoosted = Short.MAX_VALUE.toInt()
+                if (vBoosted < Short.MIN_VALUE) vBoosted = Short.MIN_VALUE.toInt()
+
+                var sum = m + vBoosted
                 if (sum > Short.MAX_VALUE) sum = Short.MAX_VALUE.toInt()
                 if (sum < Short.MIN_VALUE) sum = Short.MIN_VALUE.toInt()
                 out[i] = sum.toShort()
