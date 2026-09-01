@@ -121,12 +121,24 @@ class OutputRouter(
     /**
      * ✅ MOI: xin AUDIOFOCUS_GAIN (giu lau dai, khong phai TRANSIENT) truoc
      * khi phat - xem giai thich chi tiet o khai bao audioFocusRequest ben
-     * tren. Khong xu ly callback onAudioFocusChange gi dac biet (chua can
-     * o Phase 3 nay - muc tieu CHINH la bao hieu "toi dang giu focus", giup
-     * giam kha nang bi he thong tu duck ngam), chi log ket qua de biet xin
-     * thanh cong hay khong.
+     * tren.
+     *
+     * ✅ CAP NHAT (fix "nhac tu nho dan qua Bluetooth khi chuyen app" - da
+     * xac dinh ro hon qua test thuc te: CHI xay ra qua Bluetooth, loa trong
+     * may khong bi): nghi van chinh gio la AVRCP Absolute Volume - co che
+     * dong bo volume 2 chieu giua dien thoai va loa Bluetooth. Khi mat Audio
+     * Focus (thuong xay ra dung luc chuyen app), loa BT co the tu gui lai
+     * gia tri volume cua no de "dong bo", ghi de len STREAM_SYSTEM - thuong
+     * la thap hon. Truoc day chi LOG onAudioFocusChange ma khong lam gi -
+     * gio CHU DONG xin lai focus NGAY khi phat hien mat (AUDIOFOCUS_LOSS
+     * hoac LOSS_TRANSIENT), de giam thoi gian "khong giu focus" xuong toi
+     * thieu, giam kha nang loa BT kich hoat dong bo lai.
      */
+    private var isRequestingFocus = false
+
     private fun requestAudioFocus() {
+        if (isRequestingFocus) return // tranh de quy neu callback tu goi lai lien tuc
+        isRequestingFocus = true
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val result: Int
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -139,6 +151,13 @@ class OutputRouter(
                 .setAcceptsDelayedFocusGain(false)
                 .setOnAudioFocusChangeListener { change ->
                     logBoth("🎧 onAudioFocusChange: $change (xem AudioManager.AUDIOFOCUS_* de doi chieu)")
+                    if (change == AudioManager.AUDIOFOCUS_LOSS ||
+                        change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
+                    ) {
+                        logBoth("⚠️ Da mat AudioFocus - thu xin lai NGAY de giam thoi gian mat focus (nghi van gay tut volume qua Bluetooth AVRCP).")
+                        isRequestingFocus = false
+                        requestAudioFocus()
+                    }
                 }
                 .build()
             audioFocusRequest = request
@@ -156,6 +175,7 @@ class OutputRouter(
             "🎧 requestAudioFocus() ket qua=$result " +
                 "(${if (granted) "✅ GRANTED" else "⚠️ KHONG duoc cap - co the van bi duck boi app khac"})"
         )
+        isRequestingFocus = false
     }
 
     private fun abandonAudioFocus() {

@@ -86,20 +86,27 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
 
-        // ✅ MOI (fix "vocal qua nho so voi nhac", phat hien qua test Phase 3
-        // thuc te - amplitude MusicInput ~6000-8000, MicInput chi ~400-1200,
-        // chenh lech 6-8 lan): mic thu THO, chua qua compressor/gain (dung
-        // nguyen tac goc - VocalProcessor Phase 4 moi xu ly EQ/Compressor),
-        // trong khi nhac da qua mastering nen bien do cao san. Neu cong 1:1
-        // nhu truoc, giong hat gan nhu bi nhac lan at. Nhan gain CO DINH cho
-        // vocal truoc khi cong - muc 4.0 la diem khoi dau uoc luong tu ty le
-        // amplitude do duoc (~6-8x, chon thap hon mot chut de tranh clip qua
-        // nhieu), CAN nguoi dung tu tinh chinh lai sau khi nghe thu thuc te
-        // (vd tang len 5-6 neu van con nho, giam xuong neu bi rit/clip khi
-        // hat to). Day la gain THO tam thoi cho Phase 3 - Phase 4
-        // (Compressor) se thay the co che nay bang xu ly dong bo, chuyen
-        // nghiep hon.
-        private const val VOCAL_GAIN = 4.0f
+        // ⚠️ CAP NHAT QUAN TRONG (AN TOAN - fix "mic hu" phat hien qua test
+        // thuc te): VOCAL_GAIN=4.0 truoc day da vo tinh day do loi cua VONG
+        // LAP PHAN HOI AM THANH (feedback loop: loa phat -> mic mo bat lai
+        // -> nhan gain -> mix lai -> loa phat to hon -> mic bat to hon...)
+        // VUOT QUA nguong tu kich hoat hu - da xac nhan qua log thuc te
+        // (amplitude mic tang von: 2500 -> 6000 -> 7000 -> 8000 roi giu o
+        // muc cao, dung dac trung vong lap phan hoi). Day la GIOI HAN VAT LY
+        // cua viec dung loa ngoai + mic mo CUNG LUC ma chua co AEC (Acoustic
+        // Echo Cancellation) hay Limiter (du kien Phase 4) - GIAM gain o day
+        // chi giam RUI RO (giam do loi vong lap), KHONG loai bo hoan toan
+        // nguy co hu neu am luong loa dat qua cao hoac mic qua gan loa.
+        //
+        // ✅ KHUYEN NGHI BAT BUOC trong luc test Phase 3 (cho toi khi co
+        // AEC/Limiter that): DUNG TAI NGHE (co day, cam vao may) thay vi loa
+        // ngoai - tai nghe cach ly hoan toan duong phat khoi mic, loai bo
+        // hoan toan nguy co hu, khong phu thuoc gain bao nhieu.
+        //
+        // Giam tu 4.0 xuong 1.8 - van con boost vocal (khong ve lai 1:1 qua
+        // nho), nhung giam dang ke do loi vong lap so voi 4.0. Van CAN nguoi
+        // dung tu tinh chinh tiep tuy thiet bi/khoang cach mic-loa thuc te.
+        private const val VOCAL_GAIN = 1.8f
 
         fun mix(music: ShortArray, musicLen: Int, vocal: ShortArray, vocalLen: Int, outLength: Int): ShortArray {
             val out = ShortArray(outLength)

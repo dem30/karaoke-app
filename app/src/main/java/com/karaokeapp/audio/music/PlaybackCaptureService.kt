@@ -18,6 +18,12 @@ import androidx.core.app.NotificationCompat
 import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -89,6 +95,17 @@ class PlaybackCaptureService : Service() {
     // reassertStreamSystemVolumeIfMixerRunning().
     private var savedStreamMusicVolume = -1
     private var savedStreamSystemVolume = -1
+
+    // ✅ MOI (fix "nhac nho dan qua Bluetooth" - nang cap tan suat kiem tra):
+    // truoc day chi kiem tra/ep lai STREAM_SYSTEM 1 lan/giay (an theo tick
+    // notification co san) - qua cham de bat kip AVRCP volume resync cua
+    // loa Bluetooth (nghi van chinh, xem giai thich trong OutputRouter.kt).
+    // Doi sang vong lap RIENG, chay ~300ms/lan, chi hoat dong trong luc
+    // Mixer Test dang bat (start/stop cung luc voi startMixerTestInternal/
+    // stopMixerTestInternal). serviceScope dung Dispatchers.Default vi day
+    // chi la vong kiem tra volume don gian, khong can UI thread.
+    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    private var volumeGuardJob: Job? = null
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
@@ -204,11 +221,25 @@ class PlaybackCaptureService : Service() {
             mix.pushVocal(buffer, size)
         })
 
+        // ✅ MOI: bat dau vong lap guard volume ~300ms/lan - xem giai thich
+        // chi tiet o khai bao volumeGuardJob ben tren.
+        volumeGuardJob = serviceScope.launch {
+            while (isActive) {
+                reassertStreamSystemVolumeIfMixerRunning()
+                delay(300L)
+            }
+        }
+
         logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
     }
 
     private fun stopMixerTestInternal() {
         if (mixer == null && micInput == null && mixerOutputRouter == null) return
+
+        // ✅ MOI: dung vong lap guard volume TRUOC khi don dep gi khac.
+        volumeGuardJob?.cancel()
+        volumeGuardJob = null
+
         micInput?.stopCapture()
         micInput = null
         mixer?.stop()
@@ -328,14 +359,11 @@ class PlaybackCaptureService : Service() {
             onAmplitudeTick = { avgAmplitude ->
                 val now = timeFormat.format(java.util.Date())
                 updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
-                // ✅ MOI (fix nghi van "nhac tu nho dan khi chuyen app qua
-                // lai"): tick nay von co san, chay ~1 lan/giay - tan dung
-                // luon de kiem tra + EP LAI STREAM_SYSTEM ve max moi giay
-                // trong luc Mixer Test dang chay, phong truong hop co yeu to
-                // ben ngoai (duck cua he thong, app khac xin focus...) tu ha
-                // no xuong ma requestAudioFocus() o OutputRouter chua chan
-                // het duoc.
-                reassertStreamSystemVolumeIfMixerRunning()
+                // ✅ Luu y: KHONG con goi reassertStreamSystemVolumeIfMixerRunning()
+                // o day nua - da thay bang volumeGuardJob (vong lap rieng
+                // ~300ms/lan, xem startMixerTestInternal()) nhanh hon nhieu
+                // so voi tick 1 lan/giay nay, giup bat kip AVRCP volume
+                // resync cua Bluetooth tot hon.
             },
             onPcmChunk = { buffer, size ->
                 // ✅ Phase 3: neu mixer test dang chay, day PCM nhac vao. Neu
