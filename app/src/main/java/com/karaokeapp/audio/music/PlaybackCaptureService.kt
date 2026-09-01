@@ -18,6 +18,7 @@ import androidx.core.app.NotificationCompat
 import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
+import com.karaokeapp.audio.processor.Limiter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -85,6 +86,13 @@ class PlaybackCaptureService : Service() {
     private var micInput: MicInput? = null
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
+
+    // ✅ MOI (fix "hu qua loa ngoai/Bluetooth" - vong lap phan hoi am hoc):
+    // limiter RIENG ap cho VOCAL TRUOC KHI vao mixer, xem giai thich chi
+    // tiet trong Limiter.kt. Day KHONG phai limiter cuoi chuoi cua PLAN.md
+    // (do se lam sau, ap cho MIX TONG) - day la lop chan GOC vong lap hu,
+    // can thiet NGAY vi test bang loa ngoai/Bluetooth dang bi hu that.
+    private var vocalLimiter: Limiter? = null
 
     // ✅ MOI (Phase 3 - production): luu muc goc cua 2 stream de mute/boost
     // tu dong khi Mixer Test chay, khoi phuc khi tat - tranh nghe DOI
@@ -207,9 +215,19 @@ class PlaybackCaptureService : Service() {
         val mix = LowLatencyMixer(router).apply { start() }
         val mic = MicInput(this)
 
+        // ✅ MOI: limiter rieng cho vocal, threshold 0.85 (85% Short.MAX_VALUE),
+        // release 50ms - xem Limiter.kt de biet chi tiet vi sao dat o day
+        // (chan goc re vong lap phan hoi, khong phai chi chong clipping don
+        // thuan). Noise gate CHUA bat (giu null/mac dinh) - can nghe thu
+        // truoc de biet muc nen that su cua moi truong test (phong, khoang
+        // cach mic-loa) truoc khi chon nguong gate hop ly, tranh gate cat
+        // nham tieng hat nho/thi tham.
+        val limiter = Limiter(sampleRate = 44100, thresholdRatio = 0.85f, releaseMs = 50f)
+
         mixerOutputRouter = router
         mixer = mix
         micInput = mic
+        vocalLimiter = limiter
 
         // ✅ Noi MusicInput hien tai vao mixer: vi MusicInput da duoc tao TU
         // TRUOC (o onStartCommand chinh) voi onPcmChunk da tro ve mixerRef
@@ -218,6 +236,13 @@ class PlaybackCaptureService : Service() {
         // dong bat dau day du lieu vao no.
 
         mic.startCapture(onPcmChunk = { buffer, size ->
+            // ✅ MOI: limiter chay TRUOC khi PCM vao mixer - xem giai thich
+            // o khai bao vocalLimiter/Limiter.kt. Vi tri nay QUAN TRONG: neu
+            // dat limiter SAU mixer (chi o mix tong), no van cho phep vocal
+            // rieng le tang bien do khong gioi han truoc khi bi cong voi
+            // nhac - vong lap phan hoi van co the tu nuoi no o day truoc khi
+            // limiter mix tong kip chan.
+            limiter.process(buffer, size)
             mix.pushVocal(buffer, size)
         })
 
@@ -234,7 +259,7 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun stopMixerTestInternal() {
-        if (mixer == null && micInput == null && mixerOutputRouter == null) return
+        if (mixer == null && micInput == null && mixerOutputRouter == null && vocalLimiter == null) return
 
         // ✅ MOI: dung vong lap guard volume TRUOC khi don dep gi khac.
         volumeGuardJob?.cancel()
@@ -246,6 +271,8 @@ class PlaybackCaptureService : Service() {
         mixer = null
         mixerOutputRouter?.stop()
         mixerOutputRouter = null
+        vocalLimiter?.reset()
+        vocalLimiter = null
 
         // ✅ MOI: khoi phuc ca 2 stream da mute/boost o startMixerTestInternal() -
         // guard bang >= 0 de tranh khoi phuc 2 lan neu ham nay bi goi lai (vd tu
