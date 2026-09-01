@@ -94,15 +94,30 @@ class PlaybackCaptureService : Service() {
     // can thiet NGAY vi test bang loa ngoai/Bluetooth dang bi hu that.
     private var vocalLimiter: Limiter? = null
 
-    // ✅ MOI (Phase 3 - production): luu muc goc cua 2 stream de mute/boost
-    // tu dong khi Mixer Test chay, khoi phuc khi tat - tranh nghe DOI
-    // (YouTube phat truc tiep + mixer phat lai) va tranh mixer nghe qua nho
-    // vi STREAM_SYSTEM mac dinh thap. Gia tri -1 nghia la "khong co gi dang
-    // can khoi phuc" - dung lam guard chong khoi phuc 2 lan, VA dung lam co
-    // de biet Mixer Test co dang chay hay khong trong
+    // ✅ MOI (Phase 3 - production): luu muc goc cua STREAM_SYSTEM de boost
+    // tu dong khi Mixer Test chay, khoi phuc khi tat. Gia tri -1 nghia la
+    // "khong co gi dang can khoi phuc" - dung lam guard chong khoi phuc 2
+    // lan, VA dung lam co de biet Mixer Test co dang chay hay khong trong
     // reassertStreamSystemVolumeIfMixerRunning().
-    private var savedStreamMusicVolume = -1
     private var savedStreamSystemVolume = -1
+
+    // ✅ MOI (fix goc "Karaoke App tu dat am luong Bluetooth = 0" - xac nhan
+    // qua thong bao he thong that cua Android, thay vi doan bang log nua):
+    // truoc day dung setStreamVolume(STREAM_MUSIC, 0, 0) - hanh dong nay
+    // DOI INDEX cua STREAM_MUSIC, va STREAM_MUSIC la "stream chinh" Android
+    // dung de dong bo AVRCP absolute-volume THUC SU gui cho loa Bluetooth -
+    // BAT KE audio cua chinh app dang phat qua stream nao khac (o day la
+    // STREAM_SYSTEM). Doi index ve 0 -> loa BT bi ha volume PHAN CUNG ve 0,
+    // anh huong luon output cua chinh mixer.
+    //
+    // Sua: chuyen sang dung CO MUTE RIENG (adjustStreamVolume ADJUST_MUTE/
+    // ADJUST_UNMUTE) thay vi doi index - day la co chế TACH BIET voi index,
+    // hy vong (CHUA chac chan 100%, can kiem chung thuc te) khong kich hoat
+    // dong bo AVRCP giong nhu khi doi index. 2 bien duoi day thay the hoan
+    // toan cho savedStreamMusicVolume (khong con can luu/khoi phuc INDEX cu
+    // nua vi khong con doi index).
+    private var streamMusicWasMutedBeforeMixerTest = false
+    private var musicMuteAppliedByMixerTest = false
 
     // ✅ MOI (fix "nhac nho dan qua Bluetooth" - nang cap tan suat kiem tra):
     // truoc day chi kiem tra/ep lai STREAM_SYSTEM 1 lan/giay (an theo tick
@@ -214,10 +229,24 @@ class PlaybackCaptureService : Service() {
         // mixer nua - da xac nhan qua "Test Mute STREAM_MUSIC" (MainActivity)
         // rang MusicInput van capture binh thuong du STREAM_MUSIC = 0, vi capture
         // tap TRUOC buoc ap volume he thong.
+        // ✅ SUA (fix goc "Karaoke App tu dat am luong Bluetooth = 0" - xem
+        // giai thich chi tiet o khai bao streamMusicWasMutedBeforeMixerTest/
+        // musicMuteAppliedByMixerTest phia tren): dung CO MUTE thay vi doi
+        // INDEX ve 0, tranh kich hoat dong bo AVRCP volume=0 cho loa
+        // Bluetooth. Van giu duoc muc dich goc: YouTube khong tu phat truc
+        // tiep ra loa nua (capture van hoat dong binh thuong vi xay ra
+        // TRUOC ca buoc ap volume LAN buoc ap mute flag).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        savedStreamMusicVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-        logBoth("🔇 Da mute STREAM_MUSIC (muc goc=$savedStreamMusicVolume) - YouTube se im, chi con mixer phat ra loa.")
+        streamMusicWasMutedBeforeMixerTest = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
+        if (!streamMusicWasMutedBeforeMixerTest) {
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+        }
+        musicMuteAppliedByMixerTest = true
+        logBoth(
+            "🔇 Da mute STREAM_MUSIC bang MUTE FLAG (KHONG doi so volume/index nua) - " +
+                "YouTube se im, chi con mixer phat ra loa. (da mute san tu truoc=" +
+                "$streamMusicWasMutedBeforeMixerTest)"
+        )
 
         // ✅ MOI: usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) cho output mixer -
         // da test latency ngang MEDIA (~296-300ms ca 2), khong dinh rui ro SCO
@@ -301,14 +330,22 @@ class PlaybackCaptureService : Service() {
         vocalLimiter?.reset()
         vocalLimiter = null
 
-        // ✅ MOI: khoi phuc ca 2 stream da mute/boost o startMixerTestInternal() -
-        // guard bang >= 0 de tranh khoi phuc 2 lan neu ham nay bi goi lai (vd tu
-        // stopCurrentSessionIfAny() VA onDestroy() lien tiep).
+        // ✅ SUA: khoi phuc STREAM_MUSIC bang co MUTE (khong con phuc hoi
+        // INDEX nua vi khong con doi index) - guard bang
+        // musicMuteAppliedByMixerTest de tranh xu ly 2 lan neu ham nay bi
+        // goi lai (vd tu stopCurrentSessionIfAny() VA onDestroy() lien
+        // tiep). CHI unmute neu STREAM_MUSIC KHONG bi mute san tu truoc khi
+        // Mixer Test bat dau (tranh vo tinh unmute 1 trang thai nguoi dung
+        // da tu chon tu truoc, khong lien quan gi den app).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        if (savedStreamMusicVolume >= 0) {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedStreamMusicVolume, 0)
-            logBoth("Da khoi phuc STREAM_MUSIC ve muc goc=$savedStreamMusicVolume")
-            savedStreamMusicVolume = -1
+        if (musicMuteAppliedByMixerTest) {
+            if (!streamMusicWasMutedBeforeMixerTest) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                logBoth("Da bo MUTE FLAG cua STREAM_MUSIC (khoi phuc trang thai truoc do - khong bi mute).")
+            } else {
+                logBoth("STREAM_MUSIC da bi mute TU TRUOC khi bat Mixer Test - giu nguyen, khong dong gi them.")
+            }
+            musicMuteAppliedByMixerTest = false
         }
         if (savedStreamSystemVolume >= 0) {
             audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, savedStreamSystemVolume, 0)
@@ -391,16 +428,19 @@ class PlaybackCaptureService : Service() {
             )
         }
 
-        // ✅ MOI: neu phat hien STREAM_MUSIC bi keo khac 0 (ngoai y muon cua
-        // app - app chi set 1 LAN duy nhat luc bat dau, KHONG co vong lap
-        // nao khac dang set lai) - ep NGAY ve 0 lai, giong tinh than xu ly
-        // STREAM_SYSTEM ben duoi.
-        if (musicCurrent != 0) {
+        // ✅ SUA (thay doi tuong ung voi viec chuyen sang dung MUTE FLAG cho
+        // STREAM_MUSIC o startMixerTestInternal(), thay vi ep INDEX ve 0):
+        // gio kiem tra CO MUTE co bi go mat khong (vi du YouTube/he thong tu
+        // unmute khi phat bai moi), KHONG con kiem tra index != 0 nua (index
+        // gio KHONG bi app dong vao 0 nua, nen kiem tra do se BAO SAI lien
+        // tuc). CHI xu ly khi Mixer Test dang thuc su enforce mute
+        // (musicMuteAppliedByMixerTest=true).
+        if (musicMuteAppliedByMixerTest && !musicMuted) {
             logBoth(
-                "⚠️ [AutoReassert] STREAM_MUSIC bi keo len $musicCurrent/$musicMax " +
-                    "(co the do YouTube tu goi setStreamVolume khi phat bai moi) - ep lai ve 0."
+                "⚠️ [AutoReassert] STREAM_MUSIC bi GO MUTE FLAG ngoai y muon " +
+                    "(co the do YouTube tu unmute khi phat bai moi) - mute lai."
             )
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
         }
 
         if (isMuted) {
