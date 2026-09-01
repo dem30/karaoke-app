@@ -331,6 +331,23 @@ class PlaybackCaptureService : Service() {
      * kien "current < max" nua), de dam bao du roi vao truong hop nao (tut
      * so, hay chi bi mute flag ma so van 15/15) cung duoc xu ly.
      */
+    /**
+     * ✅ MOI (debug - xac nhan gia thuyet moi): nguoi dung quan sat thuc te
+     * "moi lan mo lai YouTube hoac doi bai, nhac nen+vocal cua mixer bi keo
+     * nho" - trong khi STREAM_SYSTEM (theo doi truoc gio) da xac nhan qua
+     * GuardTick la ON DINH 15/15 SUOT, khong lien quan. Nghi van moi: chinh
+     * STREAM_MUSIC (dang bi code giu = 0 de mute YouTube) co the bi CHINH
+     * YOUTUBE tu goi setStreamVolume() de "khoi phuc" ve 1 gia tri khac 0
+     * moi khi no bat dau phat 1 bai/track moi (hanh vi noi bo pho bien cua
+     * nhieu app media). Vi AudioPlaybackCaptureConfiguration capture tin
+     * hieu SAU khi he thong da ap gain volume cua STREAM_MUSIC (KHONG phai
+     * truoc nhu gia dinh cu trong comment startMixerTestInternal - can kiem
+     * chung lai qua log nay), neu STREAM_MUSIC bi keo len 1 so nho khac 0
+     * (khong phai muc goc nguoi dung dat), am luong MusicInput capture duoc
+     * se ty le thuan theo do - giai thich dung hien tuong "nho xiu" thay vi
+     * "mat han" (khac voi truong hop mute hoan toan).
+     * Log CA 2 stream trong 1 dong de de doi chieu thoi diem.
+     */
     private fun reassertStreamSystemVolumeIfMixerRunning() {
         if (savedStreamSystemVolume < 0) return // Mixer Test dang tat, khong lien quan.
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -338,13 +355,28 @@ class PlaybackCaptureService : Service() {
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
         val isMuted = audioManager.isStreamMute(AudioManager.STREAM_SYSTEM)
 
-        // ✅ MOI (debug tam thoi - CHUA xac dinh duoc nguyen nhan that qua
-        // suy luan tinh, can quan sat TRUC TIEP tai dung thoi diem chuyen
-        // app): log MOI LAN chay (khong chi khi bat thuong) de bat duoc bien
-        // dong tuc thoi (transient) co the da tu phuc hoi truoc khi lan poll
-        // tiep theo (300ms sau) kiem tra lai - neu chi log luc bat thuong,
-        // se BO LO chinh khoanh khac gay ra hien tuong "nghe nho".
-        logBoth("[GuardTick] STREAM_SYSTEM current=$current/$max, isMuted=$isMuted")
+        val musicCurrent = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val musicMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val musicMuted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
+
+        logBoth(
+            "[GuardTick] STREAM_SYSTEM current=$current/$max isMuted=$isMuted | " +
+                "STREAM_MUSIC current=$musicCurrent/$musicMax isMuted=$musicMuted " +
+                "(ky vong STREAM_MUSIC LUON =0 trong luc Mixer Test chay - neu khac 0, " +
+                "day la bang chung xac nhan gia thuyet YouTube tu set lai volume)"
+        )
+
+        // ✅ MOI: neu phat hien STREAM_MUSIC bi keo khac 0 (ngoai y muon cua
+        // app - app chi set 1 LAN duy nhat luc bat dau, KHONG co vong lap
+        // nao khac dang set lai) - ep NGAY ve 0 lai, giong tinh than xu ly
+        // STREAM_SYSTEM ben duoi.
+        if (musicCurrent != 0) {
+            logBoth(
+                "⚠️ [AutoReassert] STREAM_MUSIC bi keo len $musicCurrent/$musicMax " +
+                    "(co the do YouTube tu goi setStreamVolume khi phat bai moi) - ep lai ve 0."
+            )
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        }
 
         if (isMuted) {
             logBoth(
