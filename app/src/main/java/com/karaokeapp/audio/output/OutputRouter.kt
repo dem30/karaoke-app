@@ -251,4 +251,84 @@ class OutputRouter(
         stop()
         start()
     }
+
+    /**
+     * ✅ MOI (fix NHE NHANG HON recreate() - da xac nhan qua test thuc te
+     * that: recreate() gay ra bug NANG HON nhieu - ca phien MediaProjection
+     * bi chinh Android thu hoi tren driver Honor, khi pha huy/tao lai
+     * AudioTrack trong luc AudioRecord dua tren MediaProjection dang chay
+     * song song).
+     *
+     * Bang chung MOI quan trong: nguoi dung xac nhan CHI CAN 1 THONG BAO
+     * BAT KY (vi du Facebook) toi la nhac TU DONG to lai binh thuong, KHONG
+     * can lam gi ca. Dieu nay chung minh: chi CAN 1 luong am thanh MOI xuat
+     * hien (bat ky, khong lien quan gi den AudioTrack cua chinh chung ta)
+     * la du de AudioFlinger tinh toan lai (re-mix) toan bo cac luong dang
+     * phat va xoa trang thai "duck" con sot - KHONG can pha huy/tao lai
+     * chinh AudioTrack dang bi anh huong.
+     *
+     * Ham nay MO PHONG dung hieu ung do: tu tao ra 1 "thong bao gia" - phat
+     * 1 doan PCM CUC NGAN (~60ms) va GAN NHU IM LANG (bien do =1, khong du
+     * to de tai nguoi nghe thay) tren 1 AudioTrack RIENG BIET, usage=
+     * USAGE_NOTIFICATION (dung loai stream ma thong bao that su dung) -
+     * kich hoat dung co che AudioFlinger da quan sat duoc, MA KHONG dung gi
+     * toi AudioTrack chinh (audioTrack o tren) hay AudioRecord/MediaProjection
+     * dang chay o noi khac.
+     */
+    fun nudgeAudioMixerToClearDuck() {
+        try {
+            val durationMs = 60
+            val sampleCount = SAMPLE_RATE * durationMs / 1000
+            // Bien do = 1 (KHONG phai 0) - mot so audio HAL/driver co the
+            // toi uu "bo qua" hoan toan buffer toan-0 (coi nhu khong co gi
+            // de phat), lam mat tac dung "kich hoat re-mix" ma ta can. Bien
+            // do 1 tren thang 32767 van hoan toan khong the nghe thay duoc.
+            val nearSilentBuffer = ShortArray(sampleCount) { 1 }
+
+            val nudgeTrack = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AUDIO_FORMAT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(nearSilentBuffer.size * 2)
+                .build()
+
+            if (nudgeTrack.state != AudioTrack.STATE_INITIALIZED) {
+                logBoth("❌ [NudgeMixer] nudgeTrack khoi tao that bai, state=${nudgeTrack.state}", isError = true)
+                nudgeTrack.release()
+                return
+            }
+
+            nudgeTrack.write(nearSilentBuffer, 0, nearSilentBuffer.size)
+            nudgeTrack.play()
+            logBoth(
+                "🔔 [NudgeMixer] Da phat 1 am gan-im-lang (${durationMs}ms, usage=NOTIFICATION) " +
+                    "de ep AudioFlinger tinh lai mix - thay the cho recreate() (da xac nhan gay hai)."
+            )
+
+            // Giai phong nudgeTrack sau khi phat xong (+ margin an toan) -
+            // dung Handler.postDelayed (khong can coroutine/scope rieng cho
+            // 1 tac vu 1-lan, ngan han nhu the nay).
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    nudgeTrack.stop()
+                    nudgeTrack.release()
+                } catch (e: Exception) {
+                    logBoth("⚠️ [NudgeMixer] Loi khi giai phong nudgeTrack (khong nghiem trong): ${e.message}")
+                }
+            }, (durationMs + 150).toLong())
+        } catch (e: Exception) {
+            logBoth("❌ [NudgeMixer] Loi khi tao/phat am nudge: ${e.message}", isError = true)
+        }
+    }
 }
