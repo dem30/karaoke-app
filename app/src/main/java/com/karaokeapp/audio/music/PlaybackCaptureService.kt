@@ -172,14 +172,30 @@ class PlaybackCaptureService : Service() {
             // Mixer Test" da xac nhan chua duoc trieu chung "nhac/vocal nho
             // xiu khong tu phuc hoi". Huy job cu (neu co) truoc khi dat job
             // moi, tranh recreate() bi goi chong cheo nhieu lan lien tiep.
-            selfHealJob?.cancel()
-            selfHealJob = serviceScope.launch {
-                delay(400L)
+            //
+            // ✅ MOI: boc trong ENABLE_SELF_HEAL_RECREATE (xem giai thich
+            // chi tiet o khai bao co nay) - nghi van MOI rang chinh hanh
+            // dong recreate() nay co the la nguyen nhan gay "ca phien
+            // MediaProjection bi thu hoi" (nang hon nhieu so voi "nho
+            // tieng" ban dau) tren driver am thanh cua Honor khi AudioRecord
+            // (MediaProjection) dang chay song song.
+            if (ENABLE_SELF_HEAL_RECREATE) {
+                selfHealJob?.cancel()
+                selfHealJob = serviceScope.launch {
+                    delay(400L)
+                    logBoth(
+                        "🩹 [SelfHeal] Tao lai AudioTrack cua mixer sau su kien " +
+                            "mat focus ($label), de xoa moi trang thai duck con sot."
+                    )
+                    mixerOutputRouter?.recreate()
+                }
+            } else {
                 logBoth(
-                    "🩹 [SelfHeal] Tao lai AudioTrack cua mixer sau su kien " +
-                        "mat focus ($label), de xoa moi trang thai duck con sot."
+                    "🔬 [Chan doan] ENABLE_SELF_HEAL_RECREATE=false - BO QUA " +
+                        "recreate() AudioTrack lan nay, CHI xin lai AudioFocus " +
+                        "(o tren). Dung de cach ly xem recreate() co phai nguyen " +
+                        "nhan gay mat ca phien MediaProjection hay khong."
                 )
-                mixerOutputRouter?.recreate()
             }
         }
     }
@@ -263,6 +279,31 @@ class PlaybackCaptureService : Service() {
         //   build chan doan nay) de xac nhan: neu CAPTURE SILENCE bien mat
         //   hoan toan khi seek, da xac nhan chac chan.
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
+
+        // ✅ MOI (cong cu chan doan - nghi van MOI): "recreate() cua
+        // OutputRouter" (tao lai AudioTrack tu dau) co the la nguyen nhan
+        // that su gay ra hien tuong NANG HON nhieu so voi "nho tieng" ban
+        // dau - CA PHIEN MediaProjection bi chinh Android thu hoi
+        // (onStop() chay, phai xin quyen lai, Mixer Test tu tat) - xay ra
+        // dung luc YouTube seek/doi bai (luc no tu xin lai AudioFocus,
+        // kich hoat FocusObserver -> sau 400ms goi recreate()). Nghi ngo:
+        // pha huy + tao AudioTrack MOI trong luc AudioRecord (dua tren
+        // MediaProjection) dang chay SONG SONG co the lam roi tang HAL am
+        // thanh dung chung tren driver tuy bien cua Honor, khien he thong
+        // coi phien MediaProjection la "hong" va tu thu hoi - day CHUA
+        // duoc xac nhan, can kiem chung.
+        //
+        // Cach doc ket qua: dat = false, build lai, lap lai dung kich ban
+        // (Mixer Test dang chay, vao YouTube seek/doi bai).
+        // - Neu hien tuong "xin quyen lai/Mixer Test tu tat" BIEN MAT (co
+        //   the quay lai hien tuong "nho tieng" cu, CHAP NHAN DUOC cho ban
+        //   chan doan nay) -> xac nhan recreate() la thu pham, can tim
+        //   cach fix nhe nhang hon (khong pha huy toan bo AudioTrack).
+        // - Neu VAN CON xay ra du da tat -> recreate() khong lien quan,
+        //   nguyen nhan nam o noi khac (co the la ban than viec AudioRecord
+        //   + AudioTrack chay song song tren Honor, khong lien quan gi
+        //   toi self-heal).
+        private const val ENABLE_SELF_HEAL_RECREATE = true
 
         @Volatile
         private var capturingActive = false
