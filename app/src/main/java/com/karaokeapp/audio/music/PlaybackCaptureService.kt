@@ -161,6 +161,8 @@ class PlaybackCaptureService : Service() {
     // nay, buoc tiep theo se di tim 1 tin hieu trigger dang tin cay hon
     // (hoac chap nhan dung dinh ky lien tuc luon, giam am luong/tan suat
     // xuong muc khong gay kho chiu).
+    private var selfHealJob: Job? = null
+
     private var periodicNudgeJob: Job? = null
 
 
