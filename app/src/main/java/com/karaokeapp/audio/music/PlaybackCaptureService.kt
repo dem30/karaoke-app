@@ -140,7 +140,29 @@ class PlaybackCaptureService : Service() {
     // nhieu su kien LOSS don don gan nhau (vi du YouTube giai phong + xin
     // lai focus nhieu lan rat nhanh trong 1 lan chuyen video) - chi thuc su
     // tao lai AudioTrack SAU KHI da yen ~400ms khong co su kien moi nao.
-    private var selfHealJob: Job? = null
+    // ⚠️ MOI (chan doan vong 4 - PHAT HIEN QUAN TRONG qua log thuc te): xac
+    // nhan duoc it nhat 1 lan "im lang tieng nho xiu" KEO DAI (nguoi dung
+    // bam hang tram lan seek/doi bai khong tu hoi phuc) ma trong SUOT ca
+    // khoang thoi gian do KHONG CO MOT DONG AUDIOFOCUS_LOSS NAO xuat hien
+    // trong log ca. Nghia la co chế self-heal hien tai (chi kich hoat KHI
+    // nhan duoc AUDIOFOCUS_LOSS qua focusObserverListener) CHUA TUNG DUOC
+    // GOI TOI trong dung luc can no nhat - khong phai vi nudge khong hieu
+    // qua, ma vi nudge chua bao gio chay. Rat co the day la 1 dang "smart
+    // volume"/gain-adaptive rieng cua OEM (Honor), khong di qua API
+    // AudioFocus chuan cua Android nen FocusObserver khong thay duoc.
+    //
+    // Sua (TAM THOI, giai doan chan doan): THAY vi tiep tuc cho tin hieu
+    // trigger dang khong dang tin cay, chuyen sang bat 1 vong lap RIENG bat
+    // nudge DINH KY (khong phu thuoc AudioFocus/amplitude gi ca) trong SUOT
+    // luc Mixer Test dang chay - de xac dinh chac chan buoc con lai: ban
+    // than hanh dong nudge (phat 1 am moi qua AudioTrack usage=NOTIFICATION)
+    // CO thuc su "go" duoc trang thai duck hay khong, tach rieng khoi cau
+    // hoi "khi nao nen kich hoat no". Neu xac nhan hieu qua qua ban dinh ky
+    // nay, buoc tiep theo se di tim 1 tin hieu trigger dang tin cay hon
+    // (hoac chap nhan dung dinh ky lien tuc luon, giam am luong/tan suat
+    // xuong muc khong gay kho chiu).
+    private var periodicNudgeJob: Job? = null
+
 
     private val focusObserverListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         val label = when (focusChange) {
@@ -302,6 +324,15 @@ class PlaybackCaptureService : Service() {
         // nhac tu dong to lai, KHONG can pha huy AudioTrack gi ca). Gia tri
         // true chi con dung de doi chieu/debug neu can so sanh lai sau nay.
         private const val ENABLE_SELF_HEAL_RECREATE = false
+
+        // ✅ MOI (xem giai thich chi tiet o khai bao periodicNudgeJob phia
+        // tren): tan suat bat nudge dinh ky trong giai doan chan doan nay -
+        // 1.5s/lan la muc du "day" de nhanh chong bat duoc hieu ung trong 1
+        // phien test ngan (vai chuc giay), nhung khong qua day toi muc lam
+        // beep chong lan len nhau lien tuc (durationMs=200 + margin release
+        // 150ms trong OutputRouter, tuc ~350ms/lan - con nhieu khoang trong
+        // giua 2 lan voi chu ky 1500ms).
+        private const val PERIODIC_NUDGE_INTERVAL_MS = 1500L
 
         @Volatile
         private var capturingActive = false
@@ -484,6 +515,19 @@ class PlaybackCaptureService : Service() {
             }
         }
 
+        // ✅ MOI (chan doan vong 4 - xem giai thich chi tiet o khai bao
+        // periodicNudgeJob): bat vong lap nudge DINH KY, HOAN TOAN DOC LAP
+        // voi focusObserverListener/selfHealJob o tren - CA HAI co che cung
+        // ton tai song song trong giai doan chan doan nay (khong xung dot,
+        // chi la nudgeAudioMixerToClearDuck() co the duoc goi tu 2 nguon).
+        periodicNudgeJob = serviceScope.launch {
+            while (isActive) {
+                delay(PERIODIC_NUDGE_INTERVAL_MS)
+                logBoth("🩹 [PeriodicNudge] [CHAN DOAN] Bat nudge dinh ky (khong doi tin hieu trigger).")
+                mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+            }
+        }
+
         logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
     }
 
@@ -496,6 +540,8 @@ class PlaybackCaptureService : Service() {
         volumeGuardJob = null
         selfHealJob?.cancel()
         selfHealJob = null
+        periodicNudgeJob?.cancel()
+        periodicNudgeJob = null
 
         // ✅ MOI: go dang ky listener quan sat/tu phuc hoi audio focus (xem
         // giai thich o dau file) - khong con can quan sat khi Mixer Test da
