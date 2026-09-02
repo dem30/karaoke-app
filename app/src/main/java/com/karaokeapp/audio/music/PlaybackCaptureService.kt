@@ -22,6 +22,7 @@ import com.karaokeapp.audio.processor.Limiter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -255,7 +256,28 @@ class PlaybackCaptureService : Service() {
     // stopMixerTestInternal). serviceScope dung Dispatchers.Default vi day
     // chi la vong kiem tra volume don gian, khong can UI thread. Cung dung
     // chung scope nay cho selfHealJob o tren.
-    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    // ⚠️ SUA LOI NGHIEM TRONG (chan doan vong 5 - PHAT HIEN qua test thuc
+    // te: "beep keu 1 lan, nhac to lai dung 1s, roi im hoan toan - KHONG
+    // CON BEEP NAO NUA"): serviceScope truoc day dung CoroutineScope(
+    // Dispatchers.Default) - MOT Job THUONG (KHONG PHAI SupervisorJob),
+    // dung CHUNG cho CA 3 coroutine con: volumeGuardJob (guard ~300ms/lan,
+    // goi AudioManager lien tuc - ti le dinh exception cao nhat vi tan suat
+    // day dac), selfHealJob, VA periodicNudgeJob moi them. Day CHINH LA
+    // nguyen nhan goc cua hien tuong quan sat duoc: bat ky exception nao
+    // KHONG duoc bat trong 1 trong 3 coroutine do (rat co the la
+    // reassertStreamSystemVolumeIfMixerRunning() ben trong volumeGuardJob)
+    // se HUY CA Job CHA cua serviceScope, keo theo CA 3 coroutine con bi
+    // huy theo NGAY LAP TUC va HOAN TOAN IM LANG (khong log loi nao, vi
+    // exception xay ra TRUOC ca khi kip vao logBoth() cua nhanh catch nao
+    // - trong truong hop nay khong he co catch o cap nay). Dung hien tuong
+    // "nudge chay dung 1 lan roi chet han vinh vien, khong con beep nao
+    // nua" - CHINH LA dau hieu kinh dien cua 1 Job thuong (khong phai
+    // Supervisor) bi huy do 1 nhanh con loi.
+    //
+    // Sua: doi sang SupervisorJob() - loi o 1 nhanh con (vi du guard) se
+    // KHONG con lam chet cac nhanh con khac (selfHeal, periodicNudge) nua,
+    // moi nhanh doc lap voi nhau.
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var volumeGuardJob: Job? = null
 
     // ✅ MOI (giam log du thua): dem so lan vong lap guard da chay - dung de
@@ -512,7 +534,19 @@ class PlaybackCaptureService : Service() {
         guardTickCount = 0
         volumeGuardJob = serviceScope.launch {
             while (isActive) {
-                reassertStreamSystemVolumeIfMixerRunning()
+                // ✅ MOI (lop phong thu bo sung - xem giai thich chi tiet o
+                // khai bao serviceScope): DU da co SupervisorJob bao ve cac
+                // nhanh KHAC khoi bi huy theo, ban than vong lap NAY neu gap
+                // loi thoang qua (vi du AudioManager tam thoi khong phan hoi
+                // khi app dang chuyen nen) van se tu ket thuc neu khong bat
+                // exception ngay tai day. Bat rieng de chinh volumeGuardJob
+                // cung "song sot" qua 1 lan loi le, thay vi phai cho toi
+                // lan Mixer Test tiep theo moi khoi dong lai duoc.
+                try {
+                    reassertStreamSystemVolumeIfMixerRunning()
+                } catch (e: Exception) {
+                    logBoth("⚠️ [GuardTick] Loi thoang qua trong reassertStreamSystemVolumeIfMixerRunning() (bo qua, thu lai lan sau): ${e.message}")
+                }
                 delay(300L)
             }
         }
@@ -525,8 +559,12 @@ class PlaybackCaptureService : Service() {
         periodicNudgeJob = serviceScope.launch {
             while (isActive) {
                 delay(PERIODIC_NUDGE_INTERVAL_MS)
-                logBoth("🩹 [PeriodicNudge] [CHAN DOAN] Bat nudge dinh ky (khong doi tin hieu trigger).")
-                mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                try {
+                    logBoth("🩹 [PeriodicNudge] [CHAN DOAN] Bat nudge dinh ky (khong doi tin hieu trigger).")
+                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                } catch (e: Exception) {
+                    logBoth("⚠️ [PeriodicNudge] Loi thoang qua (bo qua, thu lai lan sau): ${e.message}")
+                }
             }
         }
 
