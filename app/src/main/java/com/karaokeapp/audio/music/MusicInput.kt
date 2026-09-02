@@ -11,10 +11,12 @@ import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -76,6 +78,25 @@ class MusicInput(
         }
     }.asCoroutineDispatcher()
     private val scope = CoroutineScope(captureDispatcher + SupervisorJob())
+
+    // ✅ MOI (fix rieng, KHAC voi ly do bam SupervisorJob o tren): "Dang
+    // khoi dong... bi ket vinh vien, khong con amplitude nao ca" KHONG phai
+    // do exception bi huy lay - ma do captureDispatcher CHI CO DUNG 1
+    // THREAD, va thread do bi vong lap chinh (while (!shouldStop) {
+    // record.read(...) }) CHIEM DUNG VINH VIEN (record.read() la ham BLOCK
+    // truc tiep, khong phai suspend function, nen KHONG BAO GIO nhuong lai
+    // thread cho coroutine khac). Moi "scope.launch {...}" khac (du co
+    // SupervisorJob hay khong) deu bi XEP HANG CHO MAI MAI tren dung 1
+    // thread do, khong bao gio toi luot chay - giai thich dung y het hien
+    // tuong: am thanh (mixer/capture) van chay binh thuong, nhung callback
+    // thong bao dong bang vinh vien.
+    //
+    // Sua: dung 1 SCOPE RIENG BIET HOAN TOAN, chay tren Dispatchers.Default
+    // (thread pool NHIEU thread, dung chung binh thuong) CHI danh cho
+    // callback nay - no chi cap nhat UI thong bao, khong can va KHONG NEN
+    // dung chung captureDispatcher (chi danh rieng cho duong doc PCM real-
+    // time uu tien URGENT_AUDIO).
+    private val notifyScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     @Volatile
     private var shouldStop = false
@@ -206,7 +227,14 @@ class MusicInput(
                     // forget) de vong lap chinh khong phai cho no xong.
                     val amplitudeSnapshot = avg
                     if (onAmplitudeTick != null) {
-                        scope.launch {
+                        // ✅ SUA (fix goc "thong bao dong bang vinh vien" - xem
+                        // giai thich chi tiet o khai bao notifyScope phia tren):
+                        // dung notifyScope (Dispatchers.Default, nhieu thread)
+                        // thay vi scope (captureDispatcher, 1 thread DUY NHAT da
+                        // bi vong lap while ben ngoai chiem dung vinh vien) -
+                        // neu con dung "scope" o day, coroutine nay se KHONG
+                        // BAO GIO duoc thuc thi.
+                        notifyScope.launch {
                             // ✅ MOI (chan doan cuoi cung): log NGAY TRUOC va SAU
                             // invoke() de xac nhan 100% dong nay thuc su chay toi,
                             // khong chi suy luan qua viec thieu log loi.
@@ -256,6 +284,10 @@ class MusicInput(
         // vong lap ngay), nen thread hau nhu chac chan da ranh truoc khi
         // dong.
         captureDispatcher.close()
+        // ✅ MOI: huy cac coroutine con dang cho/dang chay tren notifyScope
+        // (KHONG dong Dispatchers.Default - do la dispatcher dung CHUNG toan
+        // he thong, dong no se anh huong ca cac phan khac cua app).
+        notifyScope.cancel()
         logBoth("🛑 Da dung capture")
     }
 }
