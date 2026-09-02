@@ -45,7 +45,7 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * tri nay ra de biet truoc, xem log "[OutputRouter] Native sample rate cua
  * thiet bi".
  *
- * ❌ DA GO Audio Focus (fix lan nay): ban truoc co them requestAudioFocus()
+ * ❌ DA GO Audio Focus (fix truoc do): ban truoc co them requestAudioFocus()
  * voi AUDIOFOCUS_GAIN + tu dong xin lai ngay khi mat focus. Day la sai lam -
  * AUDIOFOCUS_GAIN la loai focus doc quyen, khien he thong coi day la nguon
  * phat "chinh" va gui AUDIOFOCUS_LOSS cho app dang phat nhac nguon (vi du
@@ -56,6 +56,16 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * Audio Focus doc quyen - da bo hoan toan phan nay. Van de "tut volume qua
  * Bluetooth AVRCP" duoc xu ly rieng boi volumeGuardJob (khong thay doi),
  * khong lien quan gi den Audio Focus.
+ *
+ * ✅ CAP NHAT MOI (fix "nhac/vocal nho xiu sau khi YouTube seek/doi bai/bo
+ * quang cao, khong tu phuc hoi"): them ham recreate() - dung khi
+ * PlaybackCaptureService phat hien su kien mat audio focus (qua
+ * FocusObserver) va muon "reset sach" AudioTrack. Ly do can ham nay: da xac
+ * nhan qua test thuc te rang chi co hanh dong TAO LAI AudioTrack tu dau
+ * (nhu khi bat/tat Mixer Test thu cong) moi xoa duoc trang thai "duck" con
+ * sot lai o tang HAL/OEM - viec ep lai so volume/mute-flag qua AudioManager
+ * (volumeGuardJob) KHONG dong toi duoc lop nay vi duck la 1 gain noi bo,
+ * khong lam thay doi index hay mute-flag ma AudioManager bao cao.
  */
 class OutputRouter(
     private val context: Context,
@@ -75,10 +85,6 @@ class OutputRouter(
     // Buffer stereo tam dung lai de tranh cap phat moi lan write() - kich
     // thuoc se tu dong lon len neu can (xem write()).
     private var stereoScratchBuffer = ShortArray(0)
-
-    // Dem so sample da qua ke tu lan log bien do cuoi - dung de log ~1 lan/s
-    // thay vi moi lan write() (tranh spam log).
-    private var outputAmplitudeLogCounter = 0
 
     @Volatile
     var totalFramesWritten: Long = 0
@@ -185,19 +191,6 @@ class OutputRouter(
             stereoScratchBuffer[i * 2 + 1] = buffer[i]
         }
 
-        // Log bien do cua ban MIX CUOI CUNG thuc su ghi ra loa (khac voi log
-        // bien do input music/vocal rieng le o noi khac) - ~1 lan/giay de
-        // khong spam log. Day la diem gan nhat app co the do truoc khi mat
-        // dau vet vao AudioFlinger/HAL (noi co the bi OEM ap duck-gain).
-        outputAmplitudeLogCounter += size
-        if (outputAmplitudeLogCounter >= SAMPLE_RATE) {
-            outputAmplitudeLogCounter = 0
-            var sum = 0L
-            for (i in 0 until size) sum += kotlin.math.abs(buffer[i].toInt())
-            val avg = if (size > 0) sum / size else 0
-            logBoth("[OutputAmplitude] mixedAvg=$avg frame=$totalFramesWritten")
-        }
-
         val written = track.write(stereoScratchBuffer, 0, requiredStereoSize)
         if (written < 0) {
             logBoth("❌ AudioTrack.write() loi, code=$written", isError = true)
@@ -233,5 +226,29 @@ class OutputRouter(
         audioTrack = null
         totalFramesWritten = 0
         logBoth("🛑 Da dung output")
+    }
+
+    /**
+     * ✅ MOI (fix "nhac/vocal nho xiu, khong tu phuc hoi sau khi YouTube
+     * seek/doi bai/bo quang cao"): tao lai AudioTrack tu dau (stop() roi
+     * start() lai), giu nguyen "usage" da cau hinh tu constructor.
+     *
+     * Goi ham nay khi co dau hieu OS/OEM da ap 1 trang thai "duck" (giam
+     * gain noi bo, KHONG doi index/mute-flag) len AudioTrack hien tai - da
+     * xac nhan qua test thuc te rang CHI co hanh dong tao AudioTrack MOI
+     * (nhu khi nguoi dung tat/bat Mixer Test bang tay) moi xoa sach duoc
+     * trang thai nay, con ep lai volume/mute qua AudioManager (xem
+     * PlaybackCaptureService.reassertStreamSystemVolumeIfMixerRunning())
+     * KHONG dong toi duoc.
+     *
+     * ⚠️ Se co 1 khoang ngat tieng rat ngan (thuong vai chuc ms, do
+     * release() + tao AudioTrack moi + play() lai) - chap nhan duoc vi muc
+     * tieu la tranh doan im/nho keo dai nhieu giay nhu hien tai, khong phai
+     * loai bo hoan toan moi gian doan.
+     */
+    fun recreate() {
+        logBoth("🔄 [Recreate] Dang tao lai AudioTrack de xoa trang thai duck con sot (usage=$usage)...")
+        stop()
+        start()
     }
 }
