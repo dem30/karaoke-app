@@ -277,13 +277,41 @@ class OutputRouter(
      */
     fun nudgeAudioMixerToClearDuck() {
         try {
-            val durationMs = 60
+            // ✅ CAP NHAT (chan doan vong 2 - nudge ban dau khong hieu qua):
+            // buffer truoc day dung 1 GIA TRI HANG SO khong doi (vd toan bo
+            // la "1") - day thuc chat la tin hieu GAN GIONG DC (khong doi
+            // theo thoi gian). Phan cung am thanh THUONG LOC BO tin hieu DC
+            // (tu nhien khong the phat duoc qua loa/tai nghe thuc su, bi
+            // capacitor/high-pass loc mat), nen he thong co the coi day la
+            // "khong co gi de phat" va BO QUA hoan toan, khong kich hoat
+            // duoc hieu ung re-mix nhu 1 tieng "ting" thong bao THAT (co tan
+            // so, thay doi lien tuc theo thoi gian).
+            //
+            // Sua (TAM THOI o muc NGHE DUOC ro rang de kiem chung - se giam
+            // lai sau khi xac nhan huong dung): tao 1 SONG SINE THAT (co tan
+            // so AMPLITUDE_FOR_DIAGNOSTIC Hz), co fade-in/fade-out ngan de
+            // tranh tieng "click" do doi bien do dot ngot o dau/cuoi buffer.
+            val durationMs = 200
             val sampleCount = SAMPLE_RATE * durationMs / 1000
-            // Bien do = 1 (KHONG phai 0) - mot so audio HAL/driver co the
-            // toi uu "bo qua" hoan toan buffer toan-0 (coi nhu khong co gi
-            // de phat), lam mat tac dung "kich hoat re-mix" ma ta can. Bien
-            // do 1 tren thang 32767 van hoan toan khong the nghe thay duoc.
-            val nearSilentBuffer = ShortArray(sampleCount) { 1 }
+            val toneFrequencyHz = 900.0
+            // ⚠️ CHAN DOAN: dat o muc NGHE RO (khong con "gan-im-lang" nhu
+            // truoc) - chap nhan nghe 1 tieng "beep" ngan khi test lan nay.
+            // Neu xac nhan huong nay dung, se giam dan bien do o lan sua
+            // tiep theo de tim muc nho nhat van con hieu qua.
+            val amplitude = 3000
+            val fadeSamples = (sampleCount * 0.1).toInt().coerceAtLeast(1)
+            val toneBuffer = ShortArray(sampleCount) { i ->
+                val angle = 2.0 * Math.PI * toneFrequencyHz * i / SAMPLE_RATE
+                var sample = amplitude * kotlin.math.sin(angle)
+                // Fade-in/fade-out tuyen tinh o 10% dau/cuoi - tranh click.
+                val fadeGain = when {
+                    i < fadeSamples -> i.toDouble() / fadeSamples
+                    i >= sampleCount - fadeSamples -> (sampleCount - i).toDouble() / fadeSamples
+                    else -> 1.0
+                }
+                sample *= fadeGain
+                sample.toInt().toShort()
+            }
 
             val nudgeTrack = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -300,7 +328,7 @@ class OutputRouter(
                         .build()
                 )
                 .setTransferMode(AudioTrack.MODE_STATIC)
-                .setBufferSizeInBytes(nearSilentBuffer.size * 2)
+                .setBufferSizeInBytes(toneBuffer.size * 2)
                 .build()
 
             if (nudgeTrack.state != AudioTrack.STATE_INITIALIZED) {
@@ -309,11 +337,12 @@ class OutputRouter(
                 return
             }
 
-            nudgeTrack.write(nearSilentBuffer, 0, nearSilentBuffer.size)
+            nudgeTrack.write(toneBuffer, 0, toneBuffer.size)
             nudgeTrack.play()
             logBoth(
-                "🔔 [NudgeMixer] Da phat 1 am gan-im-lang (${durationMs}ms, usage=NOTIFICATION) " +
-                    "de ep AudioFlinger tinh lai mix - thay the cho recreate() (da xac nhan gay hai)."
+                "🔔 [NudgeMixer] [CHAN DOAN] Da phat 1 tieng beep NGHE RO (${durationMs}ms, " +
+                    "${toneFrequencyHz}Hz, amplitude=$amplitude, usage=NOTIFICATION) de kiem chung " +
+                    "gia thuyet 'can tin hieu that, khong phai DC' - se giam am luong lai sau khi xac nhan."
             )
 
             // Giai phong nudgeTrack sau khi phat xong (+ margin an toan) -
