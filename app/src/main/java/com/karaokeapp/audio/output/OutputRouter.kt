@@ -331,13 +331,33 @@ class OutputRouter(
                 .setBufferSizeInBytes(toneBuffer.size * 2)
                 .build()
 
+            // ⚠️ SUA LOI GOC (chan doan vong 3 - phat hien qua log thuc te
+            // "state=2" moi lan goi, DU code sine wave o tren hoan toan dung):
+            // truoc day check nudgeTrack.state NGAY SAU build(), TRUOC ca
+            // khi write() du lieu. Voi MODE_STATIC, AudioTrack CHI chuyen
+            // sang STATE_INITIALIZED SAU KHI da write() du du lieu tinh vao
+            // track - truoc do (ke ca khi build() hoan toan thanh cong,
+            // khong loi gi), getState() LUON tra ve STATE_NO_STATIC_DATA
+            // (=2). Nghia la nhanh loi nay LUON bi kich hoat vo dieu kien,
+            // ham return SOM truoc ca khi write()/play() duoc goi - toan bo
+            // cac lan nudge truoc day (kem ca ban sine wave o tren) CHUA HE
+            // THUC SU PHAT RA AM THANH LAN NAO, khong lien quan gi den noi
+            // dung tin hieu (DC hay sine) nhu nghi van truoc do.
+            //
+            // Sua: goi write() TRUOC, roi moi kiem tra state (luc nay da
+            // dung nghia la "thanh cong" hay "that bai that su").
+            val written = nudgeTrack.write(toneBuffer, 0, toneBuffer.size)
+            if (written < 0) {
+                logBoth("❌ [NudgeMixer] nudgeTrack.write() loi, ma loi=$written", isError = true)
+                nudgeTrack.release()
+                return
+            }
             if (nudgeTrack.state != AudioTrack.STATE_INITIALIZED) {
-                logBoth("❌ [NudgeMixer] nudgeTrack khoi tao that bai, state=${nudgeTrack.state}", isError = true)
+                logBoth("❌ [NudgeMixer] nudgeTrack khoi tao that bai SAU write(), state=${nudgeTrack.state}", isError = true)
                 nudgeTrack.release()
                 return
             }
 
-            nudgeTrack.write(toneBuffer, 0, toneBuffer.size)
             nudgeTrack.play()
             logBoth(
                 "🔔 [NudgeMixer] [CHAN DOAN] Da phat 1 tieng beep NGHE RO (${durationMs}ms, " +
