@@ -192,25 +192,25 @@ class PlaybackCaptureService : Service() {
                 requestFocusObserver(audioManager)
             }
 
-            // ✅ SUA (thay recreate() - da XAC NHAN qua test thuc te that:
-            // recreate() gay ra bug NANG HON nhieu, ca phien MediaProjection
-            // bi Android thu hoi. Bang chung MOI: nguoi dung xac nhan CHI
-            // CAN 1 thong bao BAT KY (vi du Facebook) toi la nhac tu dong to
-            // lai, KHONG can lam gi - chung minh chi CAN 1 luong am thanh
-            // moi xuat hien la du de AudioFlinger tu tinh lai mix, KHONG can
-            // pha huy/tao lai AudioTrack chinh): debounce ~400ms roi goi
-            // OutputRouter.nudgeAudioMixerToClearDuck() - tu tao ra dung
-            // hieu ung 1 "thong bao gia" (am gan-im-lang, usage=NOTIFICATION)
-            // thay vi pha huy AudioTrack. Xem giai thich chi tiet trong
-            // OutputRouter.kt.
+            // ✅ SUA (chan doan vong 4 - thay ca recreate() LAN ban
+            // nudgeAudioMixerToClearDuck() cu): recreate() da xac nhan gay
+            // hai (thu hoi MediaProjection). Ban nudge cu (tao AudioTrack
+            // rieng usage=NOTIFICATION trong OutputRouter) cung da xac nhan
+            // gay hai theo cach khac - lam OEM Honor tu dung audioTrack
+            // chinh sau ~1s vi co track "la" xuat hien/bien mat lien tuc
+            // canh track chinh. Gio goi LowLatencyMixer.requestNudgeTone()
+            // thay the: CHI set 1 co hieu (AtomicBoolean), chinh mixer loop
+            // se tu chen tone vao PCM dang mix va ghi qua DUNG 1 audioTrack/
+            // session dang chay - khong tao track nao moi. Xem giai thich
+            // chi tiet trong LowLatencyMixer.requestNudgeTone().
             selfHealJob?.cancel()
             selfHealJob = serviceScope.launch {
                 delay(400L)
                 logBoth(
-                    "🩹 [SelfHeal] Kich hoat nudge (mo phong thong bao) sau su kien " +
+                    "🩹 [SelfHeal] Kich hoat nudge (chen tone vao mixer loop) sau su kien " +
                         "mat focus ($label), de xoa moi trang thai duck con sot."
                 )
-                mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                mixer?.requestNudgeTone()
             }
 
             // ✅ GIU LAI (TAT mac dinh - CHI de tham khao/so sanh neu can):
@@ -342,11 +342,11 @@ class PlaybackCaptureService : Service() {
         // driver Honor.
         //
         // Doi mac dinh sang FALSE (KHONG con la duong xu ly chinh nua) - da
-        // thay bang OutputRouter.nudgeAudioMixerToClearDuck() (phat 1 am
-        // gan-im-lang mo phong "co thong bao toi" - da xac nhan qua test
-        // thuc te that: CHI CAN 1 thong bao bat ky (vi du Facebook) toi la
-        // nhac tu dong to lai, KHONG can pha huy AudioTrack gi ca). Gia tri
-        // true chi con dung de doi chieu/debug neu can so sanh lai sau nay.
+        // thay bang LowLatencyMixer.requestNudgeTone() (chen 1 tone ngan
+        // truc tiep vao mixer loop, cung audioTrack/session dang chay - xem
+        // OutputRouter ban cu tao AudioTrack rieng da xac nhan gay OEM tu
+        // dung audioTrack chinh, nen doi sang cach nay). Gia tri true chi
+        // con dung de doi chieu/debug neu can so sanh lai sau nay.
         private const val ENABLE_SELF_HEAL_RECREATE = false
 
         // ✅ MOI (xem giai thich chi tiet o khai bao periodicNudgeJob phia
@@ -555,13 +555,14 @@ class PlaybackCaptureService : Service() {
         // periodicNudgeJob): bat vong lap nudge DINH KY, HOAN TOAN DOC LAP
         // voi focusObserverListener/selfHealJob o tren - CA HAI co che cung
         // ton tai song song trong giai doan chan doan nay (khong xung dot,
-        // chi la nudgeAudioMixerToClearDuck() co the duoc goi tu 2 nguon).
+        // chi la requestNudgeTone() co the duoc goi tu 2 nguon - ban than
+        // no idempotent, goi nhieu lan chi la set lai cung 1 co hieu).
         periodicNudgeJob = serviceScope.launch {
             while (isActive) {
                 delay(PERIODIC_NUDGE_INTERVAL_MS)
                 try {
                     logBoth("🩹 [PeriodicNudge] [CHAN DOAN] Bat nudge dinh ky (khong doi tin hieu trigger).")
-                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                    mixer?.requestNudgeTone()
                 } catch (e: Exception) {
                     logBoth("⚠️ [PeriodicNudge] Loi thoang qua (bo qua, thu lai lan sau): ${e.message}")
                 }
