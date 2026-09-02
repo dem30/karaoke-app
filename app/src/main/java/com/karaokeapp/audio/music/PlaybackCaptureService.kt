@@ -3,6 +3,7 @@ package com.karaokeapp.audio.music
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -96,11 +97,35 @@ import java.util.Locale
  * goi mixerOutputRouter?.recreate() - mo phong dung thao tac tay da xac
  * nhan hieu qua, khong can nguoi dung phai tu tat/bat Mixer Test nua.
  *
+ * ⚠️ CAP NHAT QUAN TRONG NHAT (fix "nudge tu kich hoat lai gay MAT TIENG
+ * HOAN TOAN thay vi chua no" - xem giai thich chi tiet trong OutputRouter.kt
+ * ngay tai dau khai bao nudgeAudioMixerToClearDuck()): ban chan doan truoc
+ * dung periodicNudgeJob ban nudge VO DIEU KIEN moi PERIODIC_NUDGE_INTERVAL_MS
+ * (1.5s), va da xac nhan qua quan sat thuc te day CHINH LA nguyen nhan gay
+ * mat tieng HOAN TOAN (khong phai chi "chua chua duoc") - vi ban than tieng
+ * beep NOTIFICATION lai tu kich hoat duck cua he thong len STREAM_SYSTEM,
+ * lap lai nhanh hon thoi gian duck cu kip nha se lam gain bi keo xuong lien
+ * tuc. Da chuyen co che bao ve sang dat TAI OutputRouter.nudgeAudioMixerToClearDuck()
+ * (1 diem duy nhat, ap dung cho MOI nguon goi: periodicNudgeJob, selfHealJob,
+ * VA nut "Kich hoat lai" thu cong moi them ben duoi) thay vi rai rac o tung
+ * noi goi - xem MIN_NUDGE_INTERVAL_MS trong OutputRouter.kt.
+ *
+ * ✅ MOI (them phuong an thu cong, an toan hon vong lap tu dong): them action
+ * button "🔊 Kich hoat lai" ngay tren notification dang chay cua Mixer Test -
+ * nguoi dung tu bam khi NGHE THAY nhac nho, thay vi phu thuoc hoan toan vao
+ * tin hieu tu dong (AudioFocus LOSS co the khong bao gio toi, nhu da ghi
+ * nhan o [Chan doan vong 5] duoi day). Khong can quyen SYSTEM_ALERT_WINDOW/
+ * overlay - chi la 1 PendingIntent gui action toi chinh Service nay, dung
+ * chung code path voi ACTION_START_MIXER_TEST/ACTION_STOP_MIXER_TEST da co.
+ *
  * Dieu khien qua 2 Intent action rieng (KHONG dung chung voi flow
  * resultCode/resultData chinh de tranh xung dot):
  * - ACTION_START_MIXER_TEST: bat dau tron Music (dang chay san) + Mic moi.
  * - ACTION_STOP_MIXER_TEST: dung mixer test, MusicInput van tiep tuc chay
  *   binh thuong (khong anh huong Phase 1).
+ * - ACTION_MANUAL_NUDGE: nguoi dung bam nut "Kich hoat lai" tren notification -
+ *   goi 1 lan nudge (van bi cooldown boi OutputRouter neu goi qua gan lan
+ *   truoc, xem giai thich o tren).
  */
 class PlaybackCaptureService : Service() {
 
@@ -162,6 +187,17 @@ class PlaybackCaptureService : Service() {
     // nay, buoc tiep theo se di tim 1 tin hieu trigger dang tin cay hon
     // (hoac chap nhan dung dinh ky lien tuc luon, giam am luong/tan suat
     // xuong muc khong gay kho chiu).
+    //
+    // ⚠️ CAP NHAT (xem giai thich chi tiet o dau file): DA XAC NHAN ban nudge
+    // dinh ky nay (goi vo dieu kien moi PERIODIC_NUDGE_INTERVAL_MS) chinh la
+    // nguyen nhan gay MAT TIENG HOAN TOAN. Vong lap nay VAN duoc GIU LAI
+    // (van chay dinh ky nhu cu) vi ban than no khong con nguy hiem nua - moi
+    // lan goi deu di qua nudgeAudioMixerToClearDuck() da co cooldown rieng
+    // (xem OutputRouter.kt) nen se TU DONG bi bo qua neu goi qua gan lan
+    // truoc. Giu lai vong lap nay CHI de lam "luoi an toan" du phong (phong
+    // truong hop AudioFocus LOSS khong bao gio toi nhu da ghi nhan o tren),
+    // khong con dua vao no la co che chinh nua - co che chinh gio la nut
+    // "Kich hoat lai" thu cong tren notification (xem ACTION_MANUAL_NUDGE).
     private var selfHealJob: Job? = null
 
     private var periodicNudgeJob: Job? = null
@@ -192,25 +228,25 @@ class PlaybackCaptureService : Service() {
                 requestFocusObserver(audioManager)
             }
 
-            // ✅ SUA (chan doan vong 4 - thay ca recreate() LAN ban
-            // nudgeAudioMixerToClearDuck() cu): recreate() da xac nhan gay
-            // hai (thu hoi MediaProjection). Ban nudge cu (tao AudioTrack
-            // rieng usage=NOTIFICATION trong OutputRouter) cung da xac nhan
-            // gay hai theo cach khac - lam OEM Honor tu dung audioTrack
-            // chinh sau ~1s vi co track "la" xuat hien/bien mat lien tuc
-            // canh track chinh. Gio goi LowLatencyMixer.requestNudgeTone()
-            // thay the: CHI set 1 co hieu (AtomicBoolean), chinh mixer loop
-            // se tu chen tone vao PCM dang mix va ghi qua DUNG 1 audioTrack/
-            // session dang chay - khong tao track nao moi. Xem giai thich
-            // chi tiet trong LowLatencyMixer.requestNudgeTone().
+            // ✅ SUA (thay recreate() - da XAC NHAN qua test thuc te that:
+            // recreate() gay ra bug NANG HON nhieu, ca phien MediaProjection
+            // bi Android thu hoi. Bang chung MOI: nguoi dung xac nhan CHI
+            // CAN 1 thong bao BAT KY (vi du Facebook) toi la nhac tu dong to
+            // lai, KHONG can lam gi - chung minh chi CAN 1 luong am thanh
+            // moi xuat hien la du de AudioFlinger tu tinh lai mix, KHONG can
+            // pha huy/tao lai AudioTrack chinh): debounce ~400ms roi goi
+            // OutputRouter.nudgeAudioMixerToClearDuck() - tu tao ra dung
+            // hieu ung 1 "thong bao gia" (am gan-im-lang, usage=NOTIFICATION)
+            // thay vi pha huy AudioTrack. Xem giai thich chi tiet trong
+            // OutputRouter.kt.
             selfHealJob?.cancel()
             selfHealJob = serviceScope.launch {
                 delay(400L)
                 logBoth(
-                    "🩹 [SelfHeal] Kich hoat nudge (chen tone vao mixer loop) sau su kien " +
+                    "🩹 [SelfHeal] Kich hoat nudge (mo phong thong bao) sau su kien " +
                         "mat focus ($label), de xoa moi trang thai duck con sot."
                 )
-                mixer?.requestNudgeTone()
+                mixerOutputRouter?.nudgeAudioMixerToClearDuck()
             }
 
             // ✅ GIU LAI (TAT mac dinh - CHI de tham khao/so sanh neu can):
@@ -304,10 +340,17 @@ class PlaybackCaptureService : Service() {
         const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
 
+        // ✅ MOI: action rieng cho nut "Kich hoat lai" thu cong tren
+        // notification - xem buildNotification()/onStartCommand() ben duoi.
+        // Dung PendingIntent.getService() giong het 2 action tren, khong can
+        // co che moi nao khac - chi khac o cho khong bat/tat mixer, ma goi
+        // thang 1 lan nudgeAudioMixerToClearDuck() (van bi cooldown boi
+        // OutputRouter neu goi qua gan lan truoc, xem giai thich o dau file).
+        const val ACTION_MANUAL_NUDGE = "com.karaokeapp.action.MANUAL_NUDGE"
+
         // ✅ MOI: guard loop chay 300ms/lan (giu nguyen, can nhanh de bat kip
         // AVRCP resync cua Bluetooth) nhung dong log trang thai day du chi in
-        // 1 lan trong so N lan chay - 10 lan * 300ms = ~3s/dong, van du day
-        // do phan giai de thay xu huong "nho dan qua thoi gian" nhung giam
+        // moi GUARD_STATUS_LOG_EVERY_N_TICKS lan (~3s/dong o 300ms/tick) - giam
         // ~10 lan so luong dong log so voi truoc.
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
 
@@ -342,11 +385,11 @@ class PlaybackCaptureService : Service() {
         // driver Honor.
         //
         // Doi mac dinh sang FALSE (KHONG con la duong xu ly chinh nua) - da
-        // thay bang LowLatencyMixer.requestNudgeTone() (chen 1 tone ngan
-        // truc tiep vao mixer loop, cung audioTrack/session dang chay - xem
-        // OutputRouter ban cu tao AudioTrack rieng da xac nhan gay OEM tu
-        // dung audioTrack chinh, nen doi sang cach nay). Gia tri true chi
-        // con dung de doi chieu/debug neu can so sanh lai sau nay.
+        // thay bang OutputRouter.nudgeAudioMixerToClearDuck() (phat 1 am
+        // gan-im-lang mo phong "co thong bao toi" - da xac nhan qua test
+        // thuc te that: CHI CAN 1 thong bao bat ky (vi du Facebook) toi la
+        // nhac tu dong to lai, KHONG can pha huy AudioTrack gi ca). Gia tri
+        // true chi con dung de doi chieu/debug neu can so sanh lai sau nay.
         private const val ENABLE_SELF_HEAL_RECREATE = false
 
         // ✅ MOI (xem giai thich chi tiet o khai bao periodicNudgeJob phia
@@ -356,6 +399,14 @@ class PlaybackCaptureService : Service() {
         // beep chong lan len nhau lien tuc (durationMs=200 + margin release
         // 150ms trong OutputRouter, tuc ~350ms/lan - con nhieu khoang trong
         // giua 2 lan voi chu ky 1500ms).
+        //
+        // ⚠️ LUU Y (xem giai thich chi tiet o dau file): gia tri 1.5s nay
+        // TUNG la nguyen nhan gay mat tieng hoan toan khi con la DUY NHAT
+        // dong duoi phat am nudge that su. Van GIU NGUYEN gia tri nay (KHONG
+        // can tang len) vi bao ve THAT SU gio nam o OutputRouter (cooldown
+        // 5000ms tai nguon) - vong lap 1.5s nay gio chi con y nghia "kiem
+        // tra thuong xuyen xem co can nudge khong", con nudge THAT SU co
+        // duoc phat hay khong da do OutputRouter quyet dinh.
         private const val PERIODIC_NUDGE_INTERVAL_MS = 1500L
 
         @Volatile
@@ -555,14 +606,19 @@ class PlaybackCaptureService : Service() {
         // periodicNudgeJob): bat vong lap nudge DINH KY, HOAN TOAN DOC LAP
         // voi focusObserverListener/selfHealJob o tren - CA HAI co che cung
         // ton tai song song trong giai doan chan doan nay (khong xung dot,
-        // chi la requestNudgeTone() co the duoc goi tu 2 nguon - ban than
-        // no idempotent, goi nhieu lan chi la set lai cung 1 co hieu).
+        // chi la nudgeAudioMixerToClearDuck() co the duoc goi tu 2 nguon).
+        //
+        // ⚠️ Xem giai thich o dau file: vong lap nay TUNG gay mat tieng hoan
+        // toan khi la duong DUY NHAT quyet dinh co phat nudge hay khong. Gio
+        // no chi con la "nguoi de xuat" - OutputRouter.nudgeAudioMixerToClearDuck()
+        // moi la noi QUYET DINH cuoi cung co thuc su phat am hay khong (dua
+        // vao cooldown 5s), nen giu nguyen chu ky 1.5s o day la an toan.
         periodicNudgeJob = serviceScope.launch {
             while (isActive) {
                 delay(PERIODIC_NUDGE_INTERVAL_MS)
                 try {
-                    logBoth("🩹 [PeriodicNudge] [CHAN DOAN] Bat nudge dinh ky (khong doi tin hieu trigger).")
-                    mixer?.requestNudgeTone()
+                    logBoth("🩹 [PeriodicNudge] [CHAN DOAN] De xuat nudge dinh ky (OutputRouter se tu quyet dinh co phat hay khong dua vao cooldown).")
+                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
                 } catch (e: Exception) {
                     logBoth("⚠️ [PeriodicNudge] Loi thoang qua (bo qua, thu lai lan sau): ${e.message}")
                 }
@@ -720,8 +776,8 @@ class PlaybackCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // ✅ MOI (Phase 3): xu ly 2 action rieng cho mixer test TRUOC, khong
-        // dung chung nhanh xu ly resultCode/resultData ben duoi.
+        // ✅ MOI (Phase 3): xu ly 3 action rieng cho mixer test/nudge thu cong
+        // TRUOC, khong dung chung nhanh xu ly resultCode/resultData ben duoi.
         when (intent?.action) {
             ACTION_START_MIXER_TEST -> {
                 startMixerTestInternal()
@@ -729,6 +785,20 @@ class PlaybackCaptureService : Service() {
             }
             ACTION_STOP_MIXER_TEST -> {
                 stopMixerTestInternal()
+                return START_NOT_STICKY
+            }
+            ACTION_MANUAL_NUDGE -> {
+                // ✅ MOI: nguoi dung bam nut "🔊 Kich hoat lai" tren notification.
+                // Chi co tac dung khi Mixer Test dang thuc su chay (mixerOutputRouter
+                // != null) - neu Mixer Test da tat, khong co gi de nudge ca, chi log
+                // lai va bo qua, khong can bao loi ra UI vi day la action tu
+                // notification (khong co Activity nao dang mo de hien Toast).
+                if (mixerOutputRouter != null) {
+                    logBoth("👆 [ManualNudge] Nguoi dung bam nut 'Kich hoat lai' tren notification.")
+                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                } else {
+                    logBoth("👆 [ManualNudge] Bam nut nhung Mixer Test dang tat - bo qua.")
+                }
                 return START_NOT_STICKY
             }
         }
@@ -869,13 +939,38 @@ class PlaybackCaptureService : Service() {
         }
     }
 
+    /**
+     * ✅ MOI: them 1 action button "🔊 Kich hoat lai" tren notification -
+     * gui ACTION_MANUAL_NUDGE ve chinh Service nay qua PendingIntent.getService(),
+     * dung chung co che voi ACTION_START_MIXER_TEST/ACTION_STOP_MIXER_TEST da
+     * co (khong can quyen SYSTEM_ALERT_WINDOW/overlay nao ca - notification
+     * action la co che chuan cua Android, luon co san trong khay thong bao
+     * ngay ca khi app dang o nen). Nut nay hien dien THUONG XUYEN tren
+     * notification (khong chi khi co loi), vi nguoi dung co the can bam bat
+     * ky luc nao ho nghe thay nhac nho ma khong muon cho nudge dinh ky tu
+     * dong (moi 1.5s, xem PERIODIC_NUDGE_INTERVAL_MS) toi luot.
+     *
+     * requestCode=0 dung chung cho moi lan build notification - vi noi dung
+     * Intent (chi co action, khong co extras thay doi) la giong het nhau moi
+     * lan, FLAG_UPDATE_CURRENT la du, khong can requestCode rieng biet.
+     */
     private fun buildNotification(contentText: String): Notification {
+        val nudgeIntent = Intent(this, PlaybackCaptureService::class.java).apply {
+            action = ACTION_MANUAL_NUDGE
+        }
+        val nudgePendingIntent = PendingIntent.getService(
+            this,
+            0,
+            nudgeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Karaoke App - Phase 1")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .addAction(0, "🔊 Kích hoạt lại", nudgePendingIntent)
             .build()
     }
 

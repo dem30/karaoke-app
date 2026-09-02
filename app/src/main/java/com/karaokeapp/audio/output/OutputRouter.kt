@@ -66,6 +66,32 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * sot lai o tang HAL/OEM - viec ep lai so volume/mute-flag qua AudioManager
  * (volumeGuardJob) KHONG dong toi duoc lop nay vi duck la 1 gain noi bo,
  * khong lam thay doi index hay mute-flag ma AudioManager bao cao.
+ *
+ * ⚠️ CAP NHAT QUAN TRONG NHAT (fix "beep tu kich hoat lai gay MAT TIENG HOAN
+ * TOAN thay vi chua no" - phat hien qua quan sat thuc te: nudge lap moi
+ * 1.2-1.5s, kich hoat lan dau thanh cong nhung ngay lan ke tiep lam mat het
+ * am thanh): nudgeAudioMixerToClearDuck() phat 1 AudioTrack usage=
+ * NOTIFICATION/CONTENT_TYPE_SONIFICATION that, NGHE RO - va chinh viec phat
+ * 1 am thanh loai NOTIFICATION/SONIFICATION nay co the TU KICH HOAT co che
+ * "duck" cua he thong len cac stream media khac dang chay song song (o day
+ * la STREAM_SYSTEM cua chinh mixer), HOAN TOAN DOC LAP voi AudioFocus - day
+ * la hanh vi noi bo cua AudioPolicyManager/HAL tren nhieu OEM (dac biet
+ * Honor), khong can app phai chu dong xin gi ca.
+ *
+ * Neu nudge lap lai NHANH HON thoi gian de lop duck do TU NHA (thuong vai
+ * tram ms den vai giay tuy OEM), moi lan nudge tiep theo se CHONG THEM 1 lop
+ * duck MOI len tren lop duck CU CHUA KIP NHA HET cua chinh no - ket qua la
+ * gain noi bo bi keo xuong LIEN TUC thay vi duoc phuc hoi, dan den mat tieng
+ * HOAN TOAN thay vi chi "nho xiu" nhu truoc khi co nudge. Noi cach khac:
+ * chinh co che dung de chua lai la nguon gay ra trieu chung nang hon.
+ *
+ * Sua: them 1 CO CHE DEBOUNCE/COOLDOWN ngay TAI DIEM VAO cua ham nay (khong
+ * phai o tung noi goi rieng le - vi ham nay hien dang duoc goi tu NHIEU
+ * nguon doc lap: periodicNudgeJob dinh ky, selfHealJob khi mat AudioFocus,
+ * VA sap toi la nut "Kich hoat lai" thu cong tren notification) - dam bao DU
+ * co bao nhieu nguon goi cung luc, khoang cach THAT SU giua 2 lan phat am
+ * nudge khong bao gio nho hon MIN_NUDGE_INTERVAL_MS, du cho lop duck cu co
+ * du thoi gian nha truoc khi (neu can) chong them lop moi.
  */
 class OutputRouter(
     private val context: Context,
@@ -90,12 +116,30 @@ class OutputRouter(
     var totalFramesWritten: Long = 0
         private set
 
+    // ✅ MOI (fix "nudge lap lai gay mat tieng hoan toan" - xem giai thich
+    // chi tiet o dau file): moc thoi gian (System.currentTimeMillis) cua lan
+    // nudge THAT SU duoc phat GAN NHAT - dung de tinh khoang cach voi lan
+    // goi tiep theo trong nudgeAudioMixerToClearDuck(). Rieng cho tung
+    // instance OutputRouter (moi phien Mixer Test la 1 instance moi, tu
+    // dong reset ve 0 khi bat lai) - dung chu y, KHONG dat trong companion
+    // object, vi khong can/khong nen chia se giua nhieu phien khac nhau.
+    private var lastNudgeAtMs = 0L
+
     companion object {
         private const val TAG = "OutputRouter"
         private const val SAMPLE_RATE = 44100
         private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_STEREO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val NANOS_PER_FRAME = 1_000_000_000L / SAMPLE_RATE
+
+        // ✅ MOI: khoang cach TOI THIEU (ms) giua 2 lan phat am nudge THAT
+        // SU, bat ke ai goi (periodicNudgeJob / selfHealJob / nut thu cong).
+        // 5000ms duoc chon vi lon hon nhieu so voi chu ky nudge dinh ky cu
+        // (1.2-1.5s) da xac nhan gay chong lop duck - du de lop duck cu (du
+        // do chinh nudge truoc gay ra hay do YouTube/OS gay ra) co thoi gian
+        // tu nha truoc khi can, nhung van du nhanh de nguoi dung khong phai
+        // cho lau neu bam nut thu cong luc thuc su can.
+        private const val MIN_NUDGE_INTERVAL_MS = 5000L
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -126,6 +170,11 @@ class OutputRouter(
 
     fun start() {
         totalFramesWritten = 0
+        // ✅ MOI: reset moc cooldown khi bat dau 1 phien output moi - tranh
+        // truong hop instance cu (neu bi tai su dung bat thuong) giu lai moc
+        // thoi gian cua phien truoc, lam tri hoan lan nudge dau tien cua
+        // phien moi mot cach vo ly.
+        lastNudgeAtMs = 0L
         logNativeAudioProperties()
 
         val builder = AudioTrack.Builder()
@@ -252,11 +301,157 @@ class OutputRouter(
         start()
     }
 
-    // ❌ DA XOA nudgeAudioMixerToClearDuck() (chan doan vong 4): ham nay tung
-    // tao AudioTrack RIENG (usage=NOTIFICATION) - da xac nhan qua test thuc
-    // te la nguyen nhan khien OEM Honor tu dung audioTrack chinh sau ~1s.
-    // Ban thay the (chen tone truc tiep vao PCM dang mix, KHONG tao track
-    // nao moi) gio nam trong LowLatencyMixer.requestNudgeTone() - noi DUY
-    // NHAT goi outputRouter.write() (mixer loop, 1 thread), tranh ca race
-    // condition NEU logic nudge van con o day va bi goi tu thread khac.
+    /**
+     * ✅ MOI (fix NHE NHANG HON recreate() - da xac nhan qua test thuc te
+     * that: recreate() gay ra bug NANG HON nhieu - ca phien MediaProjection
+     * bi chinh Android thu hoi tren driver Honor, khi pha huy/tao lai
+     * AudioTrack trong luc AudioRecord dua tren MediaProjection dang chay
+     * song song).
+     *
+     * Bang chung MOI quan trong: nguoi dung xac nhan CHI CAN 1 THONG BAO
+     * BAT KY (vi du Facebook) toi la nhac TU DONG to lai binh thuong, KHONG
+     * can lam gi ca. Dieu nay chung minh: chi CAN 1 luong am thanh MOI xuat
+     * hien (bat ky, khong lien quan gi den AudioTrack cua chinh chung ta)
+     * la du de AudioFlinger tinh toan lai (re-mix) toan bo cac luong dang
+     * phat va xoa trang thai "duck" con sot - KHONG can pha huy/tao lai
+     * chinh AudioTrack dang bi anh huong.
+     *
+     * Ham nay MO PHONG dung hieu ung do: tu tao ra 1 "thong bao gia" - phat
+     * 1 doan PCM CUC NGAN (~60ms) va GAN NHU IM LANG (bien do =1, khong du
+     * to de tai nguoi nghe thay) tren 1 AudioTrack RIENG BIET, usage=
+     * USAGE_NOTIFICATION (dung loai stream ma thong bao that su dung) -
+     * kich hoat dung co che AudioFlinger da quan sat duoc, MA KHONG dung gi
+     * toi AudioTrack chinh (audioTrack o tren) hay AudioRecord/MediaProjection
+     * dang chay o noi khac.
+     *
+     * ⚠️ CAP NHAT QUAN TRONG (xem giai thich chi tiet o dau file): ham nay
+     * GIO CO COOLDOWN o dau ham - neu khoang cach voi lan phat nudge THAT SU
+     * gan nhat chua du MIN_NUDGE_INTERVAL_MS, ham se BO QUA (khong tao/phat
+     * AudioTrack nudge nao ca) va chi log lai, thay vi phat chong len lan
+     * truoc. Day la lop bao ve DUY NHAT can thiet - ap dung cho MOI nguon
+     * goi (periodic, self-heal theo AudioFocus, hay nut bam thu cong), nen
+     * chi can dat 1 lan duy nhat ngay tai day.
+     */
+    fun nudgeAudioMixerToClearDuck() {
+        val now = System.currentTimeMillis()
+        val elapsedSinceLastNudge = now - lastNudgeAtMs
+        if (elapsedSinceLastNudge < MIN_NUDGE_INTERVAL_MS) {
+            logBoth(
+                "⏭️ [NudgeMixer] Bo qua - moi chi $elapsedSinceLastNudge ms tu lan nudge truoc " +
+                    "(can toi thieu ${MIN_NUDGE_INTERVAL_MS}ms) - tranh chong lop duck len chinh no."
+            )
+            return
+        }
+
+        try {
+            // ✅ CAP NHAT (chan doan vong 2 - nudge ban dau khong hieu qua):
+            // buffer truoc day dung 1 GIA TRI HANG SO khong doi (vd toan bo
+            // la "1") - day thuc chat la tin hieu GAN GIONG DC (khong doi
+            // theo thoi gian). Phan cung am thanh THUONG LOC BO tin hieu DC
+            // (tu nhien khong the phat duoc qua loa/tai nghe thuc su, bi
+            // capacitor/high-pass loc mat), nen he thong co the coi day la
+            // "khong co gi de phat" va BO QUA hoan toan, khong kich hoat
+            // duoc hieu ung re-mix nhu 1 tieng "ting" thong bao THAT (co tan
+            // so, thay doi lien tuc theo thoi gian).
+            //
+            // Sua (TAM THOI o muc NGHE DUOC ro rang de kiem chung - se giam
+            // lai sau khi xac nhan huong dung): tao 1 SONG SINE THAT (co tan
+            // so AMPLITUDE_FOR_DIAGNOSTIC Hz), co fade-in/fade-out ngan de
+            // tranh tieng "click" do doi bien do dot ngot o dau/cuoi buffer.
+            val durationMs = 200
+            val sampleCount = SAMPLE_RATE * durationMs / 1000
+            val toneFrequencyHz = 900.0
+            // ⚠️ CHAN DOAN: dat o muc NGHE RO (khong con "gan-im-lang" nhu
+            // truoc) - chap nhan nghe 1 tieng "beep" ngan khi test lan nay.
+            // Neu xac nhan huong nay dung, se giam dan bien do o lan sua
+            // tiep theo de tim muc nho nhat van con hieu qua.
+            val amplitude = 3000
+            val fadeSamples = (sampleCount * 0.1).toInt().coerceAtLeast(1)
+            val toneBuffer = ShortArray(sampleCount) { i ->
+                val angle = 2.0 * Math.PI * toneFrequencyHz * i / SAMPLE_RATE
+                var sample = amplitude * kotlin.math.sin(angle)
+                // Fade-in/fade-out tuyen tinh o 10% dau/cuoi - tranh click.
+                val fadeGain = when {
+                    i < fadeSamples -> i.toDouble() / fadeSamples
+                    i >= sampleCount - fadeSamples -> (sampleCount - i).toDouble() / fadeSamples
+                    else -> 1.0
+                }
+                sample *= fadeGain
+                sample.toInt().toShort()
+            }
+
+            val nudgeTrack = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AUDIO_FORMAT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(toneBuffer.size * 2)
+                .build()
+
+            // ⚠️ SUA LOI GOC (chan doan vong 3 - phat hien qua log thuc te
+            // "state=2" moi lan goi, DU code sine wave o tren hoan toan dung):
+            // truoc day check nudgeTrack.state NGAY SAU build(), TRUOC ca
+            // khi write() du lieu. Voi MODE_STATIC, AudioTrack CHI chuyen
+            // sang STATE_INITIALIZED SAU KHI da write() du du lieu tinh vao
+            // track - truoc do (ke ca khi build() hoan toan thanh cong,
+            // khong loi gi), getState() LUON tra ve STATE_NO_STATIC_DATA
+            // (=2). Nghia la nhanh loi nay LUON bi kich hoat vo dieu kien,
+            // ham return SOM truoc ca khi write()/play() duoc goi - toan bo
+            // cac lan nudge truoc day (kem ca ban sine wave o tren) CHUA HE
+            // THUC SU PHAT RA AM THANH LAN NAO, khong lien quan gi den noi
+            // dung tin hieu (DC hay sine) nhu nghi van truoc do.
+            //
+            // Sua: goi write() TRUOC, roi moi kiem tra state (luc nay da
+            // dung nghia la "thanh cong" hay "that bai that su").
+            val written = nudgeTrack.write(toneBuffer, 0, toneBuffer.size)
+            if (written < 0) {
+                logBoth("❌ [NudgeMixer] nudgeTrack.write() loi, ma loi=$written", isError = true)
+                nudgeTrack.release()
+                return
+            }
+            if (nudgeTrack.state != AudioTrack.STATE_INITIALIZED) {
+                logBoth("❌ [NudgeMixer] nudgeTrack khoi tao that bai SAU write(), state=${nudgeTrack.state}", isError = true)
+                nudgeTrack.release()
+                return
+            }
+
+            // ✅ MOI: chi cap nhat moc cooldown NGAY TRUOC luc thuc su play() -
+            // tuc la CHI tinh la "1 lan nudge" khi am thanh chac chan se duoc
+            // phat ra (da qua het cac nhanh loi o tren), tranh truong hop 1
+            // lan goi bi loi som (vd write() that bai) van vo tinh "tieu" mat
+            // 1 khoang cooldown ma khong he co am thanh nao duoc phat.
+            lastNudgeAtMs = now
+
+            nudgeTrack.play()
+            logBoth(
+                "🔔 [NudgeMixer] [CHAN DOAN] Da phat 1 tieng beep NGHE RO (${durationMs}ms, " +
+                    "${toneFrequencyHz}Hz, amplitude=$amplitude, usage=NOTIFICATION) de kiem chung " +
+                    "gia thuyet 'can tin hieu that, khong phai DC' - se giam am luong lai sau khi xac nhan."
+            )
+
+            // Giai phong nudgeTrack sau khi phat xong (+ margin an toan) -
+            // dung Handler.postDelayed (khong can coroutine/scope rieng cho
+            // 1 tac vu 1-lan, ngan han nhu the nay).
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    nudgeTrack.stop()
+                    nudgeTrack.release()
+                } catch (e: Exception) {
+                    logBoth("⚠️ [NudgeMixer] Loi khi giai phong nudgeTrack (khong nghiem trong): ${e.message}")
+                }
+            }, (durationMs + 150).toLong())
+        } catch (e: Exception) {
+            logBoth("❌ [NudgeMixer] Loi khi tao/phat am nudge: ${e.message}", isError = true)
+        }
+    }
 }

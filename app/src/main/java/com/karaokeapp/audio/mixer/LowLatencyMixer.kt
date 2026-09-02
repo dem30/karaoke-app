@@ -11,7 +11,6 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
@@ -117,31 +116,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
         // dung tu tinh chinh tiep tuy thiet bi/khoang cach mic-loa thuc te.
         private const val VOCAL_GAIN = 1.8f
 
-        // ✅ MOI (chuyen nudge-beep tu 1 AudioTrack rieng sang "chen truc
-        // tiep vao chinh luong dang mix"): thong so cho tone chan doan, dung
-        // chung trong vong lap mixer - xem giai thich day du o
-        // requestNudgeTone()/applyNudgeToneIfRequested() ben duoi.
-        private const val NUDGE_TONE_DURATION_MS = 200
-        private const val NUDGE_TONE_SAMPLE_COUNT = (SAMPLE_RATE * NUDGE_TONE_DURATION_MS / 1000)
-        private const val NUDGE_TONE_FREQUENCY_HZ = 900.0
-        private const val NUDGE_TONE_AMPLITUDE = 3000
-
-        /** Sinh san 1 buffer sine ngan (co fade-in/out) dung lai cho moi lan nudge - tranh cap phat lai moi lan. */
-        private val nudgeToneBuffer: ShortArray by lazy {
-            val fadeSamples = (NUDGE_TONE_SAMPLE_COUNT * 0.1).toInt().coerceAtLeast(1)
-            ShortArray(NUDGE_TONE_SAMPLE_COUNT) { i ->
-                val angle = 2.0 * Math.PI * NUDGE_TONE_FREQUENCY_HZ * i / SAMPLE_RATE
-                var sample = NUDGE_TONE_AMPLITUDE * kotlin.math.sin(angle)
-                val fadeGain = when {
-                    i < fadeSamples -> i.toDouble() / fadeSamples
-                    i >= NUDGE_TONE_SAMPLE_COUNT - fadeSamples -> (NUDGE_TONE_SAMPLE_COUNT - i).toDouble() / fadeSamples
-                    else -> 1.0
-                }
-                sample *= fadeGain
-                sample.toInt().toShort()
-            }
-        }
-
         fun mix(music: ShortArray, musicLen: Int, vocal: ShortArray, vocalLen: Int, outLength: Int): ShortArray {
             val out = ShortArray(outLength)
             for (i in 0 until outLength) {
@@ -168,21 +142,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
     private val vocalBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
 
     private var mixerJob: Job? = null
-
-    // ✅ MOI: co hieu "co yeu cau nudge" - AN TOAN de goi tu BAT KY thread
-    // nao (vi du tu PlaybackCaptureService), vi AtomicBoolean chi la 1 flag
-    // don gian, KHONG dung chung AudioTrack hay bat ky tai nguyen nao voi
-    // mixer loop. Chinh mixer loop (duy nhat 1 thread "LowLatencyMixerLoop")
-    // se tu doc va xu ly co nay trong vong lap cua no - dam bao MOI lenh
-    // ghi vao outputRouter deu xuat phat tu dung 1 thread do, khong co race
-    // condition giua 2 thread cung goi write() nhu truoc day.
-    private val nudgeRequested = AtomicBoolean(false)
-
-    // So sample con lai cua tone dang duoc "chen dan" vao cac chunk mix lien
-    // tiep (vi CHUNK_SIZE ~1764 sample/40ms nho hon NUDGE_TONE_SAMPLE_COUNT
-    // ~8820 sample/200ms, tone se trai dai qua nhieu chunk, KHONG the nhoi
-    // het vao 1 lan mix()). Chi doc/ghi trong mixer loop, khong can @Volatile.
-    private var nudgeToneSamplesRemaining = 0
 
     // ✅ MOI (fix chung goc voi MusicInput/MicInput - xem giai thich chi
     // tiet trong MusicInput.kt): vong lap mixer (drain 2 ring buffer + ghi
@@ -214,31 +173,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
 
     fun pushVocal(buffer: ShortArray, size: Int) {
         vocalBuffer.push(buffer, size)
-    }
-
-    /**
-     * ✅ MOI: thay the cho OutputRouter.nudgeAudioMixerToClearDuck() ban cu
-     * (tao AudioTrack rieng usage=NOTIFICATION - da xac nhan qua test thuc
-     * te la nguyen nhan lam OEM Honor tu dung audioTrack chinh sau ~1s, vi
-     * co them 1 track "la" xuat hien/bien mat lien tuc canh audioTrack
-     * chinh khien audio policy danh gia lai nguon dang active).
-     *
-     * Ham nay CHI set 1 co hieu (AtomicBoolean, khong dung tai nguyen audio
-     * nao) - AN TOAN de goi tu bat ky thread nao (vi du tu
-     * PlaybackCaptureService qua PeriodicNudge/SelfHeal). Chinh mixer loop
-     * (thread "LowLatencyMixerLoop" duy nhat) se tu phat hien co nay va
-     * CHEN tone truc tiep vao PCM dang mix, roi ghi qua CUNG 1 loi goi
-     * outputRouter.write() ma no van dang dung - nghia la tone se "noi vao
-     * session cu" (cung audioTrack, cung usage=MEDIA), khong tao track/
-     * session moi nen se khong gay hien tuong OEM tu dung audioTrack chinh
-     * nhu ban cu.
-     *
-     * Danh doi: vi tone duoc CONG THEM vao PCM that (khong phai phat song
-     * song tren track rieng), nguoi dung se nghe tieng "beep" de len tren
-     * nhac/mic dang mix trong ~200ms, thay vi nghe rieng biet nhu truoc.
-     */
-    fun requestNudgeTone() {
-        nudgeRequested.set(true)
     }
 
     fun start() {
@@ -313,31 +247,6 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
                 wasMusicSilentAtMixer = musicSilentNow
 
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
-
-                // ✅ MOI: neu co yeu cau nudge dang cho (tu requestNudgeTone(),
-                // co the goi tu thread khac) hoac dang giua chung 1 tone con
-                // dang duoc chen dan tu chunk truoc, CONG THEM tone vao
-                // "mixed" TRUOC khi ghi - van CHI 1 loi goi outputRouter.write()
-                // duy nhat moi chunk, dung nhu cu, khong them thread/track nao.
-                if (nudgeRequested.compareAndSet(true, false)) {
-                    nudgeToneSamplesRemaining = NUDGE_TONE_SAMPLE_COUNT
-                }
-                if (nudgeToneSamplesRemaining > 0) {
-                    val toneStartIndex = NUDGE_TONE_SAMPLE_COUNT - nudgeToneSamplesRemaining
-                    val samplesToApply = min(CHUNK_SIZE, nudgeToneSamplesRemaining)
-                    for (i in 0 until samplesToApply) {
-                        val toneSample = nudgeToneBuffer[toneStartIndex + i].toInt()
-                        var sum = mixed[i].toInt() + toneSample
-                        if (sum > Short.MAX_VALUE) sum = Short.MAX_VALUE.toInt()
-                        if (sum < Short.MIN_VALUE) sum = Short.MIN_VALUE.toInt()
-                        mixed[i] = sum.toShort()
-                    }
-                    nudgeToneSamplesRemaining -= samplesToApply
-                    if (nudgeToneSamplesRemaining == 0) {
-                        logBoth("🔔 [NudgeMixer] Da chen xong tone nudge (${NUDGE_TONE_DURATION_MS}ms) vao luong mix chinh, khong tao track rieng.")
-                    }
-                }
-
                 outputRouter.write(mixed, CHUNK_SIZE)
 
                 // ✅ MOI: log dinh ky (~1 lan/giay) do sau (tinh theo ms) cua
