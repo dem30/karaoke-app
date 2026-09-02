@@ -13,6 +13,7 @@ import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
@@ -74,7 +75,7 @@ class MusicInput(
             }
         }
     }.asCoroutineDispatcher()
-    private val scope = CoroutineScope(captureDispatcher)
+    private val scope = CoroutineScope(captureDispatcher + SupervisorJob())
 
     @Volatile
     private var shouldStop = false
@@ -205,7 +206,25 @@ class MusicInput(
                     // forget) de vong lap chinh khong phai cho no xong.
                     val amplitudeSnapshot = avg
                     if (onAmplitudeTick != null) {
-                        scope.launch { onAmplitudeTick.invoke(amplitudeSnapshot) }
+                        scope.launch {
+                            try {
+                                onAmplitudeTick.invoke(amplitudeSnapshot)
+                            } catch (e: Exception) {
+                                // ✅ MOI (fix rui ro crash im lang): onAmplitudeTick cuoi
+                                // cung goi toi NotificationManager.notify() ben ngoai -
+                                // bat ky exception nao o day (vi du IPC toi
+                                // system_server that bai) TRUOC DAY co the huy ca
+                                // "scope" (Job thuong, khong SupervisorJob), keo theo
+                                // captureJob chinh (vong lap doc PCM) bi huy theo MA
+                                // KHONG CO LOG NAO - dung hien tuong "kep, im lang, khong
+                                // bao loi" da quan sat duoc. Da doi "scope" sang dung
+                                // SupervisorJob() de chan lay lan, nhung van bat o day
+                                // them 1 lop de dam bao khong bao gio de exception thoat
+                                // ra ngoai coroutine nay (tranh phu thuoc vao
+                                // CoroutineExceptionHandler mac dinh cua he thong).
+                                logBoth("❌ onAmplitudeTick loi (khong anh huong capture chinh): ${e.message}", isError = true)
+                            }
+                        }
                     }
                     sumAmplitude = 0
                     sampleCount = 0

@@ -654,25 +654,54 @@ class PlaybackCaptureService : Service() {
         }, null)
 
         mediaProjection = projection
-        musicInput = MusicInput(
-            mediaProjection = projection,
-            onAmplitudeTick = { avgAmplitude ->
-                val now = timeFormat.format(java.util.Date())
-                updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
-                // ✅ Luu y: KHONG con goi reassertStreamSystemVolumeIfMixerRunning()
-                // o day nua - da thay bang volumeGuardJob (vong lap rieng
-                // ~300ms/lan, xem startMixerTestInternal()) nhanh hon nhieu
-                // so voi tick 1 lan/giay nay, giup bat kip AVRCP volume
-                // resync cua Bluetooth tot hon.
-            },
-            onPcmChunk = { buffer, size ->
-                // ✅ Phase 3: neu mixer test dang chay, day PCM nhac vao. Neu
-                // chua bat mixer, mixer == null nen dong nay khong lam gi ca -
-                // khong anh huong Phase 1 khi chua test mixer.
-                mixer?.pushMusic(buffer, size)
-            }
-        ).apply { startCapture() }
-        capturingActive = true
+
+        // ✅ MOI (fix nghi van "Dang khoi dong... bi ket vinh vien, khong co
+        // amplitude nao"): truoc day khoi tao MusicInput + goi startCapture()
+        // KHONG co try/catch, chay TRUC TIEP tren main thread cua
+        // onStartCommand. AudioRecord.Builder().build() va
+        // AudioPlaybackCaptureConfiguration.Builder().build() deu co the nem
+        // exception dong bo (vi du IllegalStateException/UnsupportedOperationException
+        // tuy OEM, hoac do mediaProjection chua san sang ngay sau khi dialog
+        // cap quyen vua dong) - neu xay ra, tien trinh crash NGAY tai day,
+        // TRUOC KHI startCapture() kip chay lan dau. Vi startForeground() da
+        // hien thi "Dang khoi dong..." truoc do, notification bi dong bang
+        // vinh vien tren thanh thong bao (tien trinh chet, khong con ai cap
+        // nhat/xoa no nua) - dung hien tuong da quan sat qua anh chup man
+        // hinh. Boc try/catch de: (1) khong crash ca tien trinh, (2) cap nhat
+        // lai notification voi thong bao loi ro rang thay vi de no dong bang
+        // im lang, (3) log day du de biet chinh xac buoc nao that bai.
+        try {
+            musicInput = MusicInput(
+                mediaProjection = projection,
+                onAmplitudeTick = { avgAmplitude ->
+                    val now = timeFormat.format(java.util.Date())
+                    updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
+                    // ✅ Luu y: KHONG con goi reassertStreamSystemVolumeIfMixerRunning()
+                    // o day nua - da thay bang volumeGuardJob (vong lap rieng
+                    // ~300ms/lan, xem startMixerTestInternal()) nhanh hon nhieu
+                    // so voi tick 1 lan/giay nay, giup bat kip AVRCP volume
+                    // resync cua Bluetooth tot hon.
+                },
+                onPcmChunk = { buffer, size ->
+                    // ✅ Phase 3: neu mixer test dang chay, day PCM nhac vao. Neu
+                    // chua bat mixer, mixer == null nen dong nay khong lam gi ca -
+                    // khong anh huong Phase 1 khi chua test mixer.
+                    mixer?.pushMusic(buffer, size)
+                }
+            ).apply { startCapture() }
+            capturingActive = true
+        } catch (e: Exception) {
+            logBoth(
+                "❌ Khoi tao MusicInput/startCapture() that bai: ${e.message} - " +
+                    "dung lai session nay, KHONG de tien trinh crash im lang.",
+                isError = true
+            )
+            updateNotification("Loi khoi dong capture: ${e.message}")
+            musicInput = null
+            capturingActive = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         return START_NOT_STICKY
     }
