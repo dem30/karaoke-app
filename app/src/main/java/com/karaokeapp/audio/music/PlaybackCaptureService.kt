@@ -754,7 +754,18 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun updateNotification(contentText: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(contentText))
+        // ✅ MOI (chan doan cuoi cung): log NGAY TRUOC va SAU manager.notify()
+        // de xac nhan 100% no thuc su chay toi day va khong nem ra loi nao bi
+        // nuot mat - neu dong "da goi xong" khong bao gio xuat hien trong log,
+        // nghia la co exception xay ra o buoc lay NotificationManager hoac o
+        // chinh notify().
+        try {
+            val manager = getSystemService(NotificationManager::class.java)
+            logBoth("🔔 [NotifyDebug] Chuan bi goi notify() voi text=\"$contentText\"")
+            manager.notify(NOTIFICATION_ID, buildNotification(contentText))
+            logBoth("🔔 [NotifyDebug] Da goi notify() xong, khong co loi.")
+        } catch (e: Exception) {
+            logBoth("❌ [NotifyDebug] notify() nem loi: ${e.message}", isError = true)
+        }
     }
 }
