@@ -207,8 +207,13 @@ class MusicInput(
                     val amplitudeSnapshot = avg
                     if (onAmplitudeTick != null) {
                         scope.launch {
+                            // ✅ MOI (chan doan cuoi cung): log NGAY TRUOC va SAU
+                            // invoke() de xac nhan 100% dong nay thuc su chay toi,
+                            // khong chi suy luan qua viec thieu log loi.
+                            logBoth("🔔 [InvokeDebug] Chuan bi goi onAmplitudeTick.invoke($amplitudeSnapshot)")
                             try {
                                 onAmplitudeTick.invoke(amplitudeSnapshot)
+                                logBoth("🔔 [InvokeDebug] Da goi onAmplitudeTick.invoke() xong, khong co loi.")
                             } catch (e: Exception) {
                                 // ✅ MOI (fix rui ro crash im lang): onAmplitudeTick cuoi
                                 // cung goi toi NotificationManager.notify() ben ngoai -
