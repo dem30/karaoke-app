@@ -48,7 +48,7 @@ import com.karaokeapp.audio.output.OutputRouter
  * app).
  *
  * ✅ MOI (fix "Mixer Test chi song ~5 giay roi im, phai thu app xuong moi to
- * lai" - xem giai thich chi tiet trong NudgeOverlayButton.kt): them flow xin
+ * lai" - xem giai thich chi tiet trong MixerToggleOverlayButton.kt): them flow xin
  * quyen "Hien thi tren ung dung khac" (SYSTEM_ALERT_WINDOW) - can de
  * PlaybackCaptureService co the hien nut noi "🔊 Kich hoat lai" DE TREN
  * YouTube trong luc Mixer Test dang chay. Day la 1 "special permission" cua
@@ -82,6 +82,13 @@ class MainActivity : AppCompatActivity() {
     // Mic Loopback cua Phase 2, vi mixer test can chay ben trong Service de
     // song cung MusicInput dang capture nhac ngam).
     private var mixerTestRunning = false
+
+    // ✅ MOI: giu tham chieu toi nut "Bat/Tat Mixer Test" de dong bo lai chu
+    // trong onResume() - can thiet vi GIO Mixer Test co the bi bat/tat tu
+    // ben ngoai Activity (nut noi tren man hinh) trong luc Activity nay
+    // dang o nen, xem giai thich chi tiet trong PlaybackCaptureService.kt
+    // (isMixerTestActive()).
+    private var mixerTestButtonRef: Button? = null
 
     // ✅ MOI (thu nghiem "co the mute YouTube nhung MusicInput van capture
     // duoc khong?"): CHI mute/unmute STREAM_MUSIC cua he thong - KHONG dung
@@ -200,7 +207,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ MOI (xem giai thich chi tiet o dau file/NudgeOverlayButton.kt): quyen
+    // ✅ MOI (xem giai thich chi tiet o dau file/MixerToggleOverlayButton.kt): quyen
     // SYSTEM_ALERT_WINDOW KHONG co callback "granted=true/false" truc tiep nhu
     // RequestPermission() thong thuong - Settings.ACTION_MANAGE_OVERLAY_PERMISSION
     // chi mo 1 man hinh Settings, dong lai roi tra ve KHONG kem ket qua dang tin
@@ -290,6 +297,7 @@ class MainActivity : AppCompatActivity() {
             text = "Bat Mixer Test"
             setOnClickListener { toggleMixerTest(this) }
         }
+        mixerTestButtonRef = mixerTestButton
 
         // ✅ MOI: nut thu nghiem rieng, KHONG lien quan Mixer/OutputRouter -
         // chi de kiem tra gia thuyet mute STREAM_MUSIC ve 0 co lam MusicInput
@@ -311,7 +319,7 @@ class MainActivity : AppCompatActivity() {
 
         // ✅ MOI (xem giai thich chi tiet o dau file): nut xin quyen "Hien thi
         // tren ung dung khac" - can cho nut noi "Kich hoat lai" cua Mixer Test
-        // (NudgeOverlayButton.kt). Doi ten nut theo trang thai hien tai moi lan
+        // (MixerToggleOverlayButton.kt). Doi ten nut theo trang thai hien tai moi lan
         // onCreate() chay, de nguoi dung biet ngay khong can bam neu da cap roi.
         val overlayPermissionButton = Button(this).apply {
             text = if (Settings.canDrawOverlays(this@MainActivity)) {
@@ -410,6 +418,18 @@ class MainActivity : AppCompatActivity() {
                 logText.append("\n$line")
                 scrollLogToBottom()
             }
+        }
+
+        // ✅ MOI: dong bo lai trang thai/chu cua nut "Bat/Tat Mixer Test" moi
+        // lan quay lai app - can thiet vi nut noi tren man hinh (xem
+        // MixerToggleOverlayButton.kt) co the da bat/tat Mixer Test trong
+        // luc Activity nay dang o nen (vi du dang xem YouTube), khien bien
+        // mixerTestRunning cu trong Activity khong con dung nua.
+        val actuallyRunning = PlaybackCaptureService.isMixerTestActive()
+        if (actuallyRunning != mixerTestRunning) {
+            mixerTestRunning = actuallyRunning
+            mixerTestButtonRef?.text = if (mixerTestRunning) "Tat Mixer Test" else "Bat Mixer Test"
+            CaptureLogBus.log("[Activity] Da dong bo lai trang thai Mixer Test tu Service: dangChay=$actuallyRunning")
         }
     }
 

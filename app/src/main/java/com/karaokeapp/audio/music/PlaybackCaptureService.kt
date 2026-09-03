@@ -20,7 +20,7 @@ import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
-import com.karaokeapp.overlay.NudgeOverlayButton
+import com.karaokeapp.overlay.MixerToggleOverlayButton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -141,14 +141,15 @@ class PlaybackCaptureService : Service() {
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
 
-    // ✅ MOI (fix "chi song 5 giay roi im, phai thu ung dung xuong moi to
-    // lai" - xem giai thich chi tiet trong NudgeOverlayButton.kt): nut TRON
-    // NOI TREN man hinh, nguoi dung tu bam thu cong bat ky luc nao (ke ca
-    // dang xem YouTube toan man hinh) de kich hoat nudge - phuong an du
-    // phong cuoi cung, dung song song voi periodicNudgeJob/selfHealJob tu
-    // dong (khong thay the). Chi ton tai trong luc Mixer Test dang chay -
-    // tao o startMixerTestInternal(), huy o stopMixerTestInternal().
-    private var nudgeOverlay: NudgeOverlayButton? = null
+    // ✅ CAP NHAT LON (thay the "beep" bang cong tac BAT/TAT Mixer Test tu xa
+    // - xem giai thich chi tiet trong MixerToggleOverlayButton.kt): nut TRON
+    // NOI TREN man hinh (ke ca dang xem YouTube toan man hinh), bam se goi
+    // TRUC TIEP startMixerTestInternal()/stopMixerTestInternal() - KHONG con
+    // phat beep nao ca. Nut nay TON TAI XUYEN SUOT trong luc Phase 1 (capture
+    // nhac) dang chay, KHONG bi go bo khi chi Mixer Test bi tat (chi doi
+    // icon/mau) - CHI thuc su bi go (hide()) khi ca phien Phase 1 ket thuc,
+    // xem stopCurrentSessionIfAny().
+    private var mixerToggleOverlay: MixerToggleOverlayButton? = null
 
     // ✅ MOI (fix "hu qua loa ngoai/Bluetooth" - vong lap phan hoi am hoc):
     // limiter RIENG ap cho VOCAL TRUOC KHI vao mixer, xem giai thich chi
@@ -329,14 +330,27 @@ class PlaybackCaptureService : Service() {
         // ✅ MOI (bo het nhanh tu dong theo yeu cau): ENABLE_SELF_HEAL_RECREATE
         // va PERIODIC_NUDGE_INTERVAL_MS DA BI XOA khoi day - khong con
         // recreate()/nudge nao duoc kich hoat tu dong nua, xem giai thich chi
-        // tiet o khai bao focusObserverListener phia tren. Nudge GIO CHI co
-        // the den tu 2 nguon THU CONG: nut noi (NudgeOverlayButton) hoac nut
-        // action tren notification (ACTION_MANUAL_NUDGE).
+        // tiet o khai bao focusObserverListener phia tren. Beep/nudge DA BI BO
+        // HOAN TOAN khoi nut noi (xem MixerToggleOverlayButton.kt) - nut noi
+        // GIO la cong tac BAT/TAT Mixer Test tu xa, khong con phat am nao ca.
 
         @Volatile
         private var capturingActive = false
 
+        // ✅ MOI: trang thai Mixer Test dang chay hay khong, doc duoc tu BEN
+        // NGOAI Service (vi du MainActivity) - can thiet vi GIO Mixer Test co
+        // the duoc bat/tat tu 3 nguon DOC LAP (nut trong app, nut notification,
+        // VA nut noi tren man hinh) - neu nguoi dung dung nut noi de tat trong
+        // luc dang o YouTube roi quay lai app, nut "Bat/Tat Mixer Test" trong
+        // MainActivity can biet de tu cap nhat lai chu, tranh hien thi SAI
+        // trang thai (vi du van ghi "Tat Mixer Test" trong khi thuc te da tat
+        // roi tu nut noi).
+        @Volatile
+        private var mixerTestActive = false
+
         fun isCapturing(): Boolean = capturingActive
+
+        fun isMixerTestActive(): Boolean = mixerTestActive
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -401,6 +415,34 @@ class PlaybackCaptureService : Service() {
         mediaProjection?.stop()
         mediaProjection = null
         capturingActive = false
+
+        // ✅ MOI (xem giai thich chi tiet o khai bao mixerToggleOverlay): CHI
+        // go han nut noi khoi man hinh o day - luc CA PHIEN Phase 1 ket thuc
+        // (khong con gi de Mixer Test hoat dong tren do nua) - KHONG go o
+        // stopMixerTestInternal() (chi TAT rieng Mixer Test, Phase 1 van con
+        // chay, nguoi dung co the can bam BAT lai bat ky luc nao).
+        mixerToggleOverlay?.hide()
+        mixerToggleOverlay = null
+    }
+
+    /**
+     * ✅ MOI: duoc goi TRUC TIEP tu callback onToggle cua MixerToggleOverlayButton
+     * (chay tren main thread, cung thread voi onStartCommand()) - vi day la
+     * ham thuong (khong phai suspend), goi thang khong can di qua Intent/
+     * onStartCommand() nhu 2 nut trong app/notification, du ca 3 duong cuoi
+     * cung deu dan toi cung 2 ham startMixerTestInternal()/stopMixerTestInternal().
+     *
+     * Quyet dinh BAT hay TAT dua vao mixer (!= null nghia la dang chay) -
+     * dung chinh bien trang thai da co san, khong can bien co rieng.
+     */
+    private fun toggleMixerTestFromOverlay() {
+        if (mixer != null) {
+            logBoth("👆 [OverlayToggle] Dang BAT -> chuyen sang TAT Mixer Test.")
+            stopMixerTestInternal()
+        } else {
+            logBoth("👆 [OverlayToggle] Dang TAT -> chuyen sang BAT Mixer Test.")
+            startMixerTestInternal()
+        }
     }
 
     /** Phase 3: bat dau tron Music (dang chay) + Mic moi, phat ra qua OutputRouter rieng. */
@@ -526,18 +568,18 @@ class PlaybackCaptureService : Service() {
             }
         }
 
-        // ✅ MOI (bo het nhanh tu dong theo yeu cau): khong con vong lap
-        // periodicNudgeJob nao ca - nudge CHI con den tu nut bam tay (overlay
-        // hoac notification), xem giai thich chi tiet o khai bao
-        // focusObserverListener phia tren.
-
-        // ✅ MOI (xem giai thich chi tiet o khai bao nudgeOverlay o tren): hien
-        // nut noi thu cong NGAY KHI Mixer Test bat dau chay - se tu bo qua
-        // (khong crash) va chi log canh bao neu chua duoc cap quyen "Hien thi
-        // tren ung dung khac" (nguoi dung can cap tu MainActivity truoc).
-        nudgeOverlay = NudgeOverlayButton(applicationContext) {
-            mixerOutputRouter?.nudgeAudioMixerToClearDuck()
-        }.also { it.show() }
+        // ✅ CAP NHAT LON (xem giai thich chi tiet o khai bao mixerToggleOverlay
+        // o tren): CHI tao nut noi 1 LAN DUY NHAT (neu chua ton tai) - nhung
+        // LAN nao lay lai duoc Mixer Test cung phai cap nhat lai icon/mau ve
+        // trang thai "dang chay", vi nut co the da o trang thai "TAT" tu lan
+        // nguoi dung tu tay bam tat truoc do.
+        if (mixerToggleOverlay == null) {
+            mixerToggleOverlay = MixerToggleOverlayButton(applicationContext) {
+                toggleMixerTestFromOverlay()
+            }
+        }
+        mixerToggleOverlay?.show(initiallyRunning = true)
+        mixerTestActive = true
 
         logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
     }
@@ -552,12 +594,13 @@ class PlaybackCaptureService : Service() {
         // ✅ MOI (bo het nhanh tu dong theo yeu cau): khong con selfHealJob/
         // periodicNudgeJob nao de huy o day nua.
 
-        // ✅ MOI: an/huy nut noi thu cong cung luc voi cac thanh phan khac cua
-        // Mixer Test - khong de no o lai man hinh sau khi da tat Mixer Test
-        // (luc do mixerOutputRouter=null nen bam vao cung khong con tac dung
-        // gi ca).
-        nudgeOverlay?.hide()
-        nudgeOverlay = null
+        // ✅ CAP NHAT LON: KHONG con go/an nut noi khi chi Mixer Test bi tat
+        // nua (xem giai thich chi tiet o khai bao mixerToggleOverlay) - CHI
+        // cap nhat lai icon/mau ve trang thai "TAT" de nguoi dung biet bam
+        // lai se BAT chu khong phai TAT. Nut van o nguyen tren man hinh de
+        // co the bam lai BAT bat ky luc nao, ke ca dang o YouTube.
+        mixerToggleOverlay?.updateState(isRunning = false)
+        mixerTestActive = false
 
         // ✅ MOI: go dang ky listener quan sat/tu phuc hoi audio focus (xem
         // giai thich o dau file) - khong con can quan sat khi Mixer Test da
