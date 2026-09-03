@@ -186,11 +186,28 @@ class PlaybackCaptureService : Service() {
         // truoc khi buoc "bat" tao lai moi thu tu dau.
         private const val OFF_ON_CYCLE_DELAY_MS = 400L
 
-        // Package app nhac nguon se tu dong mo lai sau buoc 5 cua chuoi -
-        // hardcode YouTube (dung nhat voi use-case chinh). Neu sau nay ho
-        // tro nhieu nguon nhac khac nhau, can doi thanh doc dong tu cau hinh
-        // (vi du SongManager) thay vi hang so co dinh.
-        private const val TARGET_PACKAGE_YOUTUBE = "com.google.android.youtube"
+        // ✅ SUA LOI GOC (xac nhan qua log thuc te: getLaunchIntentForPackage
+        // ("com.google.android.youtube") tra ve null tren may cua nguoi
+        // dung - nghia la app YouTube GOC KHONG duoc cai, nguoi dung dang
+        // xem qua trinh duyet thay vi app rieng): truoc day hardcode DUY
+        // NHAT 1 package YouTube goc - neu package do khong ton tai tren
+        // may, returnToSourceApp() se KHONG mo duoc gi ca, dan den chuoi
+        // "Bat lai" chay het cac buoc am thanh (tat/bat mixer) nhung KHONG
+        // BAO GIO thuc su tao ra su kien chuyen foreground THAT can thiet
+        // de xoa duck/mute - day moi la ly do goc khien "van nho tieng, chi
+        // bam tay quay lai YouTube (qua Chrome) moi to" nhu quan sat duoc.
+        //
+        // GIO thay bang 1 DANH SACH candidate, thu lan luot theo thu tu uu
+        // tien - dung candidate DAU TIEN resolve duoc launch intent hop le.
+        // Uu tien Chrome truoc (dua tren bang chung tu log + comment cu
+        // trong MainActivity.kt nhac toi "mo YouTube qua Chrome"), sau do
+        // moi toi app YouTube goc (phong truong hop may khac co cai san).
+        // Neu sau nay xac nhan chinh xac trinh duyet/app nao dang dung, co
+        // the rut gon lai danh sach nay cho gon.
+        private val TARGET_APP_CANDIDATES = listOf(
+            "com.android.chrome",           // Chrome - uu tien 1 (bang chung tu log)
+            "com.google.android.youtube"    // App YouTube goc - uu tien 2 (fallback)
+        )
 
         @Volatile
         private var capturingActive = false
@@ -394,73 +411,70 @@ class PlaybackCaptureService : Service() {
         }
     }
 
-    /** ✅ MOI: buoc cuoi cua chuoi - tu mo lai app nhac nguon (YouTube). */
     /**
-     * ✅ SUA (them log chan doan chi tiet - day la buoc dang bi bao "khong
-     * tu mo lai duoc YouTube"): truoc day chi log msg ngan (${e.message}),
-     * KHONG du de biet chinh xac ly do that su (vi du: null message, hoac
-     * loi xay ra o buoc resolve intent chu khong phai o startActivity()).
-     * GIO log ca class exception + goi Log.e(TAG, msg, e) de stack trace day
-     * du xuat hien trong Logcat (khong hien trong CaptureLogBus vi qua dai),
-     * VA log ro component/package ma launchIntent thuc su tro toi TRUOC khi
-     * goi startActivity(), de doi chieu dung sai voi ky vong.
+     * ✅ SUA (fix goc "khong tu mo lai duoc app nguon" - xac nhan qua log
+     * thuc te: getLaunchIntentForPackage("com.google.android.youtube") tra
+     * ve null tren may cua nguoi dung, nghia la app YouTube GOC KHONG duoc
+     * cai - nguoi dung dang xem qua trinh duyet thay vi app rieng): truoc
+     * day CHI thu 1 package YouTube goc co dinh - neu package do khong ton
+     * tai tren may, ham nay se KHONG mo duoc gi ca, dan den chuoi "Bat lai"
+     * chay het cac buoc am thanh (tat/bat mixer) nhung KHONG BAO GIO thuc
+     * su tao ra su kien chuyen foreground THAT can thiet de xoa duck/mute -
+     * day chinh la ly do goc khien "van nho tieng, chi bam tay quay lai
+     * YouTube (qua Chrome) moi to" nhu quan sat duoc qua log thuc te.
      *
-     * ⚠️ LUU Y quan trong can nguoi dung xac nhan: TARGET_PACKAGE_YOUTUBE
-     * dang hardcode la app YouTube GOC (com.google.android.youtube). Neu
-     * thuc te dang xem YouTube QUA TRINH DUYET Chrome (nhu 1 goi y trong
-     * comment cu o MainActivity.kt: "mo YouTube (qua Chrome neu can chay
-     * nen)") thay vi app YouTube rieng, thi:
-     *   - Neu may KHONG cai app YouTube goc -> getLaunchIntentForPackage()
-     *     tra ve null -> se thay log "Khong tim thay ... da cai dat" ben
-     *     duoi, va KHONG co gi duoc mo ca (dung hien tuong dang gap).
-     *   - Neu may CO cai app YouTube goc (du dang xem qua Chrome) -> lenh
-     *     nay se mo NHAM app YouTube goc (man hinh Trang chu cua no, KHONG
-     *     phai tab Chrome dang xem), khong phai "quay lai" that su.
-     * Neu dung 1 trong 2 truong hop tren, can doi TARGET_PACKAGE_YOUTUBE
-     * sang "com.android.chrome" (hoac ghi nho package cua app THUC SU dang
-     * o foreground NGAY TRUOC khi nguoi dung bam nut noi, thay vi hardcode
-     * 1 package co dinh) - noi dung nay CHUA sua trong ban nay vi can biet
-     * chinh xac truong hop nao dang xay ra truoc.
+     * GIO thu lan luot tung candidate trong TARGET_APP_CANDIDATES theo dung
+     * thu tu uu tien, dung candidate DAU TIEN vua resolve duoc launch
+     * intent HOP LE VA startActivity() khong nem loi. Log chi tiet tung
+     * buoc thu (thanh cong/that bai) de de doi chieu neu van con sai
+     * package.
      */
     private fun returnToSourceApp() {
         reactivationRunnable = null
-        val launchIntent = try {
-            packageManager.getLaunchIntentForPackage(TARGET_PACKAGE_YOUTUBE)
-        } catch (e: Exception) {
-            Log.e(TAG, "[Reactivation] Loi khi resolve launch intent cho $TARGET_PACKAGE_YOUTUBE", e)
-            logBoth(
-                "❌ [Reactivation] Loi khi tim launch intent cho $TARGET_PACKAGE_YOUTUBE: " +
-                    "${e::class.java.simpleName} - ${e.message}",
-                isError = true
-            )
-            null
-        }
 
-        if (launchIntent != null) {
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            logBoth(
-                "ℹ️ [Reactivation] launchIntent resolve duoc: component=${launchIntent.component} " +
-                    "package=${launchIntent.`package`} flags=${launchIntent.flags}"
-            )
-            try {
-                startActivity(launchIntent)
-                logBoth("✅ [Reactivation] Da goi startActivity() cho $TARGET_PACKAGE_YOUTUBE - chuoi hoan tat.")
+        for (candidatePackage in TARGET_APP_CANDIDATES) {
+            val launchIntent = try {
+                packageManager.getLaunchIntentForPackage(candidatePackage)
             } catch (e: Exception) {
-                Log.e(TAG, "[Reactivation] Loi khi startActivity() cho $TARGET_PACKAGE_YOUTUBE", e)
+                Log.e(TAG, "[Reactivation] Loi khi resolve launch intent cho $candidatePackage", e)
                 logBoth(
-                    "❌ [Reactivation] Loi khi mo lai $TARGET_PACKAGE_YOUTUBE: " +
+                    "❌ [Reactivation] Loi khi tim launch intent cho $candidatePackage: " +
                         "${e::class.java.simpleName} - ${e.message}",
                     isError = true
                 )
+                null
             }
-        } else {
+
+            if (launchIntent == null) {
+                logBoth("⚠️ [Reactivation] $candidatePackage khong resolve duoc (co the chua cai) - thu candidate ke tiep.")
+                continue
+            }
+
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             logBoth(
-                "⚠️ [Reactivation] getLaunchIntentForPackage($TARGET_PACKAGE_YOUTUBE) tra ve null - " +
-                    "app nay co the CHUA duoc cai dat tren may, hoac ban dang xem YouTube qua trinh " +
-                    "duyet (Chrome...) thay vi app rieng. Xem giai thich chi tiet o docstring phia tren.",
-                isError = true
+                "ℹ️ [Reactivation] $candidatePackage resolve duoc: component=${launchIntent.component} " +
+                    "flags=${launchIntent.flags}"
             )
+            try {
+                startActivity(launchIntent)
+                logBoth("✅ [Reactivation] Da goi startActivity() cho $candidatePackage - chuoi hoan tat.")
+                return
+            } catch (e: Exception) {
+                Log.e(TAG, "[Reactivation] Loi khi startActivity() cho $candidatePackage", e)
+                logBoth(
+                    "❌ [Reactivation] Loi khi mo $candidatePackage: " +
+                        "${e::class.java.simpleName} - ${e.message} - thu candidate ke tiep.",
+                    isError = true
+                )
+            }
         }
+
+        logBoth(
+            "❌ [Reactivation] KHONG mo duoc bat ky candidate nao trong danh sach: $TARGET_APP_CANDIDATES. " +
+                "Chuoi 'Bat lai' se dung o day - Mixer Test van BAT nhung co the van nho tieng vi khong " +
+                "co su kien chuyen foreground THAT nao xay ra.",
+            isError = true
+        )
     }
 
     private fun startMixerTestInternal() {
