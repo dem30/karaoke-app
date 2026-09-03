@@ -15,11 +15,23 @@
      visibility) - getLaunchIntentForPackage()/getPackageInfo() se tra ve
      null/exception voi BAT KY package nao KHONG duoc khai bao o day, DU
      package do co cai that su tren may. Day la ly do returnToSourceApp()
-     luon that bai voi "com.google.android.youtube" du user xac nhan co cai
-     YouTube that. Khai bao ro tung package can nhin thay (khong dung
-     QUERY_ALL_PACKAGES - can xin phep dac biet tu Google Play, kho duoc
-     duyet cho use-case nay). -->
+     luon that bai.
+
+     ⚠️ QUAN TRONG: PHAI khai bao CA HAI package trong TARGET_APP_CANDIDATES
+     (xem PlaybackCaptureService.kt), KHONG chi package cuoi cung duoc nhac
+     toi trong log loi. Lan sua truoc CHI khai bao "com.google.android.youtube"
+     (candidate uu tien 2/fallback) ma quen "com.android.chrome" (candidate
+     uu tien 1 - noi video THAT SU dang phat, theo dung ghi chu trong
+     PlaybackCaptureService.kt). Hau qua: Chrome van bi an (query tra ve
+     null), code roi xuong candidate 2 va mo NHAM app YouTube goc (phien
+     rong, khong phat gi) thay vi quay lai tab Chrome dang phat that -> tuong
+     nhu "da nhay sang YouTube" nhung khong co tieng/tieng nho vi do la SAI
+     nguon am thanh. Neu sau nay them candidate moi vao danh sach do (vi du
+     Firefox, Samsung Internet...), PHAI them dong <package> tuong ung o day
+     - thieu 1 candidate nao trong danh sach se lam candidate do bi PackageManager
+     coi nhu "khong ton tai" du may co cai that. -->
 <queries>
+    <package android:name="com.android.chrome" />
     <package android:name="com.google.android.youtube" />
 </queries>
 
