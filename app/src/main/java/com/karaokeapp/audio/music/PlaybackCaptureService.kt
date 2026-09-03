@@ -139,10 +139,22 @@ class PlaybackCaptureService : Service() {
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
 
-        // ✅ MOI: thoi gian cho o moi buoc cua chuoi "Bat lai qua nut noi" -
-        // xem giai thich chi tiet o dau file. Co the can chinh lai sau khi
-        // test thuc te tren thiet bi that.
+        // ✅ MOI: thoi gian cho o buoc 2->3 (bat Mixer Test xong -> mo lai
+        // YouTube) cua chuoi "Bat lai qua nut noi" - xem giai thich chi tiet
+        // o dau file. Co the can chinh lai sau khi test thuc te tren thiet
+        // bi that. (Buoc 1->2, tuc dua MainActivity len foreground -> bat
+        // Mixer Test, KHONG con dung gia tri co dinh nay nua - xem
+        // FALLBACK_TIMEOUT_MS va onResumedCallback trong MainActivity.kt.)
         private const val REACTIVATION_STEP_DELAY_MS = 1000L
+
+        // ✅ MOI: thoi gian cho TOI DA cho tin hieu MainActivity.onResume()
+        // THAT SU chay - neu qua lau khong thay (vi du thiet bi qua cham,
+        // hoac loi khong ro), van tiep tuc chay buoc bat Mixer Test thay vi
+        // treo chuoi vinh vien. Dat cao hon nhieu so voi
+        // REACTIVATION_STEP_DELAY_MS cu (1s) vi day la GIOI HAN TREN cho
+        // truong hop xau nhat, khong phai thoi gian cho binh thuong (binh
+        // thuong callback se toi RAT nhanh, thuong duoi 300-500ms).
+        private const val FALLBACK_TIMEOUT_MS = 3000L
 
         // Package app nhac nguon se tu dong mo lai sau buoc 5 cua chuoi -
         // hardcode YouTube (dung nhat voi use-case chinh). Neu sau nay ho
@@ -225,6 +237,12 @@ class PlaybackCaptureService : Service() {
     private fun cancelPendingReactivation() {
         reactivationRunnable?.let { reactivationHandler.removeCallbacks(it) }
         reactivationRunnable = null
+        // ✅ MOI: don luon callback cho MainActivity.onResume() (neu con dang
+        // treo) - tranh truong hop nguoi dung bam TAT giua chung luc dang
+        // cho, roi sau do TU HO mo lai app vi ly do khac (khong lien quan
+        // chuoi nay) - luc do onResume() se KHONG con vo tinh kich hoat
+        // proceedToStep2() cua 1 chuoi da bi huy tu truoc.
+        MainActivity.onResumedCallback = null
     }
 
     /**
@@ -245,36 +263,75 @@ class PlaybackCaptureService : Service() {
     }
 
     /**
-     * ✅ MOI: buoc 1/5 cua chuoi "Bat lai qua nut noi" - dua MainActivity len
-     * foreground bang Intent thuong (KHONG tao Activity/task moi, dung lai
-     * chinh MainActivity da khai bao san trong Manifest voi ACTION_MAIN/
-     * LAUNCHER) - tranh dung toi vong doi MediaProjection dang song trong
-     * chinh Service nay.
+     * ✅ SUA (fix "doan gio co dinh 1s cho buoc 1 la KHONG DU - MainActivity
+     * chua thuc su len foreground da bat Mixer Test roi"): buoc 1/3 cua
+     * chuoi "Bat lai qua nut noi" - dua MainActivity len foreground bang
+     * Intent thuong (KHONG tao Activity/task moi, dung lai chinh MainActivity
+     * da khai bao san trong Manifest voi ACTION_MAIN/LAUNCHER) - tranh dung
+     * toi vong doi MediaProjection dang song trong chinh Service nay.
+     *
+     * KHAC bien truoc: KHONG con doan gio co dinh cho buoc nay nua - thay
+     * vao do, gan MainActivity.onResumedCallback TRUOC khi goi startActivity(),
+     * roi CHO THAT SU callback nay duoc goi (tuc onResume() cua MainActivity
+     * da THAT SU chay, Activity da o trang thai foreground/resumed that su) -
+     * xem giai thich chi tiet trong MainActivity.kt (companion object). Day
+     * moi la dieu kien CAN chinh xac, thay vi doan mo 1 khoang thoi gian co
+     * dinh (startActivity() tu Service KHONG dam bao Activity len foreground
+     * trong bat ky khoang thoi gian co dinh nao, tuy thiet bi/tai he thong).
+     *
+     * Them 1 lop AN TOAN: neu callback KHONG BAO GIO duoc goi (vi du
+     * MainActivity bi loi khong len duoc, hoac he thong tre bat thuong),
+     * dat 1 fallback timeout FALLBACK_TIMEOUT_MS - qua thoi gian nay ma
+     * callback van chua toi, VAN tiep tuc chay buoc 2 (bat Mixer Test) thay
+     * vi treo chuoi vinh vien.
      */
     private fun beginOverlayReactivationSequence() {
         cancelPendingReactivation()
+
+        var alreadyProceeded = false
+
+        val proceedToStep2: () -> Unit = {
+            if (!alreadyProceeded) {
+                alreadyProceeded = true
+                cancelPendingReactivation() // huy fallback timeout con lai (neu co)
+                startMixerTestInternal()
+                logBoth("✅ [Reactivation] Da bat Mixer Test that - cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube.")
+
+                val step3 = Runnable { returnToSourceApp() }
+                reactivationRunnable = step3
+                reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+            }
+        }
+
+        // ✅ Gan callback TRUOC khi goi startActivity() - tranh race condition
+        // (truong hop onResume() chay qua nhanh, TRUOC ca khi kip gan xong).
+        MainActivity.onResumedCallback = {
+            logBoth("✅ [Reactivation] MainActivity.onResume() THAT SU da chay - tiep tuc bat Mixer Test ngay.")
+            // onResumedCallback duoc goi tren main thread (tu onResume()) -
+            // proceedToStep2 lai dong bo, an toan de goi truc tiep o day.
+            proceedToStep2()
+        }
+
+        // ✅ Fallback timeout - phong truong hop callback khong bao gio toi.
+        val fallback = Runnable {
+            logBoth("⚠️ [Reactivation] Khong nhan duoc tin hieu onResume() sau ${FALLBACK_TIMEOUT_MS}ms - tiep tuc bat Mixer Test du sao (fallback).", isError = true)
+            MainActivity.onResumedCallback = null
+            proceedToStep2()
+        }
+        reactivationRunnable = fallback
+        reactivationHandler.postDelayed(fallback, FALLBACK_TIMEOUT_MS)
 
         val activityIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         }
         try {
             startActivity(activityIntent)
-            logBoth("✅ [Reactivation] Da dua MainActivity len foreground - cho ${REACTIVATION_STEP_DELAY_MS}ms roi bat Mixer Test that.")
+            logBoth("✅ [Reactivation] Da goi startActivity() dua MainActivity len foreground - dang cho tin hieu onResume() that.")
         } catch (e: Exception) {
             logBoth("❌ [Reactivation] Loi khi dua MainActivity len foreground: ${e.message}", isError = true)
-            return
+            cancelPendingReactivation()
+            MainActivity.onResumedCallback = null
         }
-
-        val step2 = Runnable {
-            startMixerTestInternal()
-            logBoth("✅ [Reactivation] Da bat Mixer Test that - cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube.")
-
-            val step3 = Runnable { returnToSourceApp() }
-            reactivationRunnable = step3
-            reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
-        }
-        reactivationRunnable = step2
-        reactivationHandler.postDelayed(step2, REACTIVATION_STEP_DELAY_MS)
     }
 
     /** ✅ MOI: buoc cuoi cua chuoi - tu mo lai app nhac nguon (YouTube). */

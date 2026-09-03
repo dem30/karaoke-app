@@ -61,6 +61,20 @@ import com.karaokeapp.audio.output.OutputRouter
  */
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        // ✅ MOI (fix "chuoi Bat lai qua nut noi doan gio co dinh 1s la KHONG
+        // du, vi startActivity() tu Service khong dam bao Activity da THAT
+        // SU len foreground trong khoang do"): callback tuy chon, duoc
+        // PlaybackCaptureService gan truoc khi goi startActivity() dua
+        // MainActivity len - se duoc goi CHINH XAC luc onResume() THAT SU
+        // chay (tuc Activity da o trang thai foreground/resumed that), thay
+        // vi Service phai doan mo 1 khoang thoi gian co dinh. Dùng bien
+        // static don gian (khong LiveData/Flow) vi chi co 1 Activity + 1
+        // Service trong cung process, giong tinh than CaptureLogBus.
+        @Volatile
+        var onResumedCallback: (() -> Unit)? = null
+    }
+
     private lateinit var statusText: TextView
     private lateinit var logText: TextView
     private lateinit var logScrollView: ScrollView
@@ -430,6 +444,17 @@ class MainActivity : AppCompatActivity() {
             mixerTestRunning = actuallyRunning
             mixerTestButtonRef?.text = if (mixerTestRunning) "Tat Mixer Test" else "Bat Mixer Test"
             CaptureLogBus.log("[Activity] Da dong bo lai trang thai Mixer Test tu Service: dangChay=$actuallyRunning")
+        }
+
+        // ✅ MOI: bao hieu cho PlaybackCaptureService biet Activity nay VUA
+        // THAT SU len foreground/resumed - xem giai thich chi tiet o khai
+        // bao onResumedCallback trong companion object. Doc gia tri xong roi
+        // GAN LAI null NGAY (khong dung callback nay cho nhung lan onResume()
+        // binh thuong khac, vi du nguoi dung tu mo lai app - chi co tac dung
+        // 1 LAN cho dung lan Service dang cho).
+        onResumedCallback?.let { callback ->
+            onResumedCallback = null
+            callback.invoke()
         }
     }
 
