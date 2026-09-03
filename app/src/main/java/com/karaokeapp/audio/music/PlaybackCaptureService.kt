@@ -156,6 +156,24 @@ class PlaybackCaptureService : Service() {
         // thuong callback se toi RAT nhanh, thuong duoi 300-500ms).
         private const val FALLBACK_TIMEOUT_MS = 3000L
 
+        // ✅ MOI (thu nghiem fix "bat xong nhung van im lang, phai tu tay
+        // tat/bat lai moi co tieng"): onResume() cua MainActivity CHI la tin
+        // hieu o TANG UI/lifecycle rang Activity da resumed - no KHONG dam
+        // bao tang AudioPolicy/AudioFlinger cua he thong da xu ly XONG viec
+        // danh gia lai "app nao dang la foreground" tai chinh xac thoi diem
+        // do (2 tang nay hoat dong doc lap, khong dong bo cung nhau). Da
+        // quan sat thuc te: startMixerTestInternal() chay ngay sau tin hieu
+        // onResume() (0ms doi them) doi luc "thanh cong" (khong loi, log
+        // dung thu tu) nhung VAN im lang, trong khi lam lai y het thao tac
+        // do THU CONG (co khoang nghi tu nhien giua cac buoc) lai luon hieu
+        // qua. Them 1 khoang dem NHO sau khi co tin hieu onResume() that (ca
+        // 2 duong: callback that VA fallback timeout) truoc khi thuc su goi
+        // startMixerTestInternal(), de tang co them chut thoi gian "on dinh"
+        // truoc khi mixer bat dau day am thanh ra. Gia tri ban dau chon thu
+        // nghiem - co the can chinh lai (tang/giam) sau khi test tren thiet
+        // bi that.
+        private const val AUDIO_FOREGROUND_SETTLE_DELAY_MS = 500L
+
         // Package app nhac nguon se tu dong mo lai sau buoc 5 cua chuoi -
         // hardcode YouTube (dung nhat voi use-case chinh). Neu sau nay ho
         // tro nhieu nguon nhac khac nhau, can doi thanh doc dong tu cau hinh
@@ -294,12 +312,25 @@ class PlaybackCaptureService : Service() {
             if (!alreadyProceeded) {
                 alreadyProceeded = true
                 cancelPendingReactivation() // huy fallback timeout con lai (neu co)
-                startMixerTestInternal()
-                logBoth("✅ [Reactivation] Da bat Mixer Test that - cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube.")
 
-                val step3 = Runnable { returnToSourceApp() }
-                reactivationRunnable = step3
-                reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+                logBoth(
+                    "⏳ [Reactivation] Da co tin hieu onResume() (hoac fallback) - " +
+                        "doi them ${AUDIO_FOREGROUND_SETTLE_DELAY_MS}ms de tang AudioPolicy/AudioFlinger " +
+                        "kip xu ly xong viec chuyen foreground truoc khi bat Mixer Test."
+                )
+                val settleRunnable = Runnable {
+                    startMixerTestInternal()
+                    logBoth(
+                        "✅ [Reactivation] Da bat Mixer Test that (sau khi dem ${AUDIO_FOREGROUND_SETTLE_DELAY_MS}ms) - " +
+                            "cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube."
+                    )
+
+                    val step3 = Runnable { returnToSourceApp() }
+                    reactivationRunnable = step3
+                    reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+                }
+                reactivationRunnable = settleRunnable
+                reactivationHandler.postDelayed(settleRunnable, AUDIO_FOREGROUND_SETTLE_DELAY_MS)
             }
         }
 
@@ -423,6 +454,14 @@ class PlaybackCaptureService : Service() {
         mixerToggleOverlay?.show(initiallyRunning = true)
         mixerTestActive = true
 
+        // ✅ MOI (fix "nut trong app hien sai/cu, phai roi app roi quay lai
+        // moi thay dung"): bao ngay cho MainActivity biet trang thai VUA
+        // doi - KHONG doi den lan onResume() ke tiep, vi luong nay co the
+        // duoc kich hoat tu nut noi trong luc Activity dang o nen (dang xem
+        // YouTube), co the khong bao gio onResume() lai neu nguoi dung
+        // khong chu dong quay ve app.
+        MainActivity.refreshMixerTestButtonState(true)
+
         logBoth("✅ Da bat dau Mixer Test (Phase 3).")
     }
 
@@ -434,6 +473,10 @@ class PlaybackCaptureService : Service() {
 
         mixerToggleOverlay?.updateState(isRunning = false)
         mixerTestActive = false
+
+        // ✅ MOI: xem giai thich chi tiet o cuoi startMixerTestInternal() -
+        // dong bo ngay lap tuc, khong doi onResume().
+        MainActivity.refreshMixerTestButtonState(false)
 
         focusObserverRequest?.let {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager

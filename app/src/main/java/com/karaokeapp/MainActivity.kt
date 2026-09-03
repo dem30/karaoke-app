@@ -73,6 +73,46 @@ class MainActivity : AppCompatActivity() {
         // Service trong cung process, giong tinh than CaptureLogBus.
         @Volatile
         var onResumedCallback: (() -> Unit)? = null
+
+        // ✅ MOI (fix "nut trong app hien sai trang thai vinh vien sau khi
+        // chuoi tu dong bat/tat Mixer Test tu nut noi chay xong"): truoc day
+        // MainActivity CHI dong bo lai chu cua nut trong onResume() - nhung
+        // tu khi co chuoi "Bat lai qua nut noi" (PlaybackCaptureService),
+        // mixerTestActive co the doi trang thai NGAY TRONG LUC Activity nay
+        // dang o foreground/resumed (khong co onResume() moi nao xay ra nua
+        // de kich hoat dong bo), dan den nut bi "lech" so voi trang thai
+        // thuc te cho toi khi nguoi dung roi app roi quay lai lan nua.
+        //
+        // Dung WeakReference (KHONG giu tham chieu manh truc tiep toi
+        // Activity) de Service co the goi refreshMixerTestButtonState() bat
+        // ky luc nao ma khong lam leak Activity neu no da bi huy (xoay man
+        // hinh, nguoi dung thoat app...) - luc do activityRef.get() se tra
+        // null va ham nay tu bo qua an toan.
+        @Volatile
+        private var activityRef: java.lang.ref.WeakReference<MainActivity>? = null
+
+        /**
+         * ✅ MOI: goi tu PlaybackCaptureService moi lan mixerTestActive THAT
+         * SU doi trang thai (bat hoac tat) - bat ke nguyen nhan tu dau (nut
+         * trong app, nut noi tren man hinh, hay chuoi tu dong "Bat lai") -
+         * de cap nhat lai chu cua nut trong app NGAY LAP TUC neu Activity
+         * dang con song, thay vi doi den lan onResume() ke tiep (co the
+         * khong bao gio xay ra neu nguoi dung khong tu quay lai app trong
+         * luc dang xem YouTube).
+         */
+        fun refreshMixerTestButtonState(isRunning: Boolean) {
+            val activity = activityRef?.get() ?: return
+            activity.runOnUiThread {
+                if (activity.mixerTestRunning != isRunning) {
+                    activity.mixerTestRunning = isRunning
+                    activity.mixerTestButtonRef?.text = if (isRunning) "Tat Mixer Test" else "Bat Mixer Test"
+                    CaptureLogBus.log(
+                        "[Activity] 🔄 Da dong bo lai trang thai Mixer Test NGAY LAP TUC " +
+                            "(khong doi onResume): dangChay=$isRunning"
+                    )
+                }
+            }
+        }
     }
 
     private lateinit var statusText: TextView
@@ -270,6 +310,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ✅ MOI: dang ky instance nay vao WeakReference tinh (companion) -
+        // de PlaybackCaptureService co the goi refreshMixerTestButtonState()
+        // cap nhat UI nut Mixer Test NGAY LAP TUC bat ky luc nao, khong chi
+        // doi den onResume() ke tiep. Gan lai moi lan onCreate() (ke ca khi
+        // Activity bi tao lai do xoay man hinh) de luon tro toi instance
+        // DANG SONG hien tai.
+        activityRef = java.lang.ref.WeakReference(this)
 
         statusText = TextView(this).apply {
             text = "Karaoke App - Phase 1: AudioPlaybackCapture test"
@@ -623,6 +671,16 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // ✅ MOI: chi xoa activityRef neu no VAN DANG tro toi CHINH instance
+        // nay - tranh truong hop hiem gap (onCreate() cua instance MOI da
+        // chay va gan lai activityRef TRUOC KHI onDestroy() cua instance CU
+        // kip chay xong, vi du xoay man hinh) vo tinh xoa mat tham chieu toi
+        // instance moi dang song.
+        if (activityRef?.get() === this) {
+            activityRef = null
+        }
+
         // ✅ Don dep mic loopback neu Activity bi huy trong luc dang bat -
         // day la test thu cong, khong can chay nen nhu PlaybackCaptureService.
         micInput?.stopCapture()
