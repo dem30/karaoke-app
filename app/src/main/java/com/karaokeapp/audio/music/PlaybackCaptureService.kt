@@ -12,11 +12,13 @@ import android.media.AudioManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.karaokeapp.NudgeTransitionActivity
+import com.karaokeapp.MainActivity
 import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
@@ -35,7 +37,7 @@ import java.util.Locale
 /**
  * Foreground service quan ly toan bo pipeline: capture nhac (Phase 1),
  * Mixer Test (Music + Mic -> LowLatencyMixer -> OutputRouter, Phase 3),
- * va co che tu phuc hoi am luong (AutoReassert + Nudge/Recreate).
+ * va co che tu phuc hoi am luong khi bat lai Mixer Test.
  *
  * Co che mute STREAM_MUSIC + phat mixer qua STREAM_SYSTEM (usage
  * ASSISTANCE_SONIFICATION) da duoc xac nhan qua test thuc te: capture tap
@@ -43,10 +45,31 @@ import java.util.Locale
  *
  * volumeGuardJob (~300ms/lan) chi xu ly duoc muc "index"/"mute-flag" ma
  * AudioManager bao cao - KHONG xu ly duoc "duck" noi bo o tang HAL/OEM (gain
- * giam nhung index/mute-flag van bao binh thuong). Duck chi duoc xoa bang
- * cach tao lai AudioTrack (OutputRouter.recreate()) SAU KHI da co 1 su kien
- * chuyen foreground/audio-focus THAT xay ra - xem NudgeTransitionActivity.kt
- * va ACTION_MANUAL_NUDGE_RECREATE.
+ * giam nhung index/mute-flag van bao binh thuong). Duck CHI duoc xoa khi co
+ * 1 su kien chuyen foreground THAT xay ra (da xac nhan qua test thuc te:
+ * roi YouTube - vi du ve app karaoke - roi quay lai, moi cuu duoc am luong;
+ * cac bien phap "gia lap" tu Service dang chay nen - beep, recreate() goi
+ * truc tiep - deu KHONG du).
+ *
+ * ✅ MOI (quy trinh "Bat lai Mixer Test qua nut noi"): khi nguoi dung bam nut
+ * noi de BAT LAI (dang o trang thai TAT, tuc ho da tu bam TAT truoc do vi ly
+ * do rieng - nghe dien thoai, tam dung...), thay vi bat Mixer Test NGAY TAI
+ * CHO (van dang dung trong YouTube - KHONG tao ra duoc su kien chuyen
+ * foreground that, dan den am luong khong on dinh nhu da quan sat), Service
+ * se chay 1 chuoi TU DONG:
+ *   1. Dua MainActivity len foreground (FLAG_ACTIVITY_REORDER_TO_FRONT -
+ *      dung Activity DA TON TAI san trong task, KHONG tao Activity/task moi,
+ *      tranh dung toi vong doi cua MediaProjection dang song trong Service
+ *      nay - bai hoc rut ra tu lan thu truoc voi 1 Activity rieng biet gay
+ *      dut MediaProjection).
+ *   2. Doi ~1 giay (nguoi dung THAT SU thay giao dien MainActivity, day la
+ *      su kien chuyen foreground CAN THIET).
+ *   3. Goi startMixerTestInternal() that su.
+ *   4. Doi ~1 giay.
+ *   5. Tu mo lai YouTube (FLAG_ACTIVITY_REORDER_TO_FRONT).
+ * Nut BAM DE TAT (dang o trang thai BAT) van GIU NGUYEN hanh vi don gian,
+ * tuc thi nhu truoc gio - KHONG doi gi ca, vi nguoi dung co the dang can
+ * tat gap (nghe dien thoai...).
  */
 class PlaybackCaptureService : Service() {
 
@@ -64,6 +87,13 @@ class PlaybackCaptureService : Service() {
 
     private var focusObserverRequest: android.media.AudioFocusRequest? = null
 
+    // ✅ MOI: dung de huy chuoi "Bat lai qua nut noi" dang cho dang delay
+    // (postDelayed) neu nguoi dung bam TAT giua chung luc chuoi dang chay -
+    // tranh chuoi cu (dang cho) tiep tuc chay ngam va tu y bat lai Mixer Test
+    // sau khi nguoi dung da chu dong tat.
+    private val reactivationHandler = Handler(Looper.getMainLooper())
+    private var reactivationRunnable: Runnable? = null
+
     private val focusObserverListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         val label = when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> "AUDIOFOCUS_GAIN"
@@ -72,7 +102,7 @@ class PlaybackCaptureService : Service() {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK"
             else -> "UNKNOWN($focusChange)"
         }
-        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label (chi ghi log - khong tu dong nudge/recreate).")
+        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label (chi ghi log).")
 
         val isLossEvent = focusChange == AudioManager.AUDIOFOCUS_LOSS ||
             focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
@@ -106,15 +136,19 @@ class PlaybackCaptureService : Service() {
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
         const val ACTION_MANUAL_NUDGE = "com.karaokeapp.action.MANUAL_NUDGE"
 
-        // Goi boi NudgeTransitionActivity SAU KHI da that su tao ra 1 su
-        // kien chuyen foreground that (roi khoi YouTube trong choc lat) -
-        // dung recreate() (tao lai AudioTrack) thay vi nudge beep, vi nudge
-        // beep KHONG du de xoa duck khi khong co su kien chuyen foreground
-        // that di kem (da xac nhan qua test thuc te).
-        const val ACTION_MANUAL_NUDGE_RECREATE = "com.karaokeapp.action.MANUAL_NUDGE_RECREATE"
-
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
+
+        // ✅ MOI: thoi gian cho o moi buoc cua chuoi "Bat lai qua nut noi" -
+        // xem giai thich chi tiet o dau file. Co the can chinh lai sau khi
+        // test thuc te tren thiet bi that.
+        private const val REACTIVATION_STEP_DELAY_MS = 1000L
+
+        // Package app nhac nguon se tu dong mo lai sau buoc 5 cua chuoi -
+        // hardcode YouTube (dung nhat voi use-case chinh). Neu sau nay ho
+        // tro nhieu nguon nhac khac nhau, can doi thanh doc dong tu cau hinh
+        // (vi du SongManager) thay vi hang so co dinh.
+        private const val TARGET_PACKAGE_YOUTUBE = "com.google.android.youtube"
 
         @Volatile
         private var capturingActive = false
@@ -173,6 +207,7 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun stopCurrentSessionIfAny() {
+        cancelPendingReactivation()
         stopMixerTestInternal()
         musicInput?.stopCapture()
         musicInput = null
@@ -183,13 +218,85 @@ class PlaybackCaptureService : Service() {
         mixerToggleOverlay = null
     }
 
+    /**
+     * ✅ MOI: huy chuoi "Bat lai qua nut noi" dang cho (neu co) - goi khi
+     * nguoi dung bam TAT giua chung, hoac khi ca phien Phase 1 ket thuc.
+     */
+    private fun cancelPendingReactivation() {
+        reactivationRunnable?.let { reactivationHandler.removeCallbacks(it) }
+        reactivationRunnable = null
+    }
+
+    /**
+     * ✅ SUA: nut noi bam de TAT (dang BAT) - GIU NGUYEN hanh vi tuc thi don
+     * gian nhu truoc gio, KHONG doi gi ca. Nut noi bam de BAT (dang TAT) -
+     * GIO se chay qua chuoi "Bat lai" moi (xem beginOverlayReactivationSequence())
+     * thay vi bat Mixer Test ngay tai cho.
+     */
     private fun toggleMixerTestFromOverlay() {
         if (mixer != null) {
-            logBoth("👆 [OverlayToggle] Dang BAT -> chuyen sang TAT Mixer Test.")
+            logBoth("👆 [OverlayToggle] Dang BAT -> chuyen sang TAT Mixer Test (tuc thi, khong doi).")
+            cancelPendingReactivation()
             stopMixerTestInternal()
         } else {
-            logBoth("👆 [OverlayToggle] Dang TAT -> chuyen sang BAT Mixer Test.")
+            logBoth("👆 [OverlayToggle] Dang TAT -> bat dau chuoi 'Kich hoat lai' (dua app len foreground truoc).")
+            beginOverlayReactivationSequence()
+        }
+    }
+
+    /**
+     * ✅ MOI: buoc 1/5 cua chuoi "Bat lai qua nut noi" - dua MainActivity len
+     * foreground bang Intent thuong (KHONG tao Activity/task moi, dung lai
+     * chinh MainActivity da khai bao san trong Manifest voi ACTION_MAIN/
+     * LAUNCHER) - tranh dung toi vong doi MediaProjection dang song trong
+     * chinh Service nay.
+     */
+    private fun beginOverlayReactivationSequence() {
+        cancelPendingReactivation()
+
+        val activityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+        }
+        try {
+            startActivity(activityIntent)
+            logBoth("✅ [Reactivation] Da dua MainActivity len foreground - cho ${REACTIVATION_STEP_DELAY_MS}ms roi bat Mixer Test that.")
+        } catch (e: Exception) {
+            logBoth("❌ [Reactivation] Loi khi dua MainActivity len foreground: ${e.message}", isError = true)
+            return
+        }
+
+        val step2 = Runnable {
             startMixerTestInternal()
+            logBoth("✅ [Reactivation] Da bat Mixer Test that - cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube.")
+
+            val step3 = Runnable { returnToSourceApp() }
+            reactivationRunnable = step3
+            reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+        }
+        reactivationRunnable = step2
+        reactivationHandler.postDelayed(step2, REACTIVATION_STEP_DELAY_MS)
+    }
+
+    /** ✅ MOI: buoc cuoi cua chuoi - tu mo lai app nhac nguon (YouTube). */
+    private fun returnToSourceApp() {
+        reactivationRunnable = null
+        val launchIntent = try {
+            packageManager.getLaunchIntentForPackage(TARGET_PACKAGE_YOUTUBE)
+        } catch (e: Exception) {
+            logBoth("❌ [Reactivation] Loi khi tim launch intent cho $TARGET_PACKAGE_YOUTUBE: ${e.message}", isError = true)
+            null
+        }
+
+        if (launchIntent != null) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            try {
+                startActivity(launchIntent)
+                logBoth("✅ [Reactivation] Da mo lai $TARGET_PACKAGE_YOUTUBE - chuoi hoan tat.")
+            } catch (e: Exception) {
+                logBoth("❌ [Reactivation] Loi khi mo lai $TARGET_PACKAGE_YOUTUBE: ${e.message}", isError = true)
+            }
+        } else {
+            logBoth("⚠️ [Reactivation] Khong tim thay $TARGET_PACKAGE_YOUTUBE da cai dat.", isError = true)
         }
     }
 
@@ -353,6 +460,7 @@ class PlaybackCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_STOP_MIXER_TEST -> {
+                cancelPendingReactivation()
                 stopMixerTestInternal()
                 return START_NOT_STICKY
             }
@@ -362,15 +470,6 @@ class PlaybackCaptureService : Service() {
                     mixerOutputRouter?.nudgeAudioMixerToClearDuck()
                 } else {
                     logBoth("👆 [ManualNudge] Bam nut nhung Mixer Test dang tat - bo qua.")
-                }
-                return START_NOT_STICKY
-            }
-            ACTION_MANUAL_NUDGE_RECREATE -> {
-                if (mixerOutputRouter != null) {
-                    logBoth("🔄 [ManualNudgeRecreate] Da co su kien chuyen foreground that - goi recreate().")
-                    mixerOutputRouter?.recreate()
-                } else {
-                    logBoth("🔄 [ManualNudgeRecreate] Mixer Test dang tat - bo qua.")
                 }
                 return START_NOT_STICKY
             }
@@ -404,6 +503,7 @@ class PlaybackCaptureService : Service() {
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 logBoth("MediaProjection.onStop() - he thong da thu hoi quyen capture")
+                cancelPendingReactivation()
                 stopMixerTestInternal()
                 musicInput?.stopCapture()
                 musicInput = null
@@ -472,13 +572,13 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun buildNotification(contentText: String): Notification {
-        // Nut nay mo NudgeTransitionActivity (khong goi thang ACTION_MANUAL_NUDGE
-        // nua) - can 1 su kien chuyen foreground THAT de xoa duck khi YouTube
-        // dang la app foreground (xem NudgeTransitionActivity.kt).
-        val nudgePendingIntent = PendingIntent.getActivity(
+        val nudgeIntent = Intent(this, PlaybackCaptureService::class.java).apply {
+            action = ACTION_MANUAL_NUDGE
+        }
+        val nudgePendingIntent = PendingIntent.getService(
             this,
             0,
-            NudgeTransitionActivity.buildLaunchIntent(this),
+            nudgeIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
