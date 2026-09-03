@@ -3,7 +3,6 @@ package com.karaokeapp.audio.music
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -56,17 +55,22 @@ import java.util.Locale
  * do rieng - nghe dien thoai, tam dung...), thay vi bat Mixer Test NGAY TAI
  * CHO (van dang dung trong YouTube - KHONG tao ra duoc su kien chuyen
  * foreground that, dan den am luong khong on dinh nhu da quan sat), Service
- * se chay 1 chuoi TU DONG:
+ * se chay 1 chuoi TU DONG mo phong DUNG THAO TAC TAY da xac nhan hieu qua
+ * (dua app len foreground, TAT, BAT LAI, roi quay ve app nguon) - KHONG chi
+ * goi startMixerTestInternal() 1 lan don gian:
  *   1. Dua MainActivity len foreground (FLAG_ACTIVITY_REORDER_TO_FRONT -
  *      dung Activity DA TON TAI san trong task, KHONG tao Activity/task moi,
  *      tranh dung toi vong doi cua MediaProjection dang song trong Service
  *      nay - bai hoc rut ra tu lan thu truoc voi 1 Activity rieng biet gay
  *      dut MediaProjection).
- *   2. Doi ~1 giay (nguoi dung THAT SU thay giao dien MainActivity, day la
- *      su kien chuyen foreground CAN THIET).
- *   3. Goi startMixerTestInternal() that su.
- *   4. Doi ~1 giay.
- *   5. Tu mo lai YouTube (FLAG_ACTIVITY_REORDER_TO_FRONT).
+ *   2. Cho tin hieu MainActivity.onResume() THAT SU chay (xem
+ *      onResumedCallback), roi doi them AUDIO_FOREGROUND_SETTLE_DELAY_MS de
+ *      tang AudioPolicy/AudioFlinger kip xu ly xong viec chuyen foreground.
+ *   3. Goi stopMixerTestInternal() (buoc "tat" - an toan/idempotent du dang
+ *      thuc su tat hay khong).
+ *   4. Doi OFF_ON_CYCLE_DELAY_MS.
+ *   5. Goi startMixerTestInternal() that su (buoc "bat lai").
+ *   6. Doi REACTIVATION_STEP_DELAY_MS roi tu mo lai app nguon (YouTube).
  * Nut BAM DE TAT (dang o trang thai BAT) van GIU NGUYEN hanh vi don gian,
  * tuc thi nhu truoc gio - KHONG doi gi ca, vi nguoi dung co the dang can
  * tat gap (nghe dien thoai...).
@@ -134,7 +138,6 @@ class PlaybackCaptureService : Service() {
 
         const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
-        const val ACTION_MANUAL_NUDGE = "com.karaokeapp.action.MANUAL_NUDGE"
 
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
@@ -173,6 +176,15 @@ class PlaybackCaptureService : Service() {
         // nghiem - co the can chinh lai (tang/giam) sau khi test tren thiet
         // bi that.
         private const val AUDIO_FOREGROUND_SETTLE_DELAY_MS = 500L
+
+        // ✅ MOI: khoang doi giua buoc "tat" va buoc "bat lai" trong chuoi tu
+        // dong (xem beginOverlayReactivationSequence()) - mo phong dung
+        // khoang nghi tu nhien giua 2 lan bam tay that su (tat, roi bat lai)
+        // ma nguoi dung da xac nhan hieu qua. Neu 2 buoc nay chay qua sat
+        // nhau (0ms) co the khong du thoi gian de he thong xu ly xong buoc
+        // "tat" (giai phong AudioTrack/OutputRouter cu, khoi phuc volume...)
+        // truoc khi buoc "bat" tao lai moi thu tu dau.
+        private const val OFF_ON_CYCLE_DELAY_MS = 400L
 
         // Package app nhac nguon se tu dong mo lai sau buoc 5 cua chuoi -
         // hardcode YouTube (dung nhat voi use-case chinh). Neu sau nay ho
@@ -316,21 +328,38 @@ class PlaybackCaptureService : Service() {
                 logBoth(
                     "⏳ [Reactivation] Da co tin hieu onResume() (hoac fallback) - " +
                         "doi them ${AUDIO_FOREGROUND_SETTLE_DELAY_MS}ms de tang AudioPolicy/AudioFlinger " +
-                        "kip xu ly xong viec chuyen foreground truoc khi bat Mixer Test."
+                        "kip xu ly xong viec chuyen foreground."
                 )
-                val settleRunnable = Runnable {
-                    startMixerTestInternal()
-                    logBoth(
-                        "✅ [Reactivation] Da bat Mixer Test that (sau khi dem ${AUDIO_FOREGROUND_SETTLE_DELAY_MS}ms) - " +
-                            "cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube."
-                    )
 
-                    val step3 = Runnable { returnToSourceApp() }
-                    reactivationRunnable = step3
-                    reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+                // ✅ MOI (mo phong dung quy trinh THU CONG da xac nhan hieu qua:
+                // "tat Mixer Test roi bat lai", KHONG chi bat 1 lan don gian):
+                // buoc nay CHU DONG goi stopMixerTestInternal() TRUOC (an toan
+                // du mixer dang thuc su tat hay khong - ham nay tu kiem tra va
+                // bo qua neu khong co gi de tat), roi MOI goi
+                // startMixerTestInternal() sau 1 khoang doi rieng
+                // (OFF_ON_CYCLE_DELAY_MS) - dung y het 1 lan "tat" roi "bat lai"
+                // that su nhu nguoi dung tu tay bam 2 lan, thay vi chi goi
+                // startMixerTestInternal() 1 lan duy nhat nhu truoc.
+                val offStepRunnable = Runnable {
+                    logBoth("🔁 [Reactivation] Buoc 'tat' (dam bao trang thai sach truoc khi bat lai that su).")
+                    stopMixerTestInternal()
+
+                    val onStepRunnable = Runnable {
+                        logBoth("🔁 [Reactivation] Buoc 'bat lai' - goi startMixerTestInternal() that su.")
+                        startMixerTestInternal()
+                        logBoth(
+                            "✅ [Reactivation] Da bat Mixer Test that - cho ${REACTIVATION_STEP_DELAY_MS}ms roi mo lai YouTube."
+                        )
+
+                        val step3 = Runnable { returnToSourceApp() }
+                        reactivationRunnable = step3
+                        reactivationHandler.postDelayed(step3, REACTIVATION_STEP_DELAY_MS)
+                    }
+                    reactivationRunnable = onStepRunnable
+                    reactivationHandler.postDelayed(onStepRunnable, OFF_ON_CYCLE_DELAY_MS)
                 }
-                reactivationRunnable = settleRunnable
-                reactivationHandler.postDelayed(settleRunnable, AUDIO_FOREGROUND_SETTLE_DELAY_MS)
+                reactivationRunnable = offStepRunnable
+                reactivationHandler.postDelayed(offStepRunnable, AUDIO_FOREGROUND_SETTLE_DELAY_MS)
             }
         }
 
@@ -366,25 +395,71 @@ class PlaybackCaptureService : Service() {
     }
 
     /** ✅ MOI: buoc cuoi cua chuoi - tu mo lai app nhac nguon (YouTube). */
+    /**
+     * ✅ SUA (them log chan doan chi tiet - day la buoc dang bi bao "khong
+     * tu mo lai duoc YouTube"): truoc day chi log msg ngan (${e.message}),
+     * KHONG du de biet chinh xac ly do that su (vi du: null message, hoac
+     * loi xay ra o buoc resolve intent chu khong phai o startActivity()).
+     * GIO log ca class exception + goi Log.e(TAG, msg, e) de stack trace day
+     * du xuat hien trong Logcat (khong hien trong CaptureLogBus vi qua dai),
+     * VA log ro component/package ma launchIntent thuc su tro toi TRUOC khi
+     * goi startActivity(), de doi chieu dung sai voi ky vong.
+     *
+     * ⚠️ LUU Y quan trong can nguoi dung xac nhan: TARGET_PACKAGE_YOUTUBE
+     * dang hardcode la app YouTube GOC (com.google.android.youtube). Neu
+     * thuc te dang xem YouTube QUA TRINH DUYET Chrome (nhu 1 goi y trong
+     * comment cu o MainActivity.kt: "mo YouTube (qua Chrome neu can chay
+     * nen)") thay vi app YouTube rieng, thi:
+     *   - Neu may KHONG cai app YouTube goc -> getLaunchIntentForPackage()
+     *     tra ve null -> se thay log "Khong tim thay ... da cai dat" ben
+     *     duoi, va KHONG co gi duoc mo ca (dung hien tuong dang gap).
+     *   - Neu may CO cai app YouTube goc (du dang xem qua Chrome) -> lenh
+     *     nay se mo NHAM app YouTube goc (man hinh Trang chu cua no, KHONG
+     *     phai tab Chrome dang xem), khong phai "quay lai" that su.
+     * Neu dung 1 trong 2 truong hop tren, can doi TARGET_PACKAGE_YOUTUBE
+     * sang "com.android.chrome" (hoac ghi nho package cua app THUC SU dang
+     * o foreground NGAY TRUOC khi nguoi dung bam nut noi, thay vi hardcode
+     * 1 package co dinh) - noi dung nay CHUA sua trong ban nay vi can biet
+     * chinh xac truong hop nao dang xay ra truoc.
+     */
     private fun returnToSourceApp() {
         reactivationRunnable = null
         val launchIntent = try {
             packageManager.getLaunchIntentForPackage(TARGET_PACKAGE_YOUTUBE)
         } catch (e: Exception) {
-            logBoth("❌ [Reactivation] Loi khi tim launch intent cho $TARGET_PACKAGE_YOUTUBE: ${e.message}", isError = true)
+            Log.e(TAG, "[Reactivation] Loi khi resolve launch intent cho $TARGET_PACKAGE_YOUTUBE", e)
+            logBoth(
+                "❌ [Reactivation] Loi khi tim launch intent cho $TARGET_PACKAGE_YOUTUBE: " +
+                    "${e::class.java.simpleName} - ${e.message}",
+                isError = true
+            )
             null
         }
 
         if (launchIntent != null) {
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            logBoth(
+                "ℹ️ [Reactivation] launchIntent resolve duoc: component=${launchIntent.component} " +
+                    "package=${launchIntent.`package`} flags=${launchIntent.flags}"
+            )
             try {
                 startActivity(launchIntent)
-                logBoth("✅ [Reactivation] Da mo lai $TARGET_PACKAGE_YOUTUBE - chuoi hoan tat.")
+                logBoth("✅ [Reactivation] Da goi startActivity() cho $TARGET_PACKAGE_YOUTUBE - chuoi hoan tat.")
             } catch (e: Exception) {
-                logBoth("❌ [Reactivation] Loi khi mo lai $TARGET_PACKAGE_YOUTUBE: ${e.message}", isError = true)
+                Log.e(TAG, "[Reactivation] Loi khi startActivity() cho $TARGET_PACKAGE_YOUTUBE", e)
+                logBoth(
+                    "❌ [Reactivation] Loi khi mo lai $TARGET_PACKAGE_YOUTUBE: " +
+                        "${e::class.java.simpleName} - ${e.message}",
+                    isError = true
+                )
             }
         } else {
-            logBoth("⚠️ [Reactivation] Khong tim thay $TARGET_PACKAGE_YOUTUBE da cai dat.", isError = true)
+            logBoth(
+                "⚠️ [Reactivation] getLaunchIntentForPackage($TARGET_PACKAGE_YOUTUBE) tra ve null - " +
+                    "app nay co the CHUA duoc cai dat tren may, hoac ban dang xem YouTube qua trinh " +
+                    "duyet (Chrome...) thay vi app rieng. Xem giai thich chi tiet o docstring phia tren.",
+                isError = true
+            )
         }
     }
 
@@ -564,15 +639,6 @@ class PlaybackCaptureService : Service() {
                 stopMixerTestInternal()
                 return START_NOT_STICKY
             }
-            ACTION_MANUAL_NUDGE -> {
-                if (mixerOutputRouter != null) {
-                    logBoth("👆 [ManualNudge] Nguoi dung bam nut 'Kich hoat lai' tren notification.")
-                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
-                } else {
-                    logBoth("👆 [ManualNudge] Bam nut nhung Mixer Test dang tat - bo qua.")
-                }
-                return START_NOT_STICKY
-            }
         }
 
         startForeground(NOTIFICATION_ID, buildNotification("Dang khoi dong..."))
@@ -671,23 +737,23 @@ class PlaybackCaptureService : Service() {
         }
     }
 
+    // ✅ SUA (fix "nut Kich hoat lai tren thong bao khong bam duoc"): bo han
+    // nut nay - da xac nhan qua thuc te khong bam duoc (co the do gioi han
+    // cua notification action tren mot so ROM/Android version, hoac do
+    // PendingIntent.getService() bi OS chan lai khi Service khong dang o
+    // trang thai "gan day co tuong tac"), VA ban than co che nudge (phat 1
+    // AudioTrack am luong 0 de "danh thuc" AudioFlinger) chua bao gio duoc
+    // xac nhan hieu qua thuc su - khac han voi chuoi "Bat lai qua nut noi"
+    // (beginOverlayReactivationSequence()) da xac nhan hieu qua qua thao tac
+    // tay THUC SU (dua app len foreground / tat-bat lai / quay ve app
+    // nguon), gio da duoc tu dong hoa day du va la duong duy nhat con lai.
     private fun buildNotification(contentText: String): Notification {
-        val nudgeIntent = Intent(this, PlaybackCaptureService::class.java).apply {
-            action = ACTION_MANUAL_NUDGE
-        }
-        val nudgePendingIntent = PendingIntent.getService(
-            this,
-            0,
-            nudgeIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Karaoke App - Phase 1")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(0, "🔊 Kích hoạt lại", nudgePendingIntent)
             .build()
     }
 
