@@ -9,6 +9,20 @@
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 <uses-permission android:name="android.permission.VIBRATE"/>
+
+<!-- ✅ MOI (fix returnToSourceApp() tra ve null tren Android 11+): tu API 30,
+     PackageManager AN package khac khoi app minh theo mac dinh (package
+     visibility) - getLaunchIntentForPackage()/getPackageInfo() se tra ve
+     null/exception voi BAT KY package nao KHONG duoc khai bao o day, DU
+     package do co cai that su tren may. Day la ly do returnToSourceApp()
+     luon that bai voi "com.google.android.youtube" du user xac nhan co cai
+     YouTube that. Khai bao ro tung package can nhin thay (khong dung
+     QUERY_ALL_PACKAGES - can xin phep dac biet tu Google Play, kho duoc
+     duyet cho use-case nay). -->
+<queries>
+    <package android:name="com.google.android.youtube" />
+</queries>
+
 <application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true">
 <activity android:name=".MainActivity" android:exported="true">
 <intent-filter>
