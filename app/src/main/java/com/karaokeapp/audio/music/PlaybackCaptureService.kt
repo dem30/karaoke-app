@@ -186,6 +186,29 @@ class PlaybackCaptureService : Service() {
         // truoc khi buoc "bat" tao lai moi thu tu dau.
         private const val OFF_ON_CYCLE_DELAY_MS = 400L
 
+        // ✅ MOI (fix "quay lai YouTube nhung van nho/im" - xac nhan qua log
+        // thuc te ngay 03/09: MusicInput/LowLatencyMixer van bat duoc PCM
+        // BINH THUONG (amplitude ~3500, gan bang truoc luc toggle) NGAY SAU
+        // khi returnToSourceApp() thanh cong - nghia la KHONG phai loi capture/
+        // mix, ma la loi o TANG SAU CUNG (AudioTrack/HAL) - dung LOAI "duck
+        // HAL/OEM an hinh" da duoc ghi chi tiet trong OutputRouter.kt
+        // (recreate()/nudgeAudioMixerToClearDuck()): duck loai nay KHONG hien
+        // qua AudioManager (GuardTick van bao current=15/15, isMuted=false
+        // trong suot qua trinh, nhung am thanh THAT SU phat ra van bi giam).
+        //
+        // Nghi van cu the: buoc 'bat lai' (tao AudioTrack MOI, sach) hien dang
+        // chay TRUOC khi returnToSourceApp() dua YouTube tro lai foreground -
+        // neu CHINH hanh dong dua YouTube (dang la app nguon THAT SU, khac
+        // voi truong hop bam tu 1 app khac) tro lai foreground la thu KICH
+        // HOAT lai duck o tang HAL/OEM, thi AudioTrack MOI vua tao lai bi duck
+        // NGAY SAU DO - va khong con buoc nao don no nua. Them buoc 4: sau khi
+        // returnToSourceApp() thanh cong, doi 1 khoang de he thong on dinh xong
+        // viec chuyen foreground, roi goi nudgeAudioMixerToClearDuck() (KHONG
+        // dung recreate() - da ghi chu trong OutputRouter.kt rang recreate()
+        // tung gay thu hoi ca MediaProjection tren driver Honor, nudge la lua
+        // chon AN TOAN hon da duoc kiem chung).
+        private const val NUDGE_AFTER_RETURN_DELAY_MS = 600L
+
         // ✅ SUA LOI GOC (xac nhan qua log thuc te: getLaunchIntentForPackage
         // ("com.google.android.youtube") tra ve null tren may cua nguoi
         // dung - nghia la app YouTube GOC KHONG duoc cai, nguoi dung dang
@@ -469,6 +492,19 @@ class PlaybackCaptureService : Service() {
             try {
                 startActivity(launchIntent)
                 logBoth("✅ [Reactivation] Da goi startActivity() cho $candidatePackage - chuoi hoan tat.")
+
+                // ✅ MOI: buoc 4 - xem giai thich chi tiet o NUDGE_AFTER_RETURN_DELAY_MS
+                // phia tren. Doi 1 khoang de foreground/AudioPolicy on dinh
+                // xong SAU KHI da quay lai app nguon, roi nudge de don duck
+                // HAL/OEM co the vua bi chinh viec quay lai nay kich hoat lai
+                // - CHI nudge, KHONG recreate() (rui ro thu hoi MediaProjection).
+                val step4 = Runnable {
+                    logBoth("🔔 [Reactivation] Buoc 4 - nudge de don duck HAL/OEM (neu co) sau khi da quay lai app nguon.")
+                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+                }
+                reactivationRunnable = step4
+                reactivationHandler.postDelayed(step4, NUDGE_AFTER_RETURN_DELAY_MS)
+
                 return
             } catch (e: Exception) {
                 Log.e(TAG, "[Reactivation] Loi khi startActivity() cho $candidatePackage", e)
