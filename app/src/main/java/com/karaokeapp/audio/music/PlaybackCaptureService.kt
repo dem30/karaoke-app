@@ -199,14 +199,25 @@ class PlaybackCaptureService : Service() {
         //
         // GIO thay bang 1 DANH SACH candidate, thu lan luot theo thu tu uu
         // tien - dung candidate DAU TIEN resolve duoc launch intent hop le.
-        // Uu tien Chrome truoc (dua tren bang chung tu log + comment cu
-        // trong MainActivity.kt nhac toi "mo YouTube qua Chrome"), sau do
-        // moi toi app YouTube goc (phong truong hop may khac co cai san).
-        // Neu sau nay xac nhan chinh xac trinh duyet/app nao dang dung, co
-        // the rut gon lai danh sach nay cho gon.
+        //
+        // ✅ SUA LOI THU TU (xac nhan truc tiep tu nguoi dung: dang dung APP
+        // YOUTUBE GOC, KHONG dung Chrome de xem): ban truoc xep Chrome len
+        // uu tien 1 dua tren suy doan sai tu comment cu ("bang chung tu
+        // log") - suy doan do dua tren viec getLaunchIntentForPackage(youtube)
+        // tra ve null, nhung nguyen nhan THAT SU cua null do la thieu khai
+        // bao <queries> trong AndroidManifest.xml (Android 11+ package
+        // visibility), KHONG phai vi nguoi dung dang dung Chrome. Sau khi
+        // AndroidManifest.xml da khai bao <queries> cho CA HAI package, neu
+        // Chrome van dung uu tien 1, va Chrome hau nhu LUON duoc cai san tren
+        // moi may (dung de dieu huong link he thong, khong lien quan gi den
+        // viec nguoi dung co dung no de xem YouTube hay khong), thi code se
+        // LUON chon nham Chrome, khong bao gio thu toi YouTube goc nua - day
+        // la loi vua xay ra. Doi lai dung thu tu uu tien theo thuc te nguoi
+        // dung dang dung (YouTube goc), giu Chrome lam fallback cuoi cung
+        // (phong truong hop sau nay nguoi dung doi sang xem qua trinh duyet).
         private val TARGET_APP_CANDIDATES = listOf(
-            "com.android.chrome",           // Chrome - uu tien 1 (bang chung tu log)
-            "com.google.android.youtube"    // App YouTube goc - uu tien 2 (fallback)
+            "com.google.android.youtube",   // App YouTube goc - uu tien 1 (nguoi dung xac nhan dang dung app nay)
+            "com.android.chrome"            // Chrome - uu tien 2 (fallback, phong truong hop doi sang xem qua trinh duyet)
         )
 
         @Volatile
