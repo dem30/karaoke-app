@@ -85,13 +85,16 @@ import com.karaokeapp.audio.music.CaptureLogBus
  * HOAN TOAN thay vi chi "nho xiu" nhu truoc khi co nudge. Noi cach khac:
  * chinh co che dung de chua lai la nguon gay ra trieu chung nang hon.
  *
- * Sua: them 1 CO CHE DEBOUNCE/COOLDOWN ngay TAI DIEM VAO cua ham nay (khong
- * phai o tung noi goi rieng le - vi ham nay hien dang duoc goi tu NHIEU
- * nguon doc lap: periodicNudgeJob dinh ky, selfHealJob khi mat AudioFocus,
- * VA sap toi la nut "Kich hoat lai" thu cong tren notification) - dam bao DU
- * co bao nhieu nguon goi cung luc, khoang cach THAT SU giua 2 lan phat am
- * nudge khong bao gio nho hon MIN_NUDGE_INTERVAL_MS, du cho lop duck cu co
- * du thoi gian nha truoc khi (neu can) chong them lop moi.
+ * ✅ CAP NHAT MOI NHAT (bo cooldown theo yeu cau): ca 2 nguon TU DONG tung
+ * goi ham nay (periodicNudgeJob dinh ky, selfHealJob khi mat AudioFocus) DA
+ * BI GO BO HOAN TOAN (xem PlaybackCaptureService.kt) - nudge GIO CHI con
+ * duoc kich hoat qua 2 nut BAM TAY (nut noi tren man hinh / nut action tren
+ * notification). Vi vay lop cooldown/debounce da GO KHOI ham nay - rui ro
+ * "chong lop duck len chinh no" da mo ta o tren gan nhu khong con xay ra
+ * duoc nua trong dieu kien su dung binh thuong (khoang cach giua 2 lan bam
+ * tay tu nhien da du xa, hiem khi nhanh hon vai tram ms). Neu sau nay quan
+ * sat lai duoc hien tuong tuong tu (vi du nguoi dung bam lien tuc rat
+ * nhanh), day se la noi dau tien can them lai 1 lop bao ve.
  */
 class OutputRouter(
     private val context: Context,
@@ -116,30 +119,12 @@ class OutputRouter(
     var totalFramesWritten: Long = 0
         private set
 
-    // ✅ MOI (fix "nudge lap lai gay mat tieng hoan toan" - xem giai thich
-    // chi tiet o dau file): moc thoi gian (System.currentTimeMillis) cua lan
-    // nudge THAT SU duoc phat GAN NHAT - dung de tinh khoang cach voi lan
-    // goi tiep theo trong nudgeAudioMixerToClearDuck(). Rieng cho tung
-    // instance OutputRouter (moi phien Mixer Test la 1 instance moi, tu
-    // dong reset ve 0 khi bat lai) - dung chu y, KHONG dat trong companion
-    // object, vi khong can/khong nen chia se giua nhieu phien khac nhau.
-    private var lastNudgeAtMs = 0L
-
     companion object {
         private const val TAG = "OutputRouter"
         private const val SAMPLE_RATE = 44100
         private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_STEREO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val NANOS_PER_FRAME = 1_000_000_000L / SAMPLE_RATE
-
-        // ✅ MOI: khoang cach TOI THIEU (ms) giua 2 lan phat am nudge THAT
-        // SU, bat ke ai goi (periodicNudgeJob / selfHealJob / nut thu cong).
-        // 5000ms duoc chon vi lon hon nhieu so voi chu ky nudge dinh ky cu
-        // (1.2-1.5s) da xac nhan gay chong lop duck - du de lop duck cu (du
-        // do chinh nudge truoc gay ra hay do YouTube/OS gay ra) co thoi gian
-        // tu nha truoc khi can, nhung van du nhanh de nguoi dung khong phai
-        // cho lau neu bam nut thu cong luc thuc su can.
-        private const val MIN_NUDGE_INTERVAL_MS = 5000L
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -170,11 +155,6 @@ class OutputRouter(
 
     fun start() {
         totalFramesWritten = 0
-        // ✅ MOI: reset moc cooldown khi bat dau 1 phien output moi - tranh
-        // truong hop instance cu (neu bi tai su dung bat thuong) giu lai moc
-        // thoi gian cua phien truoc, lam tri hoan lan nudge dau tien cua
-        // phien moi mot cach vo ly.
-        lastNudgeAtMs = 0L
         logNativeAudioProperties()
 
         val builder = AudioTrack.Builder()
@@ -324,25 +304,19 @@ class OutputRouter(
      * toi AudioTrack chinh (audioTrack o tren) hay AudioRecord/MediaProjection
      * dang chay o noi khac.
      *
-     * ⚠️ CAP NHAT QUAN TRONG (xem giai thich chi tiet o dau file): ham nay
-     * GIO CO COOLDOWN o dau ham - neu khoang cach voi lan phat nudge THAT SU
-     * gan nhat chua du MIN_NUDGE_INTERVAL_MS, ham se BO QUA (khong tao/phat
-     * AudioTrack nudge nao ca) va chi log lai, thay vi phat chong len lan
-     * truoc. Day la lop bao ve DUY NHAT can thiet - ap dung cho MOI nguon
-     * goi (periodic, self-heal theo AudioFocus, hay nut bam thu cong), nen
-     * chi can dat 1 lan duy nhat ngay tai day.
+     * ✅ CAP NHAT MOI NHAT (bo cooldown theo yeu cau - CHI con nut bam tay
+     * duoc phep goi ham nay): truoc day co 1 lop cooldown MIN_NUDGE_INTERVAL_MS
+     * (5000ms) o dau ham, can thiet vi luc do CO NHIEU nguon TU DONG cung goi
+     * ham nay (periodicNudgeJob moi 1.5s, selfHealJob moi khi mat AudioFocus)
+     * - can chan chong lop duck len chinh no. Cac nhanh tu dong do DA BI GO BO
+     * HOAN TOAN (xem PlaybackCaptureService.kt) - nudge GIO CHI con duoc kich
+     * hoat qua 2 nut BAM TAY (nut noi tren man hinh / nut action tren
+     * notification), tan suat goi hoan toan do TOC DO NGON TAY nguoi dung
+     * quyet dinh, khong con nguy co "vong lap tu goi minh" nua nen KHONG con
+     * can cooldown - moi lan bam la 1 lan phat am THAT SU, khong bi am tham
+     * bo qua nua.
      */
     fun nudgeAudioMixerToClearDuck() {
-        val now = System.currentTimeMillis()
-        val elapsedSinceLastNudge = now - lastNudgeAtMs
-        if (elapsedSinceLastNudge < MIN_NUDGE_INTERVAL_MS) {
-            logBoth(
-                "⏭️ [NudgeMixer] Bo qua - moi chi $elapsedSinceLastNudge ms tu lan nudge truoc " +
-                    "(can toi thieu ${MIN_NUDGE_INTERVAL_MS}ms) - tranh chong lop duck len chinh no."
-            )
-            return
-        }
-
         try {
             // ✅ CAP NHAT (chan doan vong 2 - nudge ban dau khong hieu qua):
             // buffer truoc day dung 1 GIA TRI HANG SO khong doi (vd toan bo
@@ -424,13 +398,6 @@ class OutputRouter(
                 nudgeTrack.release()
                 return
             }
-
-            // ✅ MOI: chi cap nhat moc cooldown NGAY TRUOC luc thuc su play() -
-            // tuc la CHI tinh la "1 lan nudge" khi am thanh chac chan se duoc
-            // phat ra (da qua het cac nhanh loi o tren), tranh truong hop 1
-            // lan goi bi loi som (vd write() that bai) van vo tinh "tieu" mat
-            // 1 khoang cooldown ma khong he co am thanh nao duoc phat.
-            lastNudgeAtMs = now
 
             nudgeTrack.play()
             logBoth(

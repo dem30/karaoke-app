@@ -20,6 +20,7 @@ import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
+import com.karaokeapp.overlay.NudgeOverlayButton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -140,6 +141,15 @@ class PlaybackCaptureService : Service() {
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
 
+    // ✅ MOI (fix "chi song 5 giay roi im, phai thu ung dung xuong moi to
+    // lai" - xem giai thich chi tiet trong NudgeOverlayButton.kt): nut TRON
+    // NOI TREN man hinh, nguoi dung tu bam thu cong bat ky luc nao (ke ca
+    // dang xem YouTube toan man hinh) de kich hoat nudge - phuong an du
+    // phong cuoi cung, dung song song voi periodicNudgeJob/selfHealJob tu
+    // dong (khong thay the). Chi ton tai trong luc Mixer Test dang chay -
+    // tao o startMixerTestInternal(), huy o stopMixerTestInternal().
+    private var nudgeOverlay: NudgeOverlayButton? = null
+
     // ✅ MOI (fix "hu qua loa ngoai/Bluetooth" - vong lap phan hoi am hoc):
     // limiter RIENG ap cho VOCAL TRUOC KHI vao mixer, xem giai thich chi
     // tiet trong Limiter.kt. Day KHONG phai limiter cuoi chuoi cua PLAN.md
@@ -162,45 +172,21 @@ class PlaybackCaptureService : Service() {
     // am thanh voi YouTube.
     private var focusObserverRequest: android.media.AudioFocusRequest? = null
 
-    // ✅ MOI: debounce cho self-heal - tranh goi recreate() lien tuc neu co
-    // nhieu su kien LOSS don don gan nhau (vi du YouTube giai phong + xin
-    // lai focus nhieu lan rat nhanh trong 1 lan chuyen video) - chi thuc su
-    // tao lai AudioTrack SAU KHI da yen ~400ms khong co su kien moi nao.
-    // ⚠️ MOI (chan doan vong 4 - PHAT HIEN QUAN TRONG qua log thuc te): xac
-    // nhan duoc it nhat 1 lan "im lang tieng nho xiu" KEO DAI (nguoi dung
-    // bam hang tram lan seek/doi bai khong tu hoi phuc) ma trong SUOT ca
-    // khoang thoi gian do KHONG CO MOT DONG AUDIOFOCUS_LOSS NAO xuat hien
-    // trong log ca. Nghia la co chế self-heal hien tai (chi kich hoat KHI
-    // nhan duoc AUDIOFOCUS_LOSS qua focusObserverListener) CHUA TUNG DUOC
-    // GOI TOI trong dung luc can no nhat - khong phai vi nudge khong hieu
-    // qua, ma vi nudge chua bao gio chay. Rat co the day la 1 dang "smart
-    // volume"/gain-adaptive rieng cua OEM (Honor), khong di qua API
-    // AudioFocus chuan cua Android nen FocusObserver khong thay duoc.
+    // ✅ MOI (bo het nhanh tu dong theo yeu cau - CHI con nut bam tay duoc
+    // phep kich hoat nudge): truoc day co 2 co che tu dong goi
+    // nudgeAudioMixerToClearDuck() - selfHealJob (kich hoat khi nhan duoc su
+    // kien AudioFocus LOSS) va periodicNudgeJob (bat vo dieu kien dinh ky
+    // 1.5s/lan). Ca 2 DA DUOC GO BO HOAN TOAN khoi day theo yeu cau: nudge
+    // GIO CHI co the duoc kich hoat qua 1 trong 2 duong THU CONG - nut noi
+    // tren man hinh (NudgeOverlayButton) hoac nut action tren notification
+    // (ACTION_MANUAL_NUDGE) - khong con nhanh nao tu dong phat am nua.
     //
-    // Sua (TAM THOI, giai doan chan doan): THAY vi tiep tuc cho tin hieu
-    // trigger dang khong dang tin cay, chuyen sang bat 1 vong lap RIENG bat
-    // nudge DINH KY (khong phu thuoc AudioFocus/amplitude gi ca) trong SUOT
-    // luc Mixer Test dang chay - de xac dinh chac chan buoc con lai: ban
-    // than hanh dong nudge (phat 1 am moi qua AudioTrack usage=NOTIFICATION)
-    // CO thuc su "go" duoc trang thai duck hay khong, tach rieng khoi cau
-    // hoi "khi nao nen kich hoat no". Neu xac nhan hieu qua qua ban dinh ky
-    // nay, buoc tiep theo se di tim 1 tin hieu trigger dang tin cay hon
-    // (hoac chap nhan dung dinh ky lien tuc luon, giam am luong/tan suat
-    // xuong muc khong gay kho chiu).
-    //
-    // ⚠️ CAP NHAT (xem giai thich chi tiet o dau file): DA XAC NHAN ban nudge
-    // dinh ky nay (goi vo dieu kien moi PERIODIC_NUDGE_INTERVAL_MS) chinh la
-    // nguyen nhan gay MAT TIENG HOAN TOAN. Vong lap nay VAN duoc GIU LAI
-    // (van chay dinh ky nhu cu) vi ban than no khong con nguy hiem nua - moi
-    // lan goi deu di qua nudgeAudioMixerToClearDuck() da co cooldown rieng
-    // (xem OutputRouter.kt) nen se TU DONG bi bo qua neu goi qua gan lan
-    // truoc. Giu lai vong lap nay CHI de lam "luoi an toan" du phong (phong
-    // truong hop AudioFocus LOSS khong bao gio toi nhu da ghi nhan o tren),
-    // khong con dua vao no la co che chinh nua - co che chinh gio la nut
-    // "Kich hoat lai" thu cong tren notification (xem ACTION_MANUAL_NUDGE).
-    private var selfHealJob: Job? = null
-
-    private var periodicNudgeJob: Job? = null
+    // focusObserverListener duoc GIU LAI nhung CHI con lam nhiem vu QUAN SAT/
+    // GHI LOG (xin lai focus de khong bi "diec" cho su kien LOSS tiep theo,
+    // xem requestFocusObserver()) - KHONG con goi nudge/recreate() tu dong
+    // nua. Muc dich: van giu duoc du lieu chan doan (biet AudioFocus LOSS co
+    // xay ra hay khong, luc nao) de doi chieu voi thoi diem nguoi dung tu
+    // bam nut thu cong, ma khong tu y phat am nao ca.
 
 
     private val focusObserverListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
@@ -211,55 +197,22 @@ class PlaybackCaptureService : Service() {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK"
             else -> "UNKNOWN($focusChange)"
         }
-        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label")
+        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label (chi ghi log - KHONG tu dong nudge/recreate gi ca).")
 
         val isLossEvent = focusChange == AudioManager.AUDIOFOCUS_LOSS ||
             focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
             focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
 
         if (isLossEvent) {
-            // ✅ 1. Xin lai NGAY de KHONG bi "diec" cho su kien tiep theo -
-            // day la phan sua loi "one-shot" da giai thich o dau file. Chi
-            // xin lai neu Mixer Test van dang chay that su (mixer != null) -
-            // tranh xin lai vo ich neu nguoi dung vua tat Mixer Test dung
-            // luc su kien LOSS nay toi.
+            // ✅ Xin lai NGAY de KHONG bi "diec" cho su kien tiep theo - day la
+            // phan sua loi "one-shot" da giai thich o dau file. Chi xin lai
+            // neu Mixer Test van dang chay that su (mixer != null) - tranh
+            // xin lai vo ich neu nguoi dung vua tat Mixer Test dung luc su
+            // kien LOSS nay toi. CHI xin lai focus (de tiep tuc quan sat/log),
+            // KHONG con lam gi khac o day nua.
             if (mixer != null) {
                 val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 requestFocusObserver(audioManager)
-            }
-
-            // ✅ SUA (thay recreate() - da XAC NHAN qua test thuc te that:
-            // recreate() gay ra bug NANG HON nhieu, ca phien MediaProjection
-            // bi Android thu hoi. Bang chung MOI: nguoi dung xac nhan CHI
-            // CAN 1 thong bao BAT KY (vi du Facebook) toi la nhac tu dong to
-            // lai, KHONG can lam gi - chung minh chi CAN 1 luong am thanh
-            // moi xuat hien la du de AudioFlinger tu tinh lai mix, KHONG can
-            // pha huy/tao lai AudioTrack chinh): debounce ~400ms roi goi
-            // OutputRouter.nudgeAudioMixerToClearDuck() - tu tao ra dung
-            // hieu ung 1 "thong bao gia" (am gan-im-lang, usage=NOTIFICATION)
-            // thay vi pha huy AudioTrack. Xem giai thich chi tiet trong
-            // OutputRouter.kt.
-            selfHealJob?.cancel()
-            selfHealJob = serviceScope.launch {
-                delay(400L)
-                logBoth(
-                    "🩹 [SelfHeal] Kich hoat nudge (mo phong thong bao) sau su kien " +
-                        "mat focus ($label), de xoa moi trang thai duck con sot."
-                )
-                mixerOutputRouter?.nudgeAudioMixerToClearDuck()
-            }
-
-            // ✅ GIU LAI (TAT mac dinh - CHI de tham khao/so sanh neu can):
-            // recreate() da xac nhan gay hai (thu hoi ca phien MediaProjection)
-            // nen KHONG con la duong xu ly chinh nua. ENABLE_SELF_HEAL_RECREATE
-            // gio mac dinh = false; chi bat lai neu can dieu tra sau nay.
-            if (ENABLE_SELF_HEAL_RECREATE) {
-                logBoth("⚠️ [Chan doan] ENABLE_SELF_HEAL_RECREATE=true - GOI THEM recreate() (DA XAC NHAN CO HAI, chi dung de doi chieu/debug).")
-                selfHealJob?.cancel()
-                selfHealJob = serviceScope.launch {
-                    delay(400L)
-                    mixerOutputRouter?.recreate()
-                }
             }
         }
     }
@@ -373,41 +326,12 @@ class PlaybackCaptureService : Service() {
         //   hoan toan khi seek, da xac nhan chac chan.
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
 
-        // ✅ CAP NHAT (da XAC NHAN qua test thuc te that): recreate() la
-        // NGUYEN NHAN gay ra hien tuong NANG HON nhieu so voi "nho tieng"
-        // ban dau - CA PHIEN MediaProjection bi chinh Android thu hoi
-        // (onStop() chay, phai xin quyen lai, Mixer Test tu tat), xay ra
-        // dung luc YouTube seek/doi bai. Da xac nhan bang cach tat co nay:
-        // hien tuong "xin quyen lai" BIEN MAT HOAN TOAN khi
-        // ENABLE_SELF_HEAL_RECREATE=false, xac nhan chinh recreate() (pha
-        // huy + tao AudioTrack moi trong luc AudioRecord/MediaProjection
-        // dang chay song song) lam roi tang HAL am thanh dung chung tren
-        // driver Honor.
-        //
-        // Doi mac dinh sang FALSE (KHONG con la duong xu ly chinh nua) - da
-        // thay bang OutputRouter.nudgeAudioMixerToClearDuck() (phat 1 am
-        // gan-im-lang mo phong "co thong bao toi" - da xac nhan qua test
-        // thuc te that: CHI CAN 1 thong bao bat ky (vi du Facebook) toi la
-        // nhac tu dong to lai, KHONG can pha huy AudioTrack gi ca). Gia tri
-        // true chi con dung de doi chieu/debug neu can so sanh lai sau nay.
-        private const val ENABLE_SELF_HEAL_RECREATE = false
-
-        // ✅ MOI (xem giai thich chi tiet o khai bao periodicNudgeJob phia
-        // tren): tan suat bat nudge dinh ky trong giai doan chan doan nay -
-        // 1.5s/lan la muc du "day" de nhanh chong bat duoc hieu ung trong 1
-        // phien test ngan (vai chuc giay), nhung khong qua day toi muc lam
-        // beep chong lan len nhau lien tuc (durationMs=200 + margin release
-        // 150ms trong OutputRouter, tuc ~350ms/lan - con nhieu khoang trong
-        // giua 2 lan voi chu ky 1500ms).
-        //
-        // ⚠️ LUU Y (xem giai thich chi tiet o dau file): gia tri 1.5s nay
-        // TUNG la nguyen nhan gay mat tieng hoan toan khi con la DUY NHAT
-        // dong duoi phat am nudge that su. Van GIU NGUYEN gia tri nay (KHONG
-        // can tang len) vi bao ve THAT SU gio nam o OutputRouter (cooldown
-        // 5000ms tai nguon) - vong lap 1.5s nay gio chi con y nghia "kiem
-        // tra thuong xuyen xem co can nudge khong", con nudge THAT SU co
-        // duoc phat hay khong da do OutputRouter quyet dinh.
-        private const val PERIODIC_NUDGE_INTERVAL_MS = 1500L
+        // ✅ MOI (bo het nhanh tu dong theo yeu cau): ENABLE_SELF_HEAL_RECREATE
+        // va PERIODIC_NUDGE_INTERVAL_MS DA BI XOA khoi day - khong con
+        // recreate()/nudge nao duoc kich hoat tu dong nua, xem giai thich chi
+        // tiet o khai bao focusObserverListener phia tren. Nudge GIO CHI co
+        // the den tu 2 nguon THU CONG: nut noi (NudgeOverlayButton) hoac nut
+        // action tren notification (ACTION_MANUAL_NUDGE).
 
         @Volatile
         private var capturingActive = false
@@ -602,28 +526,18 @@ class PlaybackCaptureService : Service() {
             }
         }
 
-        // ✅ MOI (chan doan vong 4 - xem giai thich chi tiet o khai bao
-        // periodicNudgeJob): bat vong lap nudge DINH KY, HOAN TOAN DOC LAP
-        // voi focusObserverListener/selfHealJob o tren - CA HAI co che cung
-        // ton tai song song trong giai doan chan doan nay (khong xung dot,
-        // chi la nudgeAudioMixerToClearDuck() co the duoc goi tu 2 nguon).
-        //
-        // ⚠️ Xem giai thich o dau file: vong lap nay TUNG gay mat tieng hoan
-        // toan khi la duong DUY NHAT quyet dinh co phat nudge hay khong. Gio
-        // no chi con la "nguoi de xuat" - OutputRouter.nudgeAudioMixerToClearDuck()
-        // moi la noi QUYET DINH cuoi cung co thuc su phat am hay khong (dua
-        // vao cooldown 5s), nen giu nguyen chu ky 1.5s o day la an toan.
-        periodicNudgeJob = serviceScope.launch {
-            while (isActive) {
-                delay(PERIODIC_NUDGE_INTERVAL_MS)
-                try {
-                    logBoth("🩹 [PeriodicNudge] [CHAN DOAN] De xuat nudge dinh ky (OutputRouter se tu quyet dinh co phat hay khong dua vao cooldown).")
-                    mixerOutputRouter?.nudgeAudioMixerToClearDuck()
-                } catch (e: Exception) {
-                    logBoth("⚠️ [PeriodicNudge] Loi thoang qua (bo qua, thu lai lan sau): ${e.message}")
-                }
-            }
-        }
+        // ✅ MOI (bo het nhanh tu dong theo yeu cau): khong con vong lap
+        // periodicNudgeJob nao ca - nudge CHI con den tu nut bam tay (overlay
+        // hoac notification), xem giai thich chi tiet o khai bao
+        // focusObserverListener phia tren.
+
+        // ✅ MOI (xem giai thich chi tiet o khai bao nudgeOverlay o tren): hien
+        // nut noi thu cong NGAY KHI Mixer Test bat dau chay - se tu bo qua
+        // (khong crash) va chi log canh bao neu chua duoc cap quyen "Hien thi
+        // tren ung dung khac" (nguoi dung can cap tu MainActivity truoc).
+        nudgeOverlay = NudgeOverlayButton(applicationContext) {
+            mixerOutputRouter?.nudgeAudioMixerToClearDuck()
+        }.also { it.show() }
 
         logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
     }
@@ -635,10 +549,15 @@ class PlaybackCaptureService : Service() {
         // dep gi khac.
         volumeGuardJob?.cancel()
         volumeGuardJob = null
-        selfHealJob?.cancel()
-        selfHealJob = null
-        periodicNudgeJob?.cancel()
-        periodicNudgeJob = null
+        // ✅ MOI (bo het nhanh tu dong theo yeu cau): khong con selfHealJob/
+        // periodicNudgeJob nao de huy o day nua.
+
+        // ✅ MOI: an/huy nut noi thu cong cung luc voi cac thanh phan khac cua
+        // Mixer Test - khong de no o lai man hinh sau khi da tat Mixer Test
+        // (luc do mixerOutputRouter=null nen bam vao cung khong con tac dung
+        // gi ca).
+        nudgeOverlay?.hide()
+        nudgeOverlay = null
 
         // ✅ MOI: go dang ky listener quan sat/tu phuc hoi audio focus (xem
         // giai thich o dau file) - khong con can quan sat khi Mixer Test da

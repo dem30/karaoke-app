@@ -21,6 +21,14 @@
          ra duoc - chua xin runtime permission nay o Phase 1 (service van
          chay binh thuong khong co no, chi notification bi an)  -->
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<!-- ✅ MOI (nut noi "Kich hoat lai" - xem NudgeOverlayButton.kt): can de ve
+     duoc 1 View NOI TREN cac app khac (vi du YouTube dang o foreground).
+     Day la 1 "special permission" - KHONG xin duoc qua co che runtime
+     permission thong thuong (ActivityResultContracts.RequestPermission),
+     bat buoc phai dan nguoi dung sang man hinh Settings rieng qua Intent
+     ACTION_MANAGE_OVERLAY_PERMISSION (xem MainActivity.kt,
+     ensureOverlayPermission()). -->
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 <application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true">
 <activity android:name=".MainActivity" android:exported="true">
 <intent-filter>

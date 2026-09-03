@@ -10,8 +10,10 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.text.method.ScrollingMovementMethod
 import android.widget.Button
 import android.widget.LinearLayout
@@ -44,6 +46,18 @@ import com.karaokeapp.audio.output.OutputRouter
  * khong chay (vi du: nguoi dung tu choi quyen luc dau, hoac quay lai app
  * sau khi service da bi OS kill va muon thu lai ma khong can khoi dong lai
  * app).
+ *
+ * ✅ MOI (fix "Mixer Test chi song ~5 giay roi im, phai thu app xuong moi to
+ * lai" - xem giai thich chi tiet trong NudgeOverlayButton.kt): them flow xin
+ * quyen "Hien thi tren ung dung khac" (SYSTEM_ALERT_WINDOW) - can de
+ * PlaybackCaptureService co the hien nut noi "🔊 Kich hoat lai" DE TREN
+ * YouTube trong luc Mixer Test dang chay. Day la 1 "special permission" cua
+ * Android, KHONG xin duoc qua ActivityResultContracts.RequestPermission()
+ * thong thuong nhu RECORD_AUDIO - bat buoc phai dan nguoi dung sang 1 man
+ * hinh Settings rieng (Settings.ACTION_MANAGE_OVERLAY_PERMISSION) de ho tu
+ * bat cong tac thu cong, roi tu quay lai app (khong co callback "granted"
+ * truc tiep nhu request thuong - phai tu kiem tra lai Settings.canDrawOverlays()
+ * sau khi quay lai).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -186,6 +200,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ✅ MOI (xem giai thich chi tiet o dau file/NudgeOverlayButton.kt): quyen
+    // SYSTEM_ALERT_WINDOW KHONG co callback "granted=true/false" truc tiep nhu
+    // RequestPermission() thong thuong - Settings.ACTION_MANAGE_OVERLAY_PERMISSION
+    // chi mo 1 man hinh Settings, dong lai roi tra ve KHONG kem ket qua dang tin
+    // cay. Cach dung duoc khuyen nghi chinh thuc: dung StartActivityForResult
+    // chi de biet "nguoi dung da quay lai app", roi TU kiem tra lai
+    // Settings.canDrawOverlays(this) tai thoi diem do de biet ket qua that su.
+    private val overlayPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val granted = Settings.canDrawOverlays(this)
+        CaptureLogBus.log("[Activity] Ket qua sau khi quay lai tu man hinh cap quyen overlay: granted=$granted")
+        if (granted) {
+            Toast.makeText(this, "Da co quyen hien thi noi - bam 'Bat Mixer Test' de tiep tuc", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(
+                this,
+                "Chua cap quyen - nut 'Kich hoat lai' se khong hien khi bat Mixer Test",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /**
+     * ✅ MOI: kiem tra quyen SYSTEM_ALERT_WINDOW - neu chua co, dan nguoi dung
+     * sang man hinh Settings de tu bat (co gan san package cua app qua Uri
+     * "package:..." de Settings mo dung trang cua app nay, khong phai trang
+     * danh sach chung chung). Tra ve true/false NGAY LAP TUC (dua vao trang
+     * thai HIEN TAI) de goi noi dung dung - lan dau goi thuong se tra false va
+     * mo Settings, nguoi dung can bam lai nut sau khi cap quyen xong.
+     */
+    private fun ensureOverlayPermission(): Boolean {
+        if (Settings.canDrawOverlays(this)) return true
+        CaptureLogBus.log("[Activity] Chua co quyen 'Hien thi tren ung dung khac' - mo man hinh Settings de xin.")
+        Toast.makeText(
+            this,
+            "Can cap quyen 'Hien thi tren ung dung khac' de dung nut noi 'Kich hoat lai' - bam lai 'Bat Mixer Test' sau khi cap xong",
+            Toast.LENGTH_LONG
+        ).show()
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        overlayPermissionLauncher.launch(intent)
+        return false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -248,6 +309,24 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { cycleUsageCandidate(this) }
         }
 
+        // ✅ MOI (xem giai thich chi tiet o dau file): nut xin quyen "Hien thi
+        // tren ung dung khac" - can cho nut noi "Kich hoat lai" cua Mixer Test
+        // (NudgeOverlayButton.kt). Doi ten nut theo trang thai hien tai moi lan
+        // onCreate() chay, de nguoi dung biet ngay khong can bam neu da cap roi.
+        val overlayPermissionButton = Button(this).apply {
+            text = if (Settings.canDrawOverlays(this@MainActivity)) {
+                "✅ Da co quyen hien thi noi"
+            } else {
+                "Cap quyen hien thi noi (cho nut Kich hoat lai)"
+            }
+            setOnClickListener {
+                if (ensureOverlayPermission()) {
+                    text = "✅ Da co quyen hien thi noi"
+                    Toast.makeText(this@MainActivity, "Da co quyen hien thi noi roi", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(retryButton)
@@ -265,6 +344,14 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             addView(muteTestButton)
             addView(usageSelectButton)
+        }
+
+        // ✅ MOI: hang nut rieng cho quyen overlay - de tach biet ro rang voi
+        // cac nut thu nghiem khac, tranh nguoi dung nham lan day chi la 1 test
+        // nua trong so nhieu nut chan doan.
+        val buttonRow4 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(overlayPermissionButton)
         }
 
         logText = TextView(this).apply {
@@ -287,6 +374,7 @@ class MainActivity : AppCompatActivity() {
             addView(buttonRow)
             addView(buttonRow2)
             addView(buttonRow3)
+            addView(buttonRow4)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -539,6 +627,20 @@ class MainActivity : AppCompatActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             Toast.makeText(this, "Can quyen RECORD_AUDIO", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // ✅ MOI (xem giai thich chi tiet o dau file): CHI kiem tra quyen
+        // overlay khi dang BAT mixer test (giong het cach kiem tra
+        // RECORD_AUDIO o tren) - khong chan luc TAT. Neu chua co quyen,
+        // ensureOverlayPermission() se tu mo man hinh Settings VA return
+        // false - dung lai o day, KHONG gui Intent bat Mixer Test, de
+        // nguoi dung cap quyen xong roi tu bam lai nut nay 1 lan nua (luc do
+        // Settings.canDrawOverlays() da tra true, se di tiep binh thuong).
+        // Mixer Test VAN chay duoc du chua co quyen nay (chi la se khong co
+        // nut noi "Kich hoat lai" tren man hinh) - nhung nen nhac nguoi dung
+        // cap truoc de trai nghiem day du dung nhu thiet ke.
+        if (!mixerTestRunning && !ensureOverlayPermission()) {
             return
         }
 
