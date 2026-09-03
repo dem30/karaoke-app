@@ -16,6 +16,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.karaokeapp.NudgeTransitionActivity
 import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
@@ -32,101 +33,20 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 /**
- * Foreground service bat buoc de dung MediaProjection cho AudioPlaybackCapture.
+ * Foreground service quan ly toan bo pipeline: capture nhac (Phase 1),
+ * Mixer Test (Music + Mic -> LowLatencyMixer -> OutputRouter, Phase 3),
+ * va co che tu phuc hoi am luong (AutoReassert + Nudge/Recreate).
  *
- * ✅ CAP NHAT (Phase 3): them kha nang bat/tat "mixer test" - chay them
- * MicInput + LowLatencyMixer + OutputRouter NGAY TRONG service nay (khong
- * phai trong Activity nhu Mic Loopback rieng le cua Phase 2), vi day moi la
- * kien truc dung voi muc tieu cuoi: toan bo pipeline xu ly am thanh song
- * ben vung trong foreground service, khong phu thuoc Activity con song hay
- * khong - dung tinh than da xac lap tu Phase 1 (WakeLock + onTaskRemoved).
+ * Co che mute STREAM_MUSIC + phat mixer qua STREAM_SYSTEM (usage
+ * ASSISTANCE_SONIFICATION) da duoc xac nhan qua test thuc te: capture tap
+ * PCM TRUOC buoc ap volume he thong nen mute khong lam mat tin hieu capture.
  *
- * ✅ CAP NHAT (Phase 3 - production, thay the nut "Test Mute STREAM_MUSIC" +
- * "Usage test" thu cong o MainActivity bang co che TU DONG): khi bat Mixer
- * Test, service se:
- *   1. Tu mute STREAM_MUSIC - da xac nhan qua test thu cong truoc do rang
- *      AudioPlaybackCapture bat tin hieu TRUOC buoc ap volume he thong, nen
- *      mute STREAM_MUSIC KHONG lam mat tin hieu MusicInput, chi lam YouTube
- *      het tu phat truc tiep ra loa (tranh nghe DOI: vua YouTube goc vua
- *      mixer).
- *   2. Phat mixer qua usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) thay vi
- *      USAGE_MEDIA mac dinh - vi STREAM_SYSTEM doc lap voi STREAM_MUSIC vua
- *      mute o buoc 1 nen mixer khong bi im theo. Da test A/B qua Mic
- *      Loopback (MainActivity): latency ngang MEDIA (~296-300ms ca 2), an
- *      toan hon USAGE_VOICE_COMMUNICATION (khong co rui ro bi ep sang
- *      Bluetooth SCO mono) va tot hon USAGE_ALARM (latency cao hon ~100ms +
- *      co dau hieu de hu/feedback vi STREAM_ALARM luon o muc max).
- *   3. Tam day STREAM_SYSTEM len max (vi mac dinh thuong thap, khong phai do
- *      nguoi dung tung chinh tay) de mixer nghe du to, tuong tu bat buoc voi
- *      MEDIA truoc day.
- * Ca 2 stream duoc khoi phuc ve muc goc khi tat Mixer Test (hoac khi service
- * bi huy dot ngot, qua stopCurrentSessionIfAny() -> stopMixerTestInternal()).
- *
- * ✅ CAP NHAT (fix nghi van "nhac tu nho dan khi chuyen app qua lai" - phat
- * hien qua test thuc te): them reassertStreamSystemVolumeIfMixerRunning(),
- * goi moi giay tu onAmplitudeTick (tick co san tu Phase 1) trong luc Mixer
- * Test dang chay - kiem tra STREAM_SYSTEM co bi tut duoi max khong (co the
- * do audio focus ducking tu he thong/app khac khi chuyen app, vi truoc day
- * OutputRouter chua he xin AudioFocus), neu co thi log canh bao va ep lai
- * ve max ngay. Ket hop voi FocusObserver (xem duoi) de chan tu goc, con day
- * la lop phong thu bo sung.
- *
- * ✅ CAP NHAT MOI (fix "FocusObserver chi bat duoc 1 lan roi 'diec'"): ban
- * truoc xin AudioFocus kieu GAIN_TRANSIENT_MAY_DUCK CHI 1 LAN luc bat dau
- * Mixer Test, khong bao gio xin lai. Theo dung ngu nghia Android, sau khi
- * nhan AUDIOFOCUS_LOSS (khong phai ban _TRANSIENT), request goc coi nhu DA
- * BI HUY - muon nghe tiep cac lan mat focus SAU DO (vi du YouTube gianh lai
- * quyen nhieu lan lien tiep khi nguoi dung seek/doi bai/bo quang cao lien
- * tuc) BAT BUOC phai goi requestAudioFocus() lai. Thieu buoc nay khien log
- * chi hien dung 1 dong AUDIOFOCUS_LOSS duy nhat trong ca phien, dung nhu
- * nguoi dung da quan sat ("moi lan YouTube bi hanh dong gi la no danh lai
- * quyen" - xay ra NHIEU lan, nhung code cu chi ghi lai duoc LAN DAU).
- * Sua: tach viec dang ky ra ham rieng requestFocusObserver(), goi lai NGAY
- * trong chinh focusObserverListener moi khi nhan duoc bat ky loai LOSS nao -
- * dam bao listener "song" xuyen suot ca phien Mixer Test, bat duoc MOI lan
- * YouTube gianh quyen, khong chi lan dau.
- *
- * ✅ CAP NHAT MOI (tu dong "chua" trieu chung, thay vi chi quan sat): da xac
- * nhan qua test thu cong rang HANH DONG DUY NHAT chua duoc trieu chung
- * "nhac/vocal nho xiu khong tu phuc hoi" la TAO LAI AudioTrack tu dau (nhu
- * khi tat/bat Mixer Test bang tay) - ep lai volume/mute qua AudioManager
- * (reassertStreamSystemVolumeIfMixerRunning) KHONG dong toi duoc vi day la
- * 1 dang "duck" (gain noi bo tang OEM/HAL), doc lap voi index/mute-flag ma
- * AudioManager bao cao (xem giai thich chi tiet trong OutputRouter.kt,
- * ham recreate()). Moi lan focusObserverListener nhan duoc bat ky loai LOSS
- * nao, ngoai viec xin lai focus (o tren), con debounce ~400ms roi tu dong
- * goi mixerOutputRouter?.recreate() - mo phong dung thao tac tay da xac
- * nhan hieu qua, khong can nguoi dung phai tu tat/bat Mixer Test nua.
- *
- * ⚠️ CAP NHAT QUAN TRONG NHAT (fix "nudge tu kich hoat lai gay MAT TIENG
- * HOAN TOAN thay vi chua no" - xem giai thich chi tiet trong OutputRouter.kt
- * ngay tai dau khai bao nudgeAudioMixerToClearDuck()): ban chan doan truoc
- * dung periodicNudgeJob ban nudge VO DIEU KIEN moi PERIODIC_NUDGE_INTERVAL_MS
- * (1.5s), va da xac nhan qua quan sat thuc te day CHINH LA nguyen nhan gay
- * mat tieng HOAN TOAN (khong phai chi "chua chua duoc") - vi ban than tieng
- * beep NOTIFICATION lai tu kich hoat duck cua he thong len STREAM_SYSTEM,
- * lap lai nhanh hon thoi gian duck cu kip nha se lam gain bi keo xuong lien
- * tuc. Da chuyen co che bao ve sang dat TAI OutputRouter.nudgeAudioMixerToClearDuck()
- * (1 diem duy nhat, ap dung cho MOI nguon goi: periodicNudgeJob, selfHealJob,
- * VA nut "Kich hoat lai" thu cong moi them ben duoi) thay vi rai rac o tung
- * noi goi - xem MIN_NUDGE_INTERVAL_MS trong OutputRouter.kt.
- *
- * ✅ MOI (them phuong an thu cong, an toan hon vong lap tu dong): them action
- * button "🔊 Kich hoat lai" ngay tren notification dang chay cua Mixer Test -
- * nguoi dung tu bam khi NGHE THAY nhac nho, thay vi phu thuoc hoan toan vao
- * tin hieu tu dong (AudioFocus LOSS co the khong bao gio toi, nhu da ghi
- * nhan o [Chan doan vong 5] duoi day). Khong can quyen SYSTEM_ALERT_WINDOW/
- * overlay - chi la 1 PendingIntent gui action toi chinh Service nay, dung
- * chung code path voi ACTION_START_MIXER_TEST/ACTION_STOP_MIXER_TEST da co.
- *
- * Dieu khien qua 2 Intent action rieng (KHONG dung chung voi flow
- * resultCode/resultData chinh de tranh xung dot):
- * - ACTION_START_MIXER_TEST: bat dau tron Music (dang chay san) + Mic moi.
- * - ACTION_STOP_MIXER_TEST: dung mixer test, MusicInput van tiep tuc chay
- *   binh thuong (khong anh huong Phase 1).
- * - ACTION_MANUAL_NUDGE: nguoi dung bam nut "Kich hoat lai" tren notification -
- *   goi 1 lan nudge (van bi cooldown boi OutputRouter neu goi qua gan lan
- *   truoc, xem giai thich o tren).
+ * volumeGuardJob (~300ms/lan) chi xu ly duoc muc "index"/"mute-flag" ma
+ * AudioManager bao cao - KHONG xu ly duoc "duck" noi bo o tang HAL/OEM (gain
+ * giam nhung index/mute-flag van bao binh thuong). Duck chi duoc xoa bang
+ * cach tao lai AudioTrack (OutputRouter.recreate()) SAU KHI da co 1 su kien
+ * chuyen foreground/audio-focus THAT xay ra - xem NudgeTransitionActivity.kt
+ * va ACTION_MANUAL_NUDGE_RECREATE.
  */
 class PlaybackCaptureService : Service() {
 
@@ -134,61 +54,15 @@ class PlaybackCaptureService : Service() {
     private var musicInput: MusicInput? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // ✅ MOI (Phase 3): 3 thanh phan cua mixer test, doc lap voi session
-    // capture nhac chinh - co the bat/tat rieng ma khong lam gian doan
-    // MusicInput dang chay.
     private var micInput: MicInput? = null
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
-
-    // ✅ CAP NHAT LON (thay the "beep" bang cong tac BAT/TAT Mixer Test tu xa
-    // - xem giai thich chi tiet trong MixerToggleOverlayButton.kt): nut TRON
-    // NOI TREN man hinh (ke ca dang xem YouTube toan man hinh), bam se goi
-    // TRUC TIEP startMixerTestInternal()/stopMixerTestInternal() - KHONG con
-    // phat beep nao ca. Nut nay TON TAI XUYEN SUOT trong luc Phase 1 (capture
-    // nhac) dang chay, KHONG bi go bo khi chi Mixer Test bi tat (chi doi
-    // icon/mau) - CHI thuc su bi go (hide()) khi ca phien Phase 1 ket thuc,
-    // xem stopCurrentSessionIfAny().
     private var mixerToggleOverlay: MixerToggleOverlayButton? = null
-
-    // ✅ MOI (fix "hu qua loa ngoai/Bluetooth" - vong lap phan hoi am hoc):
-    // limiter RIENG ap cho VOCAL TRUOC KHI vao mixer, xem giai thich chi
-    // tiet trong Limiter.kt. Day KHONG phai limiter cuoi chuoi cua PLAN.md
-    // (do se lam sau, ap cho MIX TONG) - day la lop chan GOC vong lap hu,
-    // can thiet NGAY vi test bang loa ngoai/Bluetooth dang bi hu that.
     private var vocalLimiter: Limiter? = null
 
-    // ✅ MOI (Phase 3 - production): luu muc goc cua STREAM_SYSTEM de boost
-    // tu dong khi Mixer Test chay, khoi phuc khi tat. Gia tri -1 nghia la
-    // "khong co gi dang can khoi phuc" - dung lam guard chong khoi phuc 2
-    // lan, VA dung lam co de biet Mixer Test co dang chay hay khong trong
-    // reassertStreamSystemVolumeIfMixerRunning().
     private var savedStreamSystemVolume = -1
 
-    // ✅ SUA (khong con la "chi quan sat" nua - xem giai thich chi tiet o
-    // dau file): listener nay GIO se TU DONG xin lai focus + kich hoat
-    // self-heal moi khi nhan duoc bat ky loai LOSS nao, KHONG con chi log
-    // roi thoi. OutputRouter van HOAN TOAN KHONG tu xin focus doc quyen -
-    // day chi la 1 client "quan sat + tu phuc hoi", khong tranh gianh phat
-    // am thanh voi YouTube.
     private var focusObserverRequest: android.media.AudioFocusRequest? = null
-
-    // ✅ MOI (bo het nhanh tu dong theo yeu cau - CHI con nut bam tay duoc
-    // phep kich hoat nudge): truoc day co 2 co che tu dong goi
-    // nudgeAudioMixerToClearDuck() - selfHealJob (kich hoat khi nhan duoc su
-    // kien AudioFocus LOSS) va periodicNudgeJob (bat vo dieu kien dinh ky
-    // 1.5s/lan). Ca 2 DA DUOC GO BO HOAN TOAN khoi day theo yeu cau: nudge
-    // GIO CHI co the duoc kich hoat qua 1 trong 2 duong THU CONG - nut noi
-    // tren man hinh (NudgeOverlayButton) hoac nut action tren notification
-    // (ACTION_MANUAL_NUDGE) - khong con nhanh nao tu dong phat am nua.
-    //
-    // focusObserverListener duoc GIU LAI nhung CHI con lam nhiem vu QUAN SAT/
-    // GHI LOG (xin lai focus de khong bi "diec" cho su kien LOSS tiep theo,
-    // xem requestFocusObserver()) - KHONG con goi nudge/recreate() tu dong
-    // nua. Muc dich: van giu duoc du lieu chan doan (biet AudioFocus LOSS co
-    // xay ra hay khong, luc nao) de doi chieu voi thoi diem nguoi dung tu
-    // bam nut thu cong, ma khong tu y phat am nao ca.
-
 
     private val focusObserverListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         val label = when (focusChange) {
@@ -198,86 +72,23 @@ class PlaybackCaptureService : Service() {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK"
             else -> "UNKNOWN($focusChange)"
         }
-        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label (chi ghi log - KHONG tu dong nudge/recreate gi ca).")
+        logBoth("🎧 [FocusObserver] onAudioFocusChange=$label (chi ghi log - khong tu dong nudge/recreate).")
 
         val isLossEvent = focusChange == AudioManager.AUDIOFOCUS_LOSS ||
             focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
             focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
 
-        if (isLossEvent) {
-            // ✅ Xin lai NGAY de KHONG bi "diec" cho su kien tiep theo - day la
-            // phan sua loi "one-shot" da giai thich o dau file. Chi xin lai
-            // neu Mixer Test van dang chay that su (mixer != null) - tranh
-            // xin lai vo ich neu nguoi dung vua tat Mixer Test dung luc su
-            // kien LOSS nay toi. CHI xin lai focus (de tiep tuc quan sat/log),
-            // KHONG con lam gi khac o day nua.
-            if (mixer != null) {
-                val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                requestFocusObserver(audioManager)
-            }
+        if (isLossEvent && mixer != null) {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            requestFocusObserver(audioManager)
         }
     }
 
-
-    // ✅ MOI (fix goc "Karaoke App tu dat am luong Bluetooth = 0" - xac nhan
-    // qua thong bao he thong that cua Android, thay vi doan bang log nua):
-    // truoc day dung setStreamVolume(STREAM_MUSIC, 0, 0) - hanh dong nay
-    // DOI INDEX cua STREAM_MUSIC, va STREAM_MUSIC la "stream chinh" Android
-    // dung de dong bo AVRCP absolute-volume THUC SU gui cho loa Bluetooth -
-    // BAT KE audio cua chinh app dang phat qua stream nao khac (o day la
-    // STREAM_SYSTEM). Doi index ve 0 -> loa BT bi ha volume PHAN CUNG ve 0,
-    // anh huong luon output cua chinh mixer.
-    //
-    // Sua: chuyen sang dung CO MUTE RIENG (adjustStreamVolume ADJUST_MUTE/
-    // ADJUST_UNMUTE) thay vi doi index - day la co chế TACH BIET voi index,
-    // hy vong (CHUA chac chan 100%, can kiem chung thuc te) khong kich hoat
-    // dong bo AVRCP giong nhu khi doi index. 2 bien duoi day thay the hoan
-    // toan cho savedStreamMusicVolume (khong con can luu/khoi phuc INDEX cu
-    // nua vi khong con doi index).
     private var streamMusicWasMutedBeforeMixerTest = false
     private var musicMuteAppliedByMixerTest = false
 
-    // ✅ MOI (fix "nhac nho dan qua Bluetooth" - nang cap tan suat kiem tra):
-    // truoc day chi kiem tra/ep lai STREAM_SYSTEM 1 lan/giay (an theo tick
-    // notification co san) - qua cham de bat kip AVRCP volume resync cua
-    // loa Bluetooth (nghi van chinh, xem giai thich trong OutputRouter.kt).
-    // Doi sang vong lap RIENG, chay ~300ms/lan, chi hoat dong trong luc
-    // Mixer Test dang bat (start/stop cung luc voi startMixerTestInternal/
-    // stopMixerTestInternal). serviceScope dung Dispatchers.Default vi day
-    // chi la vong kiem tra volume don gian, khong can UI thread. Cung dung
-    // chung scope nay cho selfHealJob o tren.
-    // ⚠️ SUA LOI NGHIEM TRONG (chan doan vong 5 - PHAT HIEN qua test thuc
-    // te: "beep keu 1 lan, nhac to lai dung 1s, roi im hoan toan - KHONG
-    // CON BEEP NAO NUA"): serviceScope truoc day dung CoroutineScope(
-    // Dispatchers.Default) - MOT Job THUONG (KHONG PHAI SupervisorJob),
-    // dung CHUNG cho CA 3 coroutine con: volumeGuardJob (guard ~300ms/lan,
-    // goi AudioManager lien tuc - ti le dinh exception cao nhat vi tan suat
-    // day dac), selfHealJob, VA periodicNudgeJob moi them. Day CHINH LA
-    // nguyen nhan goc cua hien tuong quan sat duoc: bat ky exception nao
-    // KHONG duoc bat trong 1 trong 3 coroutine do (rat co the la
-    // reassertStreamSystemVolumeIfMixerRunning() ben trong volumeGuardJob)
-    // se HUY CA Job CHA cua serviceScope, keo theo CA 3 coroutine con bi
-    // huy theo NGAY LAP TUC va HOAN TOAN IM LANG (khong log loi nao, vi
-    // exception xay ra TRUOC ca khi kip vao logBoth() cua nhanh catch nao
-    // - trong truong hop nay khong he co catch o cap nay). Dung hien tuong
-    // "nudge chay dung 1 lan roi chet han vinh vien, khong con beep nao
-    // nua" - CHINH LA dau hieu kinh dien cua 1 Job thuong (khong phai
-    // Supervisor) bi huy do 1 nhanh con loi.
-    //
-    // Sua: doi sang SupervisorJob() - loi o 1 nhanh con (vi du guard) se
-    // KHONG con lam chet cac nhanh con khac (selfHeal, periodicNudge) nua,
-    // moi nhanh doc lap voi nhau.
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var volumeGuardJob: Job? = null
-
-    // ✅ MOI (giam log du thua): dem so lan vong lap guard da chay - dung de
-    // CHI in dong trang thai "[GuardTick] ..." day du moi
-    // GUARD_STATUS_LOG_EVERY_N_TICKS lan, thay vi MOI 300ms/lan (truoc day
-    // ra ~200 dong/phut, lam log 500 dong (MAX_LINES cua CaptureLogBus) day
-    // trong chua toi 3 phut va nguoi dung khong copy-paste noi de gui debug).
-    // Viec EP volume/unmute (phan quan trong that su) VAN chay du moi 300ms
-    // nhu cu - CHI co dong IN THONG TIN la bi gian cach, khong anh huong toc
-    // do phan ung cua guard.
     private var guardTickCount = 0
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -293,63 +104,25 @@ class PlaybackCaptureService : Service() {
 
         const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
-
-        // ✅ MOI: action rieng cho nut "Kich hoat lai" thu cong tren
-        // notification - xem buildNotification()/onStartCommand() ben duoi.
-        // Dung PendingIntent.getService() giong het 2 action tren, khong can
-        // co che moi nao khac - chi khac o cho khong bat/tat mixer, ma goi
-        // thang 1 lan nudgeAudioMixerToClearDuck() (van bi cooldown boi
-        // OutputRouter neu goi qua gan lan truoc, xem giai thich o dau file).
         const val ACTION_MANUAL_NUDGE = "com.karaokeapp.action.MANUAL_NUDGE"
 
-        // ✅ MOI: guard loop chay 300ms/lan (giu nguyen, can nhanh de bat kip
-        // AVRCP resync cua Bluetooth) nhung dong log trang thai day du chi in
-        // moi GUARD_STATUS_LOG_EVERY_N_TICKS lan (~3s/dong o 300ms/tick) - giam
-        // ~10 lan so luong dong log so voi truoc.
+        // Goi boi NudgeTransitionActivity SAU KHI da that su tao ra 1 su
+        // kien chuyen foreground that (roi khoi YouTube trong choc lat) -
+        // dung recreate() (tao lai AudioTrack) thay vi nudge beep, vi nudge
+        // beep KHONG du de xoa duck khi khong co su kien chuyen foreground
+        // that di kem (da xac nhan qua test thuc te).
+        const val ACTION_MANUAL_NUDGE_RECREATE = "com.karaokeapp.action.MANUAL_NUDGE_RECREATE"
+
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
-
-        // ✅ MOI (cong cu chan doan - CO THE TAT de cach ly nghi van "dang
-        // gianh mute-flag STREAM_MUSIC voi YouTube la nguyen nhan/yeu to gay
-        // mat tieng khi seek"). Mac dinh TRUE (giu nguyen hanh vi hien tai,
-        // khong doi UX cua ban production).
-        //
-        // Cach doc ket qua sau khi build voi flag nay = true (mac dinh):
-        // - Neu log cho thay CAPTURE SILENCE (MusicInput) xay ra ma KHONG co
-        //   dong [AutoReassert] "STREAM_MUSIC bi GO MUTE FLAG ngoai y muon"
-        //   nao xung quanh cung thoi diem -> mute-guard KHONG lien quan, co
-        //   the giu flag nay = true va tap trung dieu tra huong khac
-        //   (AudioPlaybackCapture/session cua YouTube).
-        // - Neu CAPTURE SILENCE luon xay ra NGAY SAU/CUNG LUC voi dong
-        //   [AutoReassert] do -> rat co the day la nguyen nhan hoac yeu to
-        //   kich hoat chinh. Doi flag nay thanh false, build lai 1 lan nua
-        //   (chap nhan YouTube phat de ra loa song song voi mixer trong ban
-        //   build chan doan nay) de xac nhan: neu CAPTURE SILENCE bien mat
-        //   hoan toan khi seek, da xac nhan chac chan.
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
-
-        // ✅ MOI (bo het nhanh tu dong theo yeu cau): ENABLE_SELF_HEAL_RECREATE
-        // va PERIODIC_NUDGE_INTERVAL_MS DA BI XOA khoi day - khong con
-        // recreate()/nudge nao duoc kich hoat tu dong nua, xem giai thich chi
-        // tiet o khai bao focusObserverListener phia tren. Beep/nudge DA BI BO
-        // HOAN TOAN khoi nut noi (xem MixerToggleOverlayButton.kt) - nut noi
-        // GIO la cong tac BAT/TAT Mixer Test tu xa, khong con phat am nao ca.
 
         @Volatile
         private var capturingActive = false
 
-        // ✅ MOI: trang thai Mixer Test dang chay hay khong, doc duoc tu BEN
-        // NGOAI Service (vi du MainActivity) - can thiet vi GIO Mixer Test co
-        // the duoc bat/tat tu 3 nguon DOC LAP (nut trong app, nut notification,
-        // VA nut noi tren man hinh) - neu nguoi dung dung nut noi de tat trong
-        // luc dang o YouTube roi quay lai app, nut "Bat/Tat Mixer Test" trong
-        // MainActivity can biet de tu cap nhat lai chu, tranh hien thi SAI
-        // trang thai (vi du van ghi "Tat Mixer Test" trong khi thuc te da tat
-        // roi tu nut noi).
         @Volatile
         private var mixerTestActive = false
 
         fun isCapturing(): Boolean = capturingActive
-
         fun isMixerTestActive(): Boolean = mixerTestActive
     }
 
@@ -358,12 +131,6 @@ class PlaybackCaptureService : Service() {
         CaptureLogBus.log("[Service] $msg")
     }
 
-    /**
-     * ✅ MOI (tach ra tu startMixerTestInternal() de dung lai duoc o CA 2
-     * noi: luc bat dau Mixer Test LAN luc focusObserverListener tu xin lai
-     * sau moi lan mat focus - xem giai thich chi tiet o dau file/khai bao
-     * focusObserverListener).
-     */
     private fun requestFocusObserver(audioManager: AudioManager) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val request = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
@@ -372,7 +139,7 @@ class PlaybackCaptureService : Service() {
             .build()
         focusObserverRequest = request
         val result = audioManager.requestAudioFocus(request)
-        logBoth("🎧 [FocusObserver] requestAudioFocus() tra ve=$result (khong dung de gianh phat doc quyen).")
+        logBoth("🎧 [FocusObserver] requestAudioFocus() tra ve=$result.")
     }
 
     private fun acquireWakeLock() {
@@ -384,7 +151,7 @@ class PlaybackCaptureService : Service() {
             wakeLock?.let {
                 if (!it.isHeld) {
                     it.acquire()
-                    logBoth("🔒 Da kich hoat WakeLock giu thuc CPU cho capture chay nen.")
+                    logBoth("🔒 Da kich hoat WakeLock.")
                 }
             }
         } catch (e: Exception) {
@@ -406,35 +173,16 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun stopCurrentSessionIfAny() {
-        if (musicInput != null || mediaProjection != null) {
-            logBoth("⚠️ Phat hien session capture cu con song - dung han truoc khi tao session moi.")
-        }
         stopMixerTestInternal()
         musicInput?.stopCapture()
         musicInput = null
         mediaProjection?.stop()
         mediaProjection = null
         capturingActive = false
-
-        // ✅ MOI (xem giai thich chi tiet o khai bao mixerToggleOverlay): CHI
-        // go han nut noi khoi man hinh o day - luc CA PHIEN Phase 1 ket thuc
-        // (khong con gi de Mixer Test hoat dong tren do nua) - KHONG go o
-        // stopMixerTestInternal() (chi TAT rieng Mixer Test, Phase 1 van con
-        // chay, nguoi dung co the can bam BAT lai bat ky luc nao).
         mixerToggleOverlay?.hide()
         mixerToggleOverlay = null
     }
 
-    /**
-     * ✅ MOI: duoc goi TRUC TIEP tu callback onToggle cua MixerToggleOverlayButton
-     * (chay tren main thread, cung thread voi onStartCommand()) - vi day la
-     * ham thuong (khong phai suspend), goi thang khong can di qua Intent/
-     * onStartCommand() nhu 2 nut trong app/notification, du ca 3 duong cuoi
-     * cung deu dan toi cung 2 ham startMixerTestInternal()/stopMixerTestInternal().
-     *
-     * Quyet dinh BAT hay TAT dua vao mixer (!= null nghia la dang chay) -
-     * dung chinh bien trang thai da co san, khong can bien co rieng.
-     */
     private fun toggleMixerTestFromOverlay() {
         if (mixer != null) {
             logBoth("👆 [OverlayToggle] Dang BAT -> chuyen sang TAT Mixer Test.")
@@ -445,10 +193,9 @@ class PlaybackCaptureService : Service() {
         }
     }
 
-    /** Phase 3: bat dau tron Music (dang chay) + Mic moi, phat ra qua OutputRouter rieng. */
     private fun startMixerTestInternal() {
         if (!capturingActive || musicInput == null) {
-            logBoth("❌ Chua co MusicInput dang chay - phai bat capture nhac (Phase 1) truoc khi test mixer.", isError = true)
+            logBoth("❌ Chua co MusicInput dang chay - phai bat capture nhac (Phase 1) truoc.", isError = true)
             return
         }
         if (mixer != null) {
@@ -456,17 +203,6 @@ class PlaybackCaptureService : Service() {
             return
         }
 
-        // ✅ MOI: mute STREAM_MUSIC de YouTube khong tu phat ra loa song song voi
-        // mixer nua - da xac nhan qua "Test Mute STREAM_MUSIC" (MainActivity)
-        // rang MusicInput van capture binh thuong du STREAM_MUSIC = 0, vi capture
-        // tap TRUOC buoc ap volume he thong.
-        // ✅ SUA (fix goc "Karaoke App tu dat am luong Bluetooth = 0" - xem
-        // giai thich chi tiet o khai bao streamMusicWasMutedBeforeMixerTest/
-        // musicMuteAppliedByMixerTest phia tren): dung CO MUTE thay vi doi
-        // INDEX ve 0, tranh kich hoat dong bo AVRCP volume=0 cho loa
-        // Bluetooth. Van giu duoc muc dich goc: YouTube khong tu phat truc
-        // tiep ra loa nua (capture van hoat dong binh thuong vi xay ra
-        // TRUOC ca buoc ap volume LAN buoc ap mute flag).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (ENABLE_MUSIC_STREAM_MUTE_GUARD) {
             streamMusicWasMutedBeforeMixerTest = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
@@ -474,54 +210,23 @@ class PlaybackCaptureService : Service() {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
             }
             musicMuteAppliedByMixerTest = true
-            logBoth(
-                "🔇 Da mute STREAM_MUSIC bang MUTE FLAG (KHONG doi so volume/index nua) - " +
-                    "YouTube se im, chi con mixer phat ra loa. (da mute san tu truoc=" +
-                    "$streamMusicWasMutedBeforeMixerTest)"
-            )
-        } else {
-            logBoth(
-                "🔬 [Chan doan] ENABLE_MUSIC_STREAM_MUTE_GUARD=false - KHONG mute STREAM_MUSIC. " +
-                    "YouTube se phat song song voi mixer (nghe trung tieng) - CHI dung de cach ly " +
-                    "nguyen nhan mat tieng khi seek, khong phai ban chay that."
-            )
+            logBoth("🔇 Da mute STREAM_MUSIC bang MUTE FLAG (da mute san tu truoc=$streamMusicWasMutedBeforeMixerTest)")
         }
 
-        // ✅ MOI: usage=ASSISTANCE_SONIFICATION (STREAM_SYSTEM) cho output mixer -
-        // da test latency ngang MEDIA (~296-300ms ca 2), khong dinh rui ro SCO
-        // nhu VOICE_COMMUNICATION, khong hu/cham nhu ALARM (xem test truoc).
-        // Doc lap voi STREAM_MUSIC vua mute o tren nen KHONG bi im theo.
         savedStreamSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
         val maxSystemVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
-        // ✅ MOI: go co mute an (xem giai thich chi tiet trong
-        // reassertStreamSystemVolumeIfMixerRunning()) TRUOC khi ep volume len
-        // max - phong truong hop co mute da ton tai tu truoc do (vi du con
-        // sot lai tu lan Mixer Test truoc), tranh phai cho toi vong guard
-        // dau tien (~300ms sau) moi duoc go.
         if (audioManager.isStreamMute(AudioManager.STREAM_SYSTEM)) {
             logBoth("⚠️ STREAM_SYSTEM dang bi mute flag ngay luc bat dau - go ngay bang ADJUST_UNMUTE.")
             audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
         }
         audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, maxSystemVolume, 0)
-        logBoth("🔊 Da day STREAM_SYSTEM len max=$maxSystemVolume (muc goc=$savedStreamSystemVolume) de mixer nghe du to.")
+        logBoth("🔊 Da day STREAM_SYSTEM len max=$maxSystemVolume (muc goc=$savedStreamSystemVolume).")
 
-        // ✅ SUA: dang ky FocusObserver qua ham dung chung requestFocusObserver()
-        // (xem khai bao ham + focusObserverListener phia tren) - GIO listener
-        // nay KHONG con chi "quan sat" nua, ma se TU DONG xin lai focus + kich
-        // hoat self-heal moi khi nhan LOSS, xuyen suot ca phien Mixer Test.
         requestFocusObserver(audioManager)
 
         val router = OutputRouter(this, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).apply { start() }
         val mix = LowLatencyMixer(router).apply { start() }
         val mic = MicInput(this)
-
-        // ✅ MOI: limiter rieng cho vocal, threshold 0.85 (85% Short.MAX_VALUE),
-        // release 50ms - xem Limiter.kt de biet chi tiet vi sao dat o day
-        // (chan goc re vong lap phan hoi, khong phai chi chong clipping don
-        // thuan). Noise gate CHUA bat (giu null/mac dinh) - can nghe thu
-        // truoc de biet muc nen that su cua moi truong test (phong, khoang
-        // cach mic-loa) truoc khi chon nguong gate hop ly, tranh gate cat
-        // nham tieng hat nho/thi tham.
         val limiter = Limiter(sampleRate = 44100, thresholdRatio = 0.85f, releaseMs = 50f)
 
         mixerOutputRouter = router
@@ -529,50 +234,23 @@ class PlaybackCaptureService : Service() {
         micInput = mic
         vocalLimiter = limiter
 
-        // ✅ Noi MusicInput hien tai vao mixer: vi MusicInput da duoc tao TU
-        // TRUOC (o onStartCommand chinh) voi onPcmChunk da tro ve mixerRef
-        // (xem ham buildMusicPcmForwarder() ben duoi) - khong can lam gi them
-        // o day, chi can gan bien mixer o tren la MusicInput's callback se tu
-        // dong bat dau day du lieu vao no.
-
         mic.startCapture(onPcmChunk = { buffer, size ->
-            // ✅ MOI: limiter chay TRUOC khi PCM vao mixer - xem giai thich
-            // o khai bao vocalLimiter/Limiter.kt. Vi tri nay QUAN TRONG: neu
-            // dat limiter SAU mixer (chi o mix tong), no van cho phep vocal
-            // rieng le tang bien do khong gioi han truoc khi bi cong voi
-            // nhac - vong lap phan hoi van co the tu nuoi no o day truoc khi
-            // limiter mix tong kip chan.
             limiter.process(buffer, size)
             mix.pushVocal(buffer, size)
         })
 
-        // ✅ MOI: bat dau vong lap guard volume ~300ms/lan - xem giai thich
-        // chi tiet o khai bao volumeGuardJob ben tren.
         guardTickCount = 0
         volumeGuardJob = serviceScope.launch {
             while (isActive) {
-                // ✅ MOI (lop phong thu bo sung - xem giai thich chi tiet o
-                // khai bao serviceScope): DU da co SupervisorJob bao ve cac
-                // nhanh KHAC khoi bi huy theo, ban than vong lap NAY neu gap
-                // loi thoang qua (vi du AudioManager tam thoi khong phan hoi
-                // khi app dang chuyen nen) van se tu ket thuc neu khong bat
-                // exception ngay tai day. Bat rieng de chinh volumeGuardJob
-                // cung "song sot" qua 1 lan loi le, thay vi phai cho toi
-                // lan Mixer Test tiep theo moi khoi dong lai duoc.
                 try {
                     reassertStreamSystemVolumeIfMixerRunning()
                 } catch (e: Exception) {
-                    logBoth("⚠️ [GuardTick] Loi thoang qua trong reassertStreamSystemVolumeIfMixerRunning() (bo qua, thu lai lan sau): ${e.message}")
+                    logBoth("⚠️ [GuardTick] Loi thoang qua (bo qua): ${e.message}")
                 }
                 delay(300L)
             }
         }
 
-        // ✅ CAP NHAT LON (xem giai thich chi tiet o khai bao mixerToggleOverlay
-        // o tren): CHI tao nut noi 1 LAN DUY NHAT (neu chua ton tai) - nhung
-        // LAN nao lay lai duoc Mixer Test cung phai cap nhat lai icon/mau ve
-        // trang thai "dang chay", vi nut co the da o trang thai "TAT" tu lan
-        // nguoi dung tu tay bam tat truoc do.
         if (mixerToggleOverlay == null) {
             mixerToggleOverlay = MixerToggleOverlayButton(applicationContext) {
                 toggleMixerTestFromOverlay()
@@ -581,30 +259,18 @@ class PlaybackCaptureService : Service() {
         mixerToggleOverlay?.show(initiallyRunning = true)
         mixerTestActive = true
 
-        logBoth("✅ Da bat dau Mixer Test (Phase 3) - YouTube da mute, chi nghe Music+Mic qua mixer.")
+        logBoth("✅ Da bat dau Mixer Test (Phase 3).")
     }
 
     private fun stopMixerTestInternal() {
         if (mixer == null && micInput == null && mixerOutputRouter == null && vocalLimiter == null) return
 
-        // ✅ MOI: dung vong lap guard volume + self-heal job TRUOC khi don
-        // dep gi khac.
         volumeGuardJob?.cancel()
         volumeGuardJob = null
-        // ✅ MOI (bo het nhanh tu dong theo yeu cau): khong con selfHealJob/
-        // periodicNudgeJob nao de huy o day nua.
 
-        // ✅ CAP NHAT LON: KHONG con go/an nut noi khi chi Mixer Test bi tat
-        // nua (xem giai thich chi tiet o khai bao mixerToggleOverlay) - CHI
-        // cap nhat lai icon/mau ve trang thai "TAT" de nguoi dung biet bam
-        // lai se BAT chu khong phai TAT. Nut van o nguyen tren man hinh de
-        // co the bam lai BAT bat ky luc nao, ke ca dang o YouTube.
         mixerToggleOverlay?.updateState(isRunning = false)
         mixerTestActive = false
 
-        // ✅ MOI: go dang ky listener quan sat/tu phuc hoi audio focus (xem
-        // giai thich o dau file) - khong con can quan sat khi Mixer Test da
-        // tat.
         focusObserverRequest?.let {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             audioManager.abandonAudioFocusRequest(it)
@@ -620,20 +286,13 @@ class PlaybackCaptureService : Service() {
         vocalLimiter?.reset()
         vocalLimiter = null
 
-        // ✅ SUA: khoi phuc STREAM_MUSIC bang co MUTE (khong con phuc hoi
-        // INDEX nua vi khong con doi index) - guard bang
-        // musicMuteAppliedByMixerTest de tranh xu ly 2 lan neu ham nay bi
-        // goi lai (vd tu stopCurrentSessionIfAny() VA onDestroy() lien
-        // tiep). CHI unmute neu STREAM_MUSIC KHONG bi mute san tu truoc khi
-        // Mixer Test bat dau (tranh vo tinh unmute 1 trang thai nguoi dung
-        // da tu chon tu truoc, khong lien quan gi den app).
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (musicMuteAppliedByMixerTest) {
             if (!streamMusicWasMutedBeforeMixerTest) {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-                logBoth("Da bo MUTE FLAG cua STREAM_MUSIC (khoi phuc trang thai truoc do - khong bi mute).")
+                logBoth("Da bo MUTE FLAG cua STREAM_MUSIC (khoi phuc trang thai truoc do).")
             } else {
-                logBoth("STREAM_MUSIC da bi mute TU TRUOC khi bat Mixer Test - giu nguyen, khong dong gi them.")
+                logBoth("STREAM_MUSIC da bi mute TU TRUOC khi bat Mixer Test - giu nguyen.")
             }
             musicMuteAppliedByMixerTest = false
         }
@@ -643,39 +302,11 @@ class PlaybackCaptureService : Service() {
             savedStreamSystemVolume = -1
         }
 
-        logBoth("🛑 Da dung Mixer Test (Phase 3). MusicInput (Phase 1) khong bi anh huong, van tiep tuc chay.")
+        logBoth("🛑 Da dung Mixer Test (Phase 3). MusicInput van tiep tuc chay.")
     }
 
-    /**
-     * ✅ CAP NHAT QUAN TRONG (fix "nhac nho dan khong the tu phuc hoi, phai
-     * vao Settings bam lai" - xac dinh qua test thuc te voi log that): ban
-     * truoc CHI kiem tra so volume (0..15) roi ep lai bang setStreamVolume()
-     * - nhung Android co 2 co che TACH BIET nhau:
-     *   1. "Volume level" (0..15) - day la thu setStreamVolume() dieu khien.
-     *   2. "Mute flag" rieng (isStreamMute()) - mot co bat/tat DOC LAP voi
-     *      so volume, co the bi BAT (vi du do he thong tu dat khi app mat
-     *      focus tam thoi luc chuyen qua app khac roi quay lai) MA KHONG
-     *      lam thay doi so volume (van bao la 15/15 - nhu da xac nhan qua
-     *      log thuc te KHONG co dong [AutoReassert] nao ca, tuc "current <
-     *      max" luon la false, nhung nguoi dung van nghe nho).
-     * setStreamVolume() KHONG chac chan go duoc co mute nay tren moi OEM.
-     * Sua: goi THEM adjustStreamVolume(..., ADJUST_UNMUTE, ...) - day la API
-     * chinh thuc cua Android de go co mute, TACH BIET voi setStreamVolume().
-     * Goi ca 2 (unmute + ep lai max) MOI LAN vong lap chay (khong con dieu
-     * kien "current < max" nua), de dam bao du roi vao truong hop nao (tut
-     * so, hay chi bi mute flag ma so van 15/15) cung duoc xu ly.
-     *
-     * ⚠️ LUU Y QUAN TRONG (van con gioi han da xac nhan qua test thuc te):
-     * ham nay CHI xu ly duoc 2 co che "index" va "mute-flag" ma AudioManager
-     * bao cao. No KHONG the phat hien hay sua duoc kieu "duck" (gain noi bo
-     * tang OEM/HAL, ap khi phat hien co su kien audio focus canh tranh) - vi
-     * duck KHONG doi index/mute-flag, GuardTick van bao 15/15 isMuted=false
-     * binh thuong du dang bi nho thuc te. Loai loi nay duoc xu ly boi
-     * focusObserverListener + OutputRouter.recreate() (xem dau file), KHONG
-     * phai ham nay.
-     */
     private fun reassertStreamSystemVolumeIfMixerRunning() {
-        if (savedStreamSystemVolume < 0) return // Mixer Test dang tat, khong lien quan.
+        if (savedStreamSystemVolume < 0) return
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val current = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_SYSTEM)
@@ -685,10 +316,6 @@ class PlaybackCaptureService : Service() {
         val musicMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val musicMuted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
 
-        // ✅ MOI (giam log du thua): dong trang thai day du nay CHI in moi
-        // GUARD_STATUS_LOG_EVERY_N_TICKS lan (~3s/dong o 300ms/tick) - cac
-        // dong [AutoReassert] canh bao ben duoi (thuc su co su kien bat
-        // thuong xay ra) VAN in MOI LAN, khong bi anh huong boi throttle nay.
         guardTickCount++
         if (guardTickCount % GUARD_STATUS_LOG_EVERY_N_TICKS == 0) {
             logBoth(
@@ -697,38 +324,20 @@ class PlaybackCaptureService : Service() {
             )
         }
 
-        // ✅ Kiem tra CO MUTE cua STREAM_MUSIC co bi go mat khong (vi du
-        // YouTube/he thong tu unmute khi phat bai moi). CHI xu ly khi Mixer
-        // Test dang thuc su enforce mute (musicMuteAppliedByMixerTest=true).
         if (ENABLE_MUSIC_STREAM_MUTE_GUARD && musicMuteAppliedByMixerTest && !musicMuted) {
-            logBoth(
-                "⚠️ [AutoReassert] STREAM_MUSIC bi GO MUTE FLAG ngoai y muon " +
-                    "(co the do YouTube tu unmute khi phat bai moi) - mute lai."
-            )
+            logBoth("⚠️ [AutoReassert] STREAM_MUSIC bi GO MUTE FLAG ngoai y muon - mute lai.")
             audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
         }
 
         if (isMuted) {
-            logBoth(
-                "⚠️ [AutoReassert] Phat hien STREAM_SYSTEM dang bi MUTE FLAG " +
-                    "(doc lap voi so volume, hien tai=$current/$max) - goi ADJUST_UNMUTE de go."
-            )
+            logBoth("⚠️ [AutoReassert] STREAM_SYSTEM dang bi MUTE FLAG (current=$current/$max) - go bang ADJUST_UNMUTE.")
             audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
         }
 
         if (current < max) {
-            logBoth(
-                "⚠️ [AutoReassert] Phat hien STREAM_SYSTEM bi tut con $current/$max " +
-                    "(khong phai do app - co yeu to ben ngoai dang ha volume, vi du " +
-                    "audio focus ducking khi chuyen app) - ep lai ve max."
-            )
+            logBoth("⚠️ [AutoReassert] STREAM_SYSTEM bi tut con $current/$max - ep lai ve max.")
         }
 
-        // ✅ Goi setStreamVolume() VO DIEU KIEN moi tick (khong gate theo
-        // current<max) - buoc AudioService "day lai" gia tri AVRCP cho loa
-        // BT dinh ky (~300ms/lan). Day la lenh nhe (khong dung
-        // FLAG_PLAY_SOUND nen khong phat am bao/tieng click), an toan de
-        // goi lien tuc.
         audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, max, 0)
     }
 
@@ -738,8 +347,6 @@ class PlaybackCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // ✅ MOI (Phase 3): xu ly 3 action rieng cho mixer test/nudge thu cong
-        // TRUOC, khong dung chung nhanh xu ly resultCode/resultData ben duoi.
         when (intent?.action) {
             ACTION_START_MIXER_TEST -> {
                 startMixerTestInternal()
@@ -750,11 +357,6 @@ class PlaybackCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_MANUAL_NUDGE -> {
-                // ✅ MOI: nguoi dung bam nut "🔊 Kich hoat lai" tren notification.
-                // Chi co tac dung khi Mixer Test dang thuc su chay (mixerOutputRouter
-                // != null) - neu Mixer Test da tat, khong co gi de nudge ca, chi log
-                // lai va bo qua, khong can bao loi ra UI vi day la action tu
-                // notification (khong co Activity nao dang mo de hien Toast).
                 if (mixerOutputRouter != null) {
                     logBoth("👆 [ManualNudge] Nguoi dung bam nut 'Kich hoat lai' tren notification.")
                     mixerOutputRouter?.nudgeAudioMixerToClearDuck()
@@ -763,35 +365,34 @@ class PlaybackCaptureService : Service() {
                 }
                 return START_NOT_STICKY
             }
+            ACTION_MANUAL_NUDGE_RECREATE -> {
+                if (mixerOutputRouter != null) {
+                    logBoth("🔄 [ManualNudgeRecreate] Da co su kien chuyen foreground that - goi recreate().")
+                    mixerOutputRouter?.recreate()
+                } else {
+                    logBoth("🔄 [ManualNudgeRecreate] Mixer Test dang tat - bo qua.")
+                }
+                return START_NOT_STICKY
+            }
         }
 
         startForeground(NOTIFICATION_ID, buildNotification("Dang khoi dong..."))
         acquireWakeLock()
 
-        logBoth(
-            "Service started. intent=$intent, hasExtras=${intent?.extras != null}, " +
-                "keys=${intent?.extras?.keySet()?.joinToString()}"
-        )
+        logBoth("Service started. intent=$intent, hasExtras=${intent?.extras != null}")
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Int.MIN_VALUE) ?: Int.MIN_VALUE
         val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-        logBoth("resultCode doc duoc=$resultCode, resultData doc duoc=$resultData")
 
         if (resultCode == Int.MIN_VALUE || resultData == null) {
-            logBoth(
-                "❌ Thieu resultCode/resultData, khong the tao MediaProjection. " +
-                    "Neu day la lan restart sau khi tien trinh bi kill, day la gioi han " +
-                    "khong the tranh cua Android - mo lai MainActivity de xin lai.",
-                isError = true
-            )
+            logBoth("❌ Thieu resultCode/resultData, khong the tao MediaProjection.", isError = true)
             stopSelf()
             return START_NOT_STICKY
         }
 
         stopCurrentSessionIfAny()
 
-        val projectionManager =
-            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
 
         if (projection == null) {
@@ -813,47 +414,20 @@ class PlaybackCaptureService : Service() {
 
         mediaProjection = projection
 
-        // ✅ MOI (fix nghi van "Dang khoi dong... bi ket vinh vien, khong co
-        // amplitude nao"): truoc day khoi tao MusicInput + goi startCapture()
-        // KHONG co try/catch, chay TRUC TIEP tren main thread cua
-        // onStartCommand. AudioRecord.Builder().build() va
-        // AudioPlaybackCaptureConfiguration.Builder().build() deu co the nem
-        // exception dong bo (vi du IllegalStateException/UnsupportedOperationException
-        // tuy OEM, hoac do mediaProjection chua san sang ngay sau khi dialog
-        // cap quyen vua dong) - neu xay ra, tien trinh crash NGAY tai day,
-        // TRUOC KHI startCapture() kip chay lan dau. Vi startForeground() da
-        // hien thi "Dang khoi dong..." truoc do, notification bi dong bang
-        // vinh vien tren thanh thong bao (tien trinh chet, khong con ai cap
-        // nhat/xoa no nua) - dung hien tuong da quan sat qua anh chup man
-        // hinh. Boc try/catch de: (1) khong crash ca tien trinh, (2) cap nhat
-        // lai notification voi thong bao loi ro rang thay vi de no dong bang
-        // im lang, (3) log day du de biet chinh xac buoc nao that bai.
         try {
             musicInput = MusicInput(
                 mediaProjection = projection,
                 onAmplitudeTick = { avgAmplitude ->
                     val now = timeFormat.format(java.util.Date())
                     updateNotification("Cap nhat luc $now - amplitude=$avgAmplitude")
-                    // ✅ Luu y: KHONG con goi reassertStreamSystemVolumeIfMixerRunning()
-                    // o day nua - da thay bang volumeGuardJob (vong lap rieng
-                    // ~300ms/lan, xem startMixerTestInternal()) nhanh hon nhieu
-                    // so voi tick 1 lan/giay nay, giup bat kip AVRCP volume
-                    // resync cua Bluetooth tot hon.
                 },
                 onPcmChunk = { buffer, size ->
-                    // ✅ Phase 3: neu mixer test dang chay, day PCM nhac vao. Neu
-                    // chua bat mixer, mixer == null nen dong nay khong lam gi ca -
-                    // khong anh huong Phase 1 khi chua test mixer.
                     mixer?.pushMusic(buffer, size)
                 }
             ).apply { startCapture() }
             capturingActive = true
         } catch (e: Exception) {
-            logBoth(
-                "❌ Khoi tao MusicInput/startCapture() that bai: ${e.message} - " +
-                    "dung lai session nay, KHONG de tien trinh crash im lang.",
-                isError = true
-            )
+            logBoth("❌ Khoi tao MusicInput/startCapture() that bai: ${e.message}", isError = true)
             updateNotification("Loi khoi dong capture: ${e.message}")
             musicInput = null
             capturingActive = false
@@ -874,17 +448,14 @@ class PlaybackCaptureService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         val stillCapturing = capturingActive
-        logBoth("Task removed (app bi vuot xoa khoi da nhiem). Dang capture=$stillCapturing")
+        logBoth("Task removed. Dang capture=$stillCapturing")
 
         if (stillCapturing) {
             try {
                 startForeground(NOTIFICATION_ID, buildNotification("Dang tiep tuc capture sau khi app bi vuot xoa..."))
-                logBoth("✅ Da tai khang dinh foreground service ngay sau khi task bi vuot xoa, van tiep tuc capture.")
             } catch (e: Exception) {
-                logBoth("❌ Loi khi tai khang dinh foreground service sau onTaskRemoved: ${e.message}", isError = true)
+                logBoth("❌ Loi khi tai khang dinh foreground service: ${e.message}", isError = true)
             }
-        } else {
-            logBoth("Khong co session capture dang chay - khong can lam gi them.")
         }
     }
 
@@ -896,34 +467,18 @@ class PlaybackCaptureService : Service() {
                 CHANNEL_ID, "Karaoke - Test Capture Nhac",
                 NotificationManager.IMPORTANCE_LOW
             )
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
-    /**
-     * ✅ MOI: them 1 action button "🔊 Kich hoat lai" tren notification -
-     * gui ACTION_MANUAL_NUDGE ve chinh Service nay qua PendingIntent.getService(),
-     * dung chung co che voi ACTION_START_MIXER_TEST/ACTION_STOP_MIXER_TEST da
-     * co (khong can quyen SYSTEM_ALERT_WINDOW/overlay nao ca - notification
-     * action la co che chuan cua Android, luon co san trong khay thong bao
-     * ngay ca khi app dang o nen). Nut nay hien dien THUONG XUYEN tren
-     * notification (khong chi khi co loi), vi nguoi dung co the can bam bat
-     * ky luc nao ho nghe thay nhac nho ma khong muon cho nudge dinh ky tu
-     * dong (moi 1.5s, xem PERIODIC_NUDGE_INTERVAL_MS) toi luot.
-     *
-     * requestCode=0 dung chung cho moi lan build notification - vi noi dung
-     * Intent (chi co action, khong co extras thay doi) la giong het nhau moi
-     * lan, FLAG_UPDATE_CURRENT la du, khong can requestCode rieng biet.
-     */
     private fun buildNotification(contentText: String): Notification {
-        val nudgeIntent = Intent(this, PlaybackCaptureService::class.java).apply {
-            action = ACTION_MANUAL_NUDGE
-        }
-        val nudgePendingIntent = PendingIntent.getService(
+        // Nut nay mo NudgeTransitionActivity (khong goi thang ACTION_MANUAL_NUDGE
+        // nua) - can 1 su kien chuyen foreground THAT de xoa duck khi YouTube
+        // dang la app foreground (xem NudgeTransitionActivity.kt).
+        val nudgePendingIntent = PendingIntent.getActivity(
             this,
             0,
-            nudgeIntent,
+            NudgeTransitionActivity.buildLaunchIntent(this),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -937,16 +492,9 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun updateNotification(contentText: String) {
-        // ✅ MOI (chan doan cuoi cung): log NGAY TRUOC va SAU manager.notify()
-        // de xac nhan 100% no thuc su chay toi day va khong nem ra loi nao bi
-        // nuot mat - neu dong "da goi xong" khong bao gio xuat hien trong log,
-        // nghia la co exception xay ra o buoc lay NotificationManager hoac o
-        // chinh notify().
         try {
             val manager = getSystemService(NotificationManager::class.java)
-            logBoth("🔔 [NotifyDebug] Chuan bi goi notify() voi text=\"$contentText\"")
             manager.notify(NOTIFICATION_ID, buildNotification(contentText))
-            logBoth("🔔 [NotifyDebug] Da goi notify() xong, khong co loi.")
         } catch (e: Exception) {
             logBoth("❌ [NotifyDebug] notify() nem loi: ${e.message}", isError = true)
         }

@@ -4,31 +4,11 @@
 <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
-<!-- ✅ MOI (Phase 3 - fix mic bi tat tieng am tham): tu Android 11+, foreground
-     service muon dung mic khi app KHONG o foreground (dung y het truong hop
-     MicInput chay ben trong PlaybackCaptureService) bat buoc phai khai bao
-     ro loai service la "microphone". Thieu khai bao nay, Android KHONG bao
-     loi gi ca nhung se AM THAM tat tieng du lieu ghi duoc nhu 1 lop bao ve
-     quyen rieng tu - dung trieu chung da gap: AudioRecord "thanh cong" nhung
-     PCM toan gan bang 0. Permission nay bat buoc phai co tu API 34 khi khai
-     bao foregroundServiceType chua "microphone". -->
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
-<!-- ✅ MOI: bat buoc phai co de PlaybackCaptureService.acquireWakeLock() khong
-     bi throw SecurityException. Dung PARTIAL_WAKE_LOCK de giu CPU thuc khi
-     capture chay nen, khong lien quan gi toi man hinh. -->
 <uses-permission android:name="android.permission.WAKE_LOCK"/>
-<!--  Can tren Android 13+ de notification cua PlaybackCaptureService hien
-         ra duoc - chua xin runtime permission nay o Phase 1 (service van
-         chay binh thuong khong co no, chi notification bi an)  -->
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-<!-- ✅ MOI (nut noi "Kich hoat lai" - xem NudgeOverlayButton.kt): can de ve
-     duoc 1 View NOI TREN cac app khac (vi du YouTube dang o foreground).
-     Day la 1 "special permission" - KHONG xin duoc qua co che runtime
-     permission thong thuong (ActivityResultContracts.RequestPermission),
-     bat buoc phai dan nguoi dung sang man hinh Settings rieng qua Intent
-     ACTION_MANAGE_OVERLAY_PERMISSION (xem MainActivity.kt,
-     ensureOverlayPermission()). -->
 <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+<uses-permission android:name="android.permission.VIBRATE"/>
 <application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true">
 <activity android:name=".MainActivity" android:exported="true">
 <intent-filter>
@@ -36,9 +16,7 @@
 <category android:name="android.intent.category.LAUNCHER"/>
 </intent-filter>
 </activity>
-<!--  Phase 1: nhan resultCode/resultData tu dialog MediaProjection
-             (MainActivity), tao MediaProjection that va bat dau capture qua
-             MusicInput.  -->
+<activity android:name=".NudgeTransitionActivity" android:exported="false" android:launchMode="singleTask" android:theme="@style/Theme.KaraokeApp.Transparent" android:excludeFromRecents="true" android:noHistory="true"/>
 <service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false"/>
 </application>
 </manifest>
