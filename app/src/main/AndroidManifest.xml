@@ -16,7 +16,7 @@
 <category android:name="android.intent.category.LAUNCHER"/>
 </intent-filter>
 </activity>
-<activity android:name=".NudgeTransitionActivity" android:exported="false" android:launchMode="singleTask" android:theme="@style/Theme.KaraokeApp.Transparent" android:excludeFromRecents="true" android:noHistory="true"/>
+
 <service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false"/>
 </application>
 </manifest>
