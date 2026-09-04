@@ -23,6 +23,7 @@ import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.mixer.VocalChannel
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
+import com.karaokeapp.overlay.MixerBoardOverlay
 import com.karaokeapp.overlay.MixerToggleOverlayButton
 import com.karaokeapp.webrtc.QrJoinData
 import com.karaokeapp.webrtc.SignalingServer
@@ -103,6 +104,12 @@ class PlaybackCaptureService : Service() {
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
     private var mixerToggleOverlay: MixerToggleOverlayButton? = null
+    // ✅ MOI (Phase 6 - "ban mixer on fly"): nut noi THU HAI, mo bang mixer
+    // thu nho de chinh volume nhac nen/tong the/mic tai cho NGAY trong luc
+    // dang xem YouTube toan man hinh - xem giai thich day du trong
+    // MixerBoardOverlay.kt ve ly do can nut nay (STREAM_MUSIC bi mute khi
+    // Mixer Test BAT, nhac gio chi con phat qua duong Mixer).
+    private var mixerBoardOverlay: MixerBoardOverlay? = null
     private var finalMixLimiter: Limiter? = null
 
     // ✅ DA GO BO (Phase 6) HowlGuard - co che "leo thang" tu dong cam/ha
@@ -469,6 +476,8 @@ class PlaybackCaptureService : Service() {
         capturingActive = false
         mixerToggleOverlay?.hide()
         mixerToggleOverlay = null
+        mixerBoardOverlay?.hide()
+        mixerBoardOverlay = null
     }
 
     private fun cancelPendingReactivation() {
@@ -804,6 +813,18 @@ class PlaybackCaptureService : Service() {
             }
         }
         mixerToggleOverlay?.show(initiallyRunning = true)
+
+        // ✅ MOI (SUA - ban day du): hien cung luc nut "Ban mixer on fly" -
+        // gio MixerBoardOverlay tu goi thang PlaybackCaptureService companion
+        // object (giong dialog trong MainActivity, qua MixerBoardUiBuilder
+        // dung chung) thay vi nhan 6 lambda getter/setter rieng le nhu ban
+        // 3-slider cu - dam bao ban mixer nhanh nay va dialog day du trong
+        // MainActivity LUON dong bo VOI NHAU (cung 1 nguon du lieu duy nhat).
+        if (mixerBoardOverlay == null) {
+            mixerBoardOverlay = MixerBoardOverlay(appContext = applicationContext)
+        }
+        mixerBoardOverlay?.show()
+
         mixerTestActive = true
 
         MainActivity.refreshMixerTestButtonState(true)
@@ -818,6 +839,12 @@ class PlaybackCaptureService : Service() {
         volumeGuardJob = null
 
         mixerToggleOverlay?.updateState(isRunning = false)
+        // ✅ Dong bang mixer nhanh (neu dang mo) khi Mixer Test TAT - cac
+        // slider (musicVolume/masterVolume/volume mic) khong con y nghia
+        // gi khi Mixer khong chay. GIU LAI nut "🎚️" tren man hinh (giong
+        // tinh than mixerToggleOverlay chi doi trang thai, khong hide())
+        // de nguoi dung van bam duoc khi Mixer Test BAT LAI sau do.
+        mixerBoardOverlay?.closeBoardIfOpen()
         mixerTestActive = false
 
         MainActivity.refreshMixerTestButtonState(false)
