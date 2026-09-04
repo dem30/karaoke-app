@@ -483,6 +483,30 @@ class MainActivity : AppCompatActivity() {
             addView(joinRoomButton)
         }
 
+        // ✅ MOI: nut "Tat hoan toan" - truoc gio KHONG co cach nao dung han
+        // Service + an nut noi tru vao Cai dat he thong > Force Stop. Nut nay
+        // goi ACTION_STOP_ALL: dung capture nhac, dung Mixer Test, AN nut noi
+        // (mixerToggleOverlay.hide()), huy notification, huy Service. Khac
+        // "Tat Mixer Test" (chi tat am thanh, GIU nut noi de bam lai nhanh) -
+        // nut nay danh cho luc muon THOAT HAN, khong con y dinh bat lai qua
+        // nut noi nua (muon dung lai phai mo app va bam "Test Capture" lai
+        // tu dau).
+        val stopAllButton = Button(this).apply {
+            text = "⏹ Tat hoan toan (an nut noi)"
+            setOnClickListener {
+                val intent = Intent(this@MainActivity, PlaybackCaptureService::class.java).apply {
+                    action = PlaybackCaptureService.ACTION_STOP_ALL
+                }
+                startService(intent)
+                Toast.makeText(this@MainActivity, "Da gui lenh tat hoan toan", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val buttonRow6 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(stopAllButton)
+        }
+
         logText = TextView(this).apply {
             setPadding(16, 16, 16, 16)
             textSize = 12f
@@ -505,6 +529,7 @@ class MainActivity : AppCompatActivity() {
             addView(buttonRow3)
             addView(buttonRow4)
             addView(buttonRow5)
+            addView(buttonRow6)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -745,6 +770,19 @@ class MainActivity : AppCompatActivity() {
      * sao khong nghe thay gi).
      */
     private fun startHostRoom() {
+        // ✅ FIX: neu dang co phong chay roi (bam "Tao phong" lan 2 ma quen
+        // bam "Dung phong" truoc), PHAI dong server cu truoc khi tao server
+        // moi. Neu khong, server moi se bind port 8765 that bai (server cu
+        // van dang giu port), nhung loi bind bi nuot am tham trong onError()
+        // (chi Log.e Logcat, khong ra CaptureLogBus) - QR moi hien ra la
+        // room/token moi, nhung server THAT SU dang tra loi ket noi van la
+        // server CU voi room/token CU -> May B quet QR moi se bi bao "Sai
+        // room ID hoac token" du QR vua quet la QR dang hien tren man hinh.
+        if (signalingServer != null || webRtcManager != null) {
+            CaptureLogBus.log("[Phong Karaoke] Dang co phong cu chay - tu dong dong truoc khi tao phong moi")
+            stopHostRoom()
+        }
+
         if (!PlaybackCaptureService.isMixerTestActive()) {
             Toast.makeText(
                 this,

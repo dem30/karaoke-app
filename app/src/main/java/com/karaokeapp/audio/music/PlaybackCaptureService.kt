@@ -157,6 +157,16 @@ class PlaybackCaptureService : Service() {
 
         const val ACTION_START_MIXER_TEST = "com.karaokeapp.action.START_MIXER_TEST"
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
+        // ✅ MOI: truoc gio KHONG co cach nao dung han Service + an nut noi tru
+        // Force Stop tu Cai dat he thong. stopMixerTestInternal() chi tat am
+        // thanh (doi mau nut sang do), KHONG bao gio goi overlay.hide() - chi
+        // stopCurrentSessionIfAny() (goi trong onDestroy) moi thuc su go nut
+        // noi. Them action nay de MainActivity co 1 nut THAT SU dung tat ca:
+        // dung capture nhac, dung mixer, AN nut noi, huy notification, huy
+        // Service - dung goi khi da xac dinh muon thoat han, KHONG the "bat
+        // lai" qua nut noi nua sau khi goi action nay (phai mo lai app va bam
+        // "Test Capture" tu dau).
+        const val ACTION_STOP_ALL = "com.karaokeapp.action.STOP_ALL"
 
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
@@ -792,6 +802,24 @@ class PlaybackCaptureService : Service() {
             ACTION_STOP_MIXER_TEST -> {
                 cancelPendingReactivation()
                 stopMixerTestInternal()
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_ALL -> {
+                // ✅ MOI: day la nut "tat het" thuc su - dung MusicInput (Phase 1),
+                // dung Mixer Test (Phase 3/4), AN nut noi (overlay.hide()), huy
+                // notification foreground, roi huy chinh Service. Khac han
+                // ACTION_STOP_MIXER_TEST (chi dung am thanh, GIU nut noi de bam
+                // lai nhanh) - action nay danh cho luc nguoi dung muon THOAT HAN,
+                // khong con y dinh bat lai qua nut noi nua.
+                logBoth("🛑 [StopAll] Nguoi dung yeu cau tat hoan toan - dung capture + an nut noi + huy Service.")
+                stopCurrentSessionIfAny()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+                stopSelf()
                 return START_NOT_STICKY
             }
         }

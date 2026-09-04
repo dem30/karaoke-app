@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap
  * - dung y PLAN.md muc 7: "chay thuan mang LAN").
  */
 class SignalingServer(
-    port: Int,
+    private val port: Int,
     private val expectedRoomId: String,
     private val expectedToken: String,
     private val listener: Listener
@@ -90,6 +90,11 @@ class SignalingServer(
 
     override fun onError(conn: WebSocket?, ex: Exception) {
         Log.e("SignalingServer", "Loi WebSocket: ${ex.message}")
+        // ✅ FIX: nguoi test chi co dien thoai that, khong co ADB/Logcat -
+        // loi bind port (vd dang co server cu chua dong, bind port 8765
+        // lan 2 se That bai) truoc day chi roi vao day va bi "nuot am tham".
+        // Ghi ra CaptureLogBus de thay ngay trong app.
+        CaptureLogBus.log("[SignalingServer] ❌ Loi server (co the do port $port dang bi chiem boi phong cu chua dong): ${ex.message}")
     }
 
     fun sendAnswer(clientId: String, sdp: String) {
