@@ -491,6 +491,27 @@ class MainActivity : AppCompatActivity() {
         // nut nay danh cho luc muon THOAT HAN, khong con y dinh bat lai qua
         // nut noi nua (muon dung lai phai mo app va bam "Test Capture" lai
         // tu dau).
+        // ✅ MOI (theo de xuat nguoi dung, fix tieng ret ret khi vua chay mic
+        // tai cho vua nhan mic tu May B qua WebRTC): nut bat/tat mic vat ly
+        // cua chinh may nay khoi Mixer. Goi THANG companion function (cung
+        // process, khong can Intent/Binder - giong cach isMixerTestActive()
+        // da lam) vi hieu ung can AP DUNG NGAY LAP TUC tren thread dang chay
+        // cua MicInput, khong the doi vong doi Intent/onStartCommand.
+        val muteLocalMicButton = Button(this).apply {
+            text = if (PlaybackCaptureService.isLocalMicMutedForMixer()) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay (chi nhan qua mang)"
+            setOnClickListener {
+                val newState = !PlaybackCaptureService.isLocalMicMutedForMixer()
+                PlaybackCaptureService.setLocalMicMutedForMixer(newState)
+                text = if (newState) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay (chi nhan qua mang)"
+                Toast.makeText(
+                    this@MainActivity,
+                    if (newState) "Da khoa mic vat ly cua may nay - chi con giong tu May B (qua mang) duoc hoa vao Mixer"
+                    else "Da bat lai mic vat ly cua may nay",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
         val stopAllButton = Button(this).apply {
             text = "⏹ Tat hoan toan (an nut noi)"
             setOnClickListener {
@@ -504,6 +525,7 @@ class MainActivity : AppCompatActivity() {
 
         val buttonRow6 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            addView(muteLocalMicButton)
             addView(stopAllButton)
         }
 
@@ -798,9 +820,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         webRtcManager = WebRtcManager(this).apply {
-            onRemotePcmChunk = { _, buffer, size ->
-                // Do thang giong hat cua Mic tu xa vao Mixer dang chay cua May A.
-                PlaybackCaptureService.pushRemoteVocalChunk(buffer, size)
+            onRemotePcmChunk = { clientId, buffer, size ->
+                // ✅ SUA (ho tro song ca nhieu may - xem giai thich chi tiet
+                // trong LowLatencyMixer.kt): truoc day BO QUA clientId (dung
+                // "_"), khien moi nguon remote bi don chung vao 1 hang doi
+                // FIFO duy nhat cua mixer, gay tieng ret/giat khi co tu 2
+                // May B/C tro len cung hat. GIO truyen clientId xuong de moi
+                // may co 1 "kenh" vocal RIENG trong mixer, cong dong (khong
+                // xen ke) voi nhau.
+                PlaybackCaptureService.pushRemoteVocalChunk(clientId, buffer, size)
             }
         }
 
@@ -814,6 +842,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 override fun onMicDisconnected(clientId: String) {
                     webRtcManager?.removeClient(clientId)
+                    // ✅ MOI: don sach ca ring buffer/Limiter rieng cua
+                    // clientId nay khoi mixer (xem PlaybackCaptureService.
+                    // removeRemoteVocalSource()) - tranh no bi "treo" trong
+                    // mixer vinh vien du khong con ai push vao nua.
+                    PlaybackCaptureService.removeRemoteVocalSource(clientId)
                 }
                 override fun onOfferReceived(clientId: String, sdp: String) {
                     webRtcManager?.handleRemoteOffer(
