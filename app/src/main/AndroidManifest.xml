@@ -10,6 +10,18 @@
 <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
 <uses-permission android:name="android.permission.VIBRATE"/>
 
+<!-- ✅ MOI (Phase 5 - Phong Karaoke LAN qua WebRTC + WebSocket + QR):
+     - ACCESS_NETWORK_STATE/ACCESS_WIFI_STATE: can de lay dia chi IP Wi-Fi
+       noi bo (QrPayload.getLocalIpAddress()) hien vao ma QR cho May B/C quet.
+     - CAMERA: can cho May B/C quet ma QR cua May A (thu vien ZXing).
+       required="false" o <uses-feature> vi ve ly thuyet may khong co camera
+       van dung duoc app (chi khong lam duoc vai tro Mic quet QR), tranh Google
+       Play loc nham nhung thiet bi khong co camera. -->
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+<uses-permission android:name="android.permission.CAMERA"/>
+<uses-feature android:name="android.hardware.camera" android:required="false"/>
+
 <!-- ✅ MOI (fix returnToSourceApp() tra ve null tren Android 11+): tu API 30,
      PackageManager AN package khac khoi app minh theo mac dinh (package
      visibility) - getLaunchIntentForPackage()/getPackageInfo() se tra ve
@@ -35,7 +47,7 @@
     <package android:name="com.google.android.youtube" />
 </queries>
 
-<application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true">
+<application android:allowBackup="true" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:label="@string/app_name" android:theme="@style/Theme.KaraokeApp" android:supportsRtl="true" android:usesCleartextTraffic="true">
 <activity android:name=".MainActivity" android:exported="true">
 <intent-filter>
 <action android:name="android.intent.action.MAIN"/>
@@ -44,5 +56,14 @@
 </activity>
 
 <service android:name=".audio.music.PlaybackCaptureService" android:foregroundServiceType="mediaProjection|microphone" android:exported="false"/>
+
+<!-- ✅ MOI (Phase 5): Activity quet QR co san cua thu vien ZXing
+     (com.journeyapps:zxing-android-embedded) - BAT BUOC khai bao thu cong,
+     thu vien KHONG tu dong them vao qua manifest merge trong moi cau hinh. -->
+<activity
+    android:name="com.journeyapps.barcodescanner.CaptureActivity"
+    android:screenOrientation="portrait"
+    android:stateNotNeeded="true"
+    android:exported="false"/>
 </application>
 </manifest>

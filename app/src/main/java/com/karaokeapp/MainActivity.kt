@@ -27,6 +27,10 @@ import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.music.CaptureLogBus
 import com.karaokeapp.audio.music.PlaybackCaptureService
 import com.karaokeapp.audio.output.OutputRouter
+import com.karaokeapp.webrtc.QrJoinData
+import com.karaokeapp.webrtc.SignalingClient
+import com.karaokeapp.webrtc.SignalingServer
+import com.karaokeapp.webrtc.WebRtcManager
 
 /**
  * Entry point tam thoi, chua co UI dep - chi du dung de test tung phase.
@@ -193,6 +197,32 @@ class MainActivity : AppCompatActivity() {
     // (phong truong hop Activity bi huy dot ngot).
     private var savedBoostedStreamVolume: Int? = null
     private var boostedLegacyStream: Int? = null
+
+    // ✅ MOI (Phase 5): phan he Phong Karaoke LAN qua WebRTC. May A (Mixer)
+    // dung signalingServer + webRtcManager (nhan PCM tu xa, day vao
+    // PlaybackCaptureService.pushRemoteVocalChunk). May B (Mic khong day)
+    // dung signalingClient + webRtcManager (gui PCM cua chinh minh di) +
+    // wirelessMicInput (MicInput RIENG, KHONG dung chung voi Mic Loopback
+    // Phase 2 hay Mixer Test Phase 3 - 3 thu nay co the ton tai doc lap,
+    // nhung KHONG nen bat cung luc tren 1 may vi se tranh nhau quyen
+    // RECORD_AUDIO/AudioRecord doc quyen cua he thong).
+    private var signalingServer: SignalingServer? = null
+    private var signalingClient: SignalingClient? = null
+    private var webRtcManager: WebRtcManager? = null
+    private var wirelessMicInput: MicInput? = null
+
+    // ✅ MOI (Phase 5): launcher quet QR cua ZXing - dang ky o cap Activity
+    // (bat buoc, giong cac ActivityResultContracts khac trong file nay),
+    // KHONG duoc goi tao trong 1 ham thuong hay se crash luc runtime.
+    private val qrScanLauncher = registerForActivityResult(
+        com.journeyapps.barcodescanner.ScanContract()
+    ) { result ->
+        if (result.contents != null) {
+            joinRoomFromQr(result.contents)
+        } else {
+            Toast.makeText(this, "Da huy quet ma QR", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     private val requestRecordAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -424,6 +454,35 @@ class MainActivity : AppCompatActivity() {
             addView(overlayPermissionButton)
         }
 
+        // ✅ MOI (Phase 5): 2 nut cho Phong Karaoke LAN - "Tao phong" danh cho
+        // May A (Mixer, phai dang capture nhac + Mixer Test truoc), "Quet QR"
+        // danh cho May B/C (Mic khong day, may nao KHONG phai Mixer chinh).
+        // Ca 2 nut cung ton tai tren MOI may - nguoi dung tu quyet dinh may
+        // nao lam Mixer, may nao lam Mic, khong co UI rieng cho 2 vai tro.
+        val createRoomButton = Button(this).apply {
+            text = "🎤 Tao phong (Mixer A)"
+            setOnClickListener { startHostRoom() }
+        }
+
+        val joinRoomButton = Button(this).apply {
+            text = "📷 Quet QR vao phong (Mic B)"
+            setOnClickListener {
+                val options = com.journeyapps.barcodescanner.ScanOptions().apply {
+                    setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+                    setPrompt("Huong camera ve phia ma QR tren May A (Mixer)")
+                    setBeepEnabled(true)
+                    setOrientationLocked(true)
+                }
+                qrScanLauncher.launch(options)
+            }
+        }
+
+        val buttonRow5 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(createRoomButton)
+            addView(joinRoomButton)
+        }
+
         logText = TextView(this).apply {
             setPadding(16, 16, 16, 16)
             textSize = 12f
@@ -445,6 +504,7 @@ class MainActivity : AppCompatActivity() {
             addView(buttonRow2)
             addView(buttonRow3)
             addView(buttonRow4)
+            addView(buttonRow5)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -669,6 +729,175 @@ class MainActivity : AppCompatActivity() {
         CaptureLogBus.log("[Activity] [UsageTest] Da doi sang usage=${selected.label} - bam 'Bat Mic Loopback' de test qua loa/BT that.")
     }
 
+    // =========================================================================
+    // PHASE 5 - PHONG KARAOKE LAN (WEBRTC + QR)
+    // =========================================================================
+
+    /**
+     * MAY A (Mixer): khoi dong Phong Karaoke - mo SignalingServer (WebSocket
+     * LAN), sinh ma QR chua thong tin phong, hien thi de May B/C quet.
+     *
+     * ✅ Yeu cau truoc khi bam nut nay: da bat capture nhac (Phase 1) VA da
+     * bat Mixer Test (Phase 3/4) - neu chua, PCM cua mic tu xa se khong co
+     * noi nao de "hoa vao" (PlaybackCaptureService.pushRemoteVocalChunk se
+     * tu bo qua neu mixer chua chay, khong crash nhung cung khong co tac
+     * dung gi - nen canh bao truoc cho ro rang thay vi de nguoi dung tu hoi
+     * sao khong nghe thay gi).
+     */
+    private fun startHostRoom() {
+        if (!PlaybackCaptureService.isMixerTestActive()) {
+            Toast.makeText(
+                this,
+                "Chua bat Mixer Test - hay bat Mixer Test truoc khi tao phong, neu khong Mic tu xa se khong co cho de hoa vao",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+
+        val qrData = QrJoinData.generate(this)
+        if (qrData == null) {
+            Toast.makeText(this, "Khong tim thay IP Wi-Fi! Hay ket noi cung mang Wi-Fi (hoac bat Hotspot).", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        webRtcManager = WebRtcManager(this).apply {
+            onRemotePcmChunk = { _, buffer, size ->
+                // Do thang giong hat cua Mic tu xa vao Mixer dang chay cua May A.
+                PlaybackCaptureService.pushRemoteVocalChunk(buffer, size)
+            }
+        }
+
+        signalingServer = SignalingServer(
+            port = qrData.port,
+            expectedRoomId = qrData.roomId,
+            expectedToken = qrData.token,
+            listener = object : SignalingServer.Listener {
+                override fun onMicConnected(clientId: String) {
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Mic '$clientId' da ket noi!", Toast.LENGTH_SHORT).show() }
+                }
+                override fun onMicDisconnected(clientId: String) {
+                    webRtcManager?.removeClient(clientId)
+                }
+                override fun onOfferReceived(clientId: String, sdp: String) {
+                    webRtcManager?.handleRemoteOffer(
+                        clientId = clientId,
+                        sdp = sdp,
+                        onAnswerCreated = { answerSdp -> signalingServer?.sendAnswer(clientId, answerSdp) },
+                        onIceCandidateGenerated = { mid, idx, cand -> signalingServer?.sendIce(clientId, mid, idx, cand) }
+                    )
+                }
+                override fun onIceReceived(clientId: String, sdpMid: String, sdpMLineIndex: Int, candidate: String) {
+                    webRtcManager?.addRemoteIceCandidate(clientId, sdpMid, sdpMLineIndex, candidate)
+                }
+            }
+        ).apply { start() }
+
+        showQrCodeDialog(qrData)
+    }
+
+    private fun showQrCodeDialog(qrData: QrJoinData) {
+        val barcodeEncoder = com.journeyapps.barcodescanner.BarcodeEncoder()
+        val bitmap = barcodeEncoder.encodeBitmap(qrData.toUriString(), com.google.zxing.BarcodeFormat.QR_CODE, 600, 600)
+
+        val imageView = android.widget.ImageView(this).apply { setImageBitmap(bitmap) }
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Phong: ${qrData.roomId} (IP: ${qrData.host})")
+            .setView(imageView)
+            .setPositiveButton("Dong") { d, _ -> d.dismiss() }
+            .setNegativeButton("Dung phong") { _, _ -> stopHostRoom() }
+            .create()
+        dialog.show()
+    }
+
+    private fun stopHostRoom() {
+        signalingServer?.stopServer()
+        signalingServer = null
+        webRtcManager?.closeAll()
+        webRtcManager = null
+        Toast.makeText(this, "Da dong phong Karaoke", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * MAY B/C: quet ma QR va gia nhap phong cua May A.
+     */
+    private fun joinRoomFromQr(rawUri: String) {
+        val qrData = QrJoinData.parse(rawUri)
+        if (qrData == null) {
+            Toast.makeText(this, "Ma QR khong dung dinh dang phong Karaoke!", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val myClientId = "Mic-" + (100..999).random()
+        webRtcManager = WebRtcManager(this)
+
+        val serverUri = java.net.URI("ws://${qrData.host}:${qrData.port}")
+        signalingClient = SignalingClient(
+            serverUri = serverUri,
+            roomId = qrData.roomId,
+            token = qrData.token,
+            clientId = myClientId,
+            listener = object : SignalingClient.Listener {
+                override fun onConnectedToMixer() {}
+                override fun onJoinedSuccess() {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Da vao phong! Dang truyen am thanh...", Toast.LENGTH_SHORT).show()
+                        startWirelessMicStream()
+                    }
+                }
+                override fun onJoinFailed(reason: String) {
+                    runOnUiThread { Toast.makeText(this@MainActivity, "Khong the vao phong: $reason", Toast.LENGTH_LONG).show() }
+                }
+                override fun onAnswerReceived(sdp: String) {
+                    webRtcManager?.handleRemoteAnswer(myClientId, sdp)
+                }
+                override fun onIceReceived(sdpMid: String, sdpMLineIndex: Int, candidate: String) {
+                    webRtcManager?.addRemoteIceCandidate(myClientId, sdpMid, sdpMLineIndex, candidate)
+                }
+                override fun onDisconnected() {
+                    runOnUiThread { stopWirelessMicStream() }
+                }
+            }
+        ).apply { connect() }
+    }
+
+    private fun startWirelessMicStream() {
+        // ✅ MOI: chan chay chong voi Mic Loopback/Mixer Test cua chinh may
+        // nay - dung tinh than kiem tra da co san o toggleMixerTest(), tranh
+        // 2 nguon cung xin AudioRecord doc quyen mic cua he thong.
+        if (micLoopbackRunning || mixerTestRunning) {
+            Toast.makeText(
+                this,
+                "May nay dang chay Mic Loopback hoac Mixer Test - hay tat truoc khi lam Mic khong day cho phong",
+                Toast.LENGTH_LONG
+            ).show()
+            stopWirelessMicStream()
+            return
+        }
+
+        val client = signalingClient ?: return
+        webRtcManager?.startClientPeer(
+            signalingClient = client,
+            onIceCandidateGenerated = { mid, idx, cand -> client.sendIce(mid, idx, cand) },
+            onConnected = {
+                CaptureLogBus.log("[Mic] WebRTC da thong mang! Bat dau thu am gui di...")
+                val mic = MicInput(this)
+                wirelessMicInput = mic
+                mic.startCapture(onPcmChunk = { buffer, size ->
+                    webRtcManager?.sendPcmChunkFromMic(buffer, size)
+                })
+            }
+        )
+    }
+
+    private fun stopWirelessMicStream() {
+        wirelessMicInput?.stopCapture()
+        wirelessMicInput = null
+        signalingClient?.close()
+        signalingClient = null
+        webRtcManager?.closeAll()
+        webRtcManager = null
+        Toast.makeText(this, "Da ngat ket noi Mic", Toast.LENGTH_SHORT).show()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
 
@@ -699,6 +928,19 @@ class MainActivity : AppCompatActivity() {
         // luc dang boost volume test ma quen tat Mic Loopback, khoi phuc o
         // day - tranh de bao thuc that cua nguoi dung bi ket o muc max.
         restoreBoostedStreamVolumeIfAny()
+
+        // ✅ MOI (Phase 5): don dep Phong Karaoke LAN neu Activity bi huy
+        // trong luc dang lam Mixer (May A) hoac Mic khong day (May B) -
+        // tranh ro ri WebSocket server/PeerConnection/AudioRecord neu nguoi
+        // dung thoat app dot ngot ma quen bam "Dung phong"/ngat ket noi.
+        signalingServer?.stopServer()
+        signalingServer = null
+        signalingClient?.close()
+        signalingClient = null
+        webRtcManager?.closeAll()
+        webRtcManager = null
+        wirelessMicInput?.stopCapture()
+        wirelessMicInput = null
     }
 
     // ✅ MOI (Phase 3): bat/tat mixer test qua Intent action gui toi Service

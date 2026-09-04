@@ -270,6 +270,35 @@ class PlaybackCaptureService : Service() {
 
         fun isCapturing(): Boolean = capturingActive
         fun isMixerTestActive(): Boolean = mixerTestActive
+
+        // ✅ MOI (Phase 5): tham chieu tinh (companion) toi LowLatencyMixer
+        // DANG CHAY, de WebRtcManager (chay o tang UI/MainActivity, KHONG
+        // biet gi ve noi bo Service) co the day PCM cua mic tu xa (May B/C)
+        // thang vao mixer ma khong can Bind Service hay AIDL/Messenger phuc
+        // tap - giong tinh than activityRef trong MainActivity.kt (WeakReference
+        // + bien static don gian, vi ca 2 chay chung 1 process).
+        //
+        // @Volatile vi duoc ghi tu thread cua startMixerTestInternal()/
+        // stopMixerTestInternal() (co the chay tu Main thread hoac tu
+        // serviceScope tuy duong goi) va doc tu thread cua WebRTC DataChannel
+        // callback (thread rieng cua thu vien WebRTC, khong phai thread nao
+        // trong so cac coroutine dispatcher da biet cua app) - can dam bao
+        // gia tri moi nhat luon thay duoc giua cac thread, khong bi cache
+        // stale o CPU core khac.
+        @Volatile
+        private var activeMixerInstance: LowLatencyMixer? = null
+
+        /**
+         * ✅ MOI (Phase 5): goi tu WebRtcManager.onRemotePcmChunk (May A nhan
+         * duoc PCM tu Mic khong day qua WebRTC DataChannel) - day THANG vao
+         * LowLatencyMixer dang chay, hoa chung voi nhac YouTube + Mic tai cho
+         * (neu co). An toan goi khi mixer dang KHONG chay (activeMixerInstance
+         * = null) - tu bo qua, khong crash, giong quy uoc onToggle/pushVocal
+         * cua cac noi khac trong app.
+         */
+        fun pushRemoteVocalChunk(buffer: ShortArray, size: Int) {
+            activeMixerInstance?.pushVocal(buffer, size)
+        }
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -603,6 +632,11 @@ class PlaybackCaptureService : Service() {
         vocalCompressor = compressor
         vocalEcho = echo
         finalMixLimiter = finalLimiterInstance
+        // ✅ MOI (Phase 5): cong bo mixer nay ra companion object de
+        // WebRtcManager.onRemotePcmChunk (chay o tang UI, xem giai thich chi
+        // tiet o khai bao activeMixerInstance) co the day PCM cua mic tu xa
+        // vao thang mixer dang chay.
+        activeMixerInstance = mix
 
         // ✅ MOI: chuoi xu ly vocal day du - Limiter (chan feedback am hoc,
         // vi tri quan trong nhat, KHONG doi) -> EQ -> Compressor -> Echo ->
@@ -683,6 +717,11 @@ class PlaybackCaptureService : Service() {
         vocalEcho = null
         finalMixLimiter?.reset()
         finalMixLimiter = null
+        // ✅ MOI (Phase 5): go tham chieu ngay khi mixer dung, tranh
+        // WebRtcManager con giu PCM cua mic tu xa day vao 1 mixer da
+        // dung/huy (pushVocal se khong crash vi mixer=null se duoc kiem tra
+        // truoc, nhung go som van gon hon, tranh push vao instance "zombie").
+        activeMixerInstance = null
 
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (musicMuteAppliedByMixerTest) {
