@@ -11,22 +11,38 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Phase 5 - Quan tri ket noi WebRTC LAN cho karaoke.
  *
- * ⚠️ LUA CHON KIEN TRUC: dung DataChannel (khong thu tu, khong retransmit -
- * chuan UDP thuan) de truyen PCM THO (ShortArray) truc tiep, THAY VI dung
- * AudioTrack/MediaStreamTrack chuan cua WebRTC (von se tu dong encode Opus,
- * co jitter buffer/NetEQ san). Ly do: toan bo pipeline hien tai (Mixer,
- * Limiter, EQ...) deu thao tac truc tiep tren ShortArray PCM tho - dung
- * AudioTrack chuan cua WebRTC se bat buoc phai giai ma Opus roi tu tay lay
- * lai PCM qua 1 lop API rieng (AudioDeviceModule tuy bien), phuc tap hon
- * nhieu so voi loi ich mang lai o quy mo 2-3 may LAN.
+ * ⚠️ LUA CHON KIEN TRUC: dung DataChannel (khong dung AudioTrack/MediaStreamTrack
+ * chuan cua WebRTC) de truyen PCM THO (ShortArray) truc tiep. Ly do: toan bo
+ * pipeline hien tai (Mixer, Limiter, EQ...) deu thao tac truc tiep tren
+ * ShortArray PCM tho - dung AudioTrack chuan cua WebRTC se bat buoc phai
+ * giai ma Opus roi tu tay lay lai PCM qua 1 lop API rieng (AudioDeviceModule
+ * tuy bien), phuc tap hon nhieu so voi loi ich mang lai o quy mo 2-3 may LAN.
  *
  * ⚠️ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
- * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN,
- * nhung se la van de neu sau nay muon chay qua mang di dong/4G. Ngoai ra,
- * "ordered=false, maxRetransmits=0" nghia la KHONG co jitter buffer/PLC
- * (Packet Loss Concealment) nao ca - neu mang chap chon, se nghe tieng
- * "khuyet" thay vi duoc lam min nhu cuoc goi VoIP thuc su. Chap nhan duoc
- * cho v1 tren LAN on dinh, ghi chu lai de biet gioi han khi mo rong sau nay.
+ * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN.
+ *
+ * ✅ CAP NHAT (fix "tieng ret ret cua Mic B qua mang, trong khi Mic A tai
+ * cho luon muot" - phat hien qua so sanh thuc te 2 nguon): truoc day
+ * DataChannel.Init() dat ordered=false, maxRetransmits=0 - nghia la UDP
+ * THUAN TUYET DOI: BAT KY goi PCM ~40ms nao bi rot tren Wi-Fi (rat thuong
+ * xay ra tren mang thuc te, dac biet qua Hotspot hoac Wi-Fi dong nguoi dung)
+ * se KHONG BAO GIO duoc gui lai - tao thanh 1 khoang trong PCM dot ngot
+ * (thay vi noi tiep lien tuc) o dung diem do, nghe nhu tieng "ret/tach" ro
+ * rang. Day chinh la nguyen nhan khien Mic B (qua mang) co tieng ret ret
+ * con Mic A (tai cho, khong qua mang) thi luon on dinh - vi Mic A khong he
+ * di qua DataChannel/mang, khong co co hoi mat goi.
+ *
+ * Sua: doi maxRetransmits=0 -> maxRetransmits=1 (giu ordered=false) - cho
+ * phep gui lai TOI DA 1 LAN neu goi dau bi mat, ma KHONG bat "ordered" (vi
+ * ordered=true se bat WebRTC PHAI cho goi truoc den du, gay tich luy do tre
+ * neu co goi bi mat lien tuc - hoan toan sai voi muc tieu do tre thap cua
+ * karaoke). 1 lan retransmit la muc can bang: du tang do tre trung binh
+ * len 1 chieu round-trip (thuong chi vai ms tren LAN cung Wi-Fi), nhung du
+ * de "cuu" phan lon cac goi bi rot ngau nhien don le - loai bo nay khong
+ * loai het duoc tieng ret (neu mang thuc su te lien tuc, van se con mat
+ * goi sau ca lan retry), nhung giam dang ke tan suat so voi khong retry gi
+ * ca. Neu sau nay van con nghe ret ret ro sau khi test, co the thu tang
+ * len maxRetransmits=2 (danh doi them chut do tre de on dinh hon nua).
  *
  * ⚠️ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
  * nhu PLAN.md muc 7 mo ta - moi client co 1 scratch buffer PCM RIENG
@@ -41,6 +57,13 @@ class WebRtcManager(private val context: Context) {
     companion object {
         private const val TAG = "WebRtcManager"
         private const val CHANNEL_LABEL = "karaoke_pcm_stream"
+
+        // ✅ MOI (xem giai thich chi tiet o dau file): cho phep gui lai TOI
+        // DA 1 lan neu goi PCM dau bi rot tren mang - can bang giua do tre
+        // thap (khong dung ordered=true) va giam tieng ret do mat goi don
+        // le. Dat thanh hang so o day de de dang chinh lai (vi du thu 2)
+        // neu test thuc te van con nghe ret sau ban sua nay.
+        private const val DATA_CHANNEL_MAX_RETRANSMITS = 1
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -111,10 +134,13 @@ class WebRtcManager(private val context: Context) {
 
         peerConnections[signalingClient.clientId] = pc
 
-        // Tao DataChannel cau hinh toi uu do tre (Unordered, MaxRetransmits = 0 -> thuan UDP)
+        // ✅ SUA (fix tieng ret ret - xem giai thich chi tiet o dau file):
+        // doi maxRetransmits tu 0 (UDP thuan, khong retry) -> 1 (cho phep
+        // gui lai 1 lan) - giu nguyen ordered=false (KHONG doi thanh true,
+        // tranh gay tich luy do tre neu goi bi mat lien tuc).
         val init = DataChannel.Init().apply {
             ordered = false
-            maxRetransmits = 0
+            maxRetransmits = DATA_CHANNEL_MAX_RETRANSMITS
         }
         localDataChannel = pc.createDataChannel(CHANNEL_LABEL, init)
 

@@ -26,6 +26,9 @@ import com.karaokeapp.audio.processor.VocalProcessor
 import com.karaokeapp.audio.processor.Compressor
 import com.karaokeapp.audio.processor.EchoReverb
 import com.karaokeapp.overlay.MixerToggleOverlayButton
+import com.karaokeapp.webrtc.QrJoinData
+import com.karaokeapp.webrtc.SignalingServer
+import com.karaokeapp.webrtc.WebRtcManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,7 +43,8 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Foreground service quan ly toan bo pipeline: capture nhac (Phase 1),
  * Mixer Test (Music + Mic -> LowLatencyMixer -> OutputRouter, Phase 3),
- * va co che tu phuc hoi am luong khi bat lai Mixer Test.
+ * Phong Karaoke LAN (Phase 5 - xem giai thich chi tiet ben duoi), va co che
+ * tu phuc hoi am luong khi bat lai Mixer Test.
  *
  * Co che mute STREAM_MUSIC + phat mixer qua STREAM_SYSTEM (usage
  * ASSISTANCE_SONIFICATION) da duoc xac nhan qua test thuc te: capture tap
@@ -61,6 +65,29 @@ import java.util.concurrent.ConcurrentHashMap
  * cong THEM 1 Limiter RIENG cho tung nguon remote (remoteVocalLimiters) -
  * vi PCM tu WebRTC la RAW, CHUA qua chuoi Limiter/EQ/Compressor/Echo (chuoi
  * do CHI ap dung cho mic VAT LY cua chinh May A).
+ *
+ * ✅ MOI (fix goc "May B mat ket noi moi lan bam play/pause tren May A" -
+ * BUG QUAN TRONG vua phat hien): truoc day hostSignalingServer/hostWebRtcManager
+ * (server WebSocket + WebRTC phia Host cua Phong Karaoke) la 2 field cua
+ * MainActivity, va MainActivity.onDestroy() chu dong goi
+ * signalingServer?.stopServer() + webRtcManager?.closeAll(). Van de: Activity
+ * (khac voi foreground Service) KHONG duoc OS bao ve khoi bi thu hoi khi lui
+ * xuong nen - nhieu OEM (dac biet Honor, da xac nhan qua hang loat bug
+ * "duck HAL/OEM" trong OutputRouter.kt) chu dong HUY Activity dang o nen de
+ * tiet kiem RAM NGAY CA KHI tien trinh van con song (nho co
+ * PlaybackCaptureService dang chay foreground). Ket qua: moi lan nguoi dung
+ * roi app Karaoke de bam play/pause tren YouTube, Android co the huy
+ * MainActivity bat cu luc nao -> onDestroy() chay -> phong Karaoke bi dong
+ * ngay lap tuc, du nguoi dung khong he chu dong bam "Dung phong".
+ *
+ * Sua: chuyen TOAN BO logic Host (SignalingServer + WebRtcManager phia May
+ * A) vao day (Service) - noi da duoc bao ve boi foreground service tu truoc
+ * (Mixer/MusicInput cung song trong Service vi ly do tuong tu), NEN se song
+ * bang vong doi voi Mixer, khong con phu thuoc vao viec MainActivity co bi
+ * OS don dep hay khong. MainActivity gio CHI con gui Intent
+ * (ACTION_START_HOST_ROOM/ACTION_STOP_HOST_ROOM) va nhan ket qua qua 3
+ * callback tinh (onRoomReadyCallback/onRoomErrorCallback/onRoomMicStatusCallback)
+ * - giong tinh than onResumedCallback/refreshMixerTestButtonState() da co san.
  */
 class PlaybackCaptureService : Service() {
 
@@ -77,6 +104,18 @@ class PlaybackCaptureService : Service() {
     private var vocalCompressor: Compressor? = null
     private var vocalEcho: EchoReverb? = null
     private var finalMixLimiter: Limiter? = null
+
+    // ✅ MOI (xem giai thich day du o dau file): Host Room (SignalingServer +
+    // WebRtcManager phia May A) chuyen vao Service de song bang vong doi voi
+    // Mixer/MusicInput, KHONG con bi huy theo MainActivity.onDestroy() nua.
+    private var hostSignalingServer: SignalingServer? = null
+    private var hostWebRtcManager: WebRtcManager? = null
+
+    // ✅ MOI: theo doi cac clientId (May B/C) dang ket noi vao phong hien
+    // tai - dung de don sach dung "kenh" vocal cua tung may (xem
+    // removeRemoteVocalSource()) khi dong ca phong (khong chi khi tung may
+    // rieng le ngat ket noi).
+    private val connectedRemoteClientIds = java.util.concurrent.CopyOnWriteArraySet<String>()
 
     private var savedStreamSystemVolume = -1
 
@@ -127,6 +166,13 @@ class PlaybackCaptureService : Service() {
         const val ACTION_STOP_MIXER_TEST = "com.karaokeapp.action.STOP_MIXER_TEST"
         const val ACTION_STOP_ALL = "com.karaokeapp.action.STOP_ALL"
 
+        // ✅ MOI (fix "May B mat ket noi khi bam play/pause tren May A"): 2
+        // action moi de MainActivity YEU CAU Service tu mo/dong Phong
+        // Karaoke, THAY VI Activity tu lam lay - xem giai thich chi tiet o
+        // khai bao hostSignalingServer/hostWebRtcManager phia tren.
+        const val ACTION_START_HOST_ROOM = "com.karaokeapp.action.START_HOST_ROOM"
+        const val ACTION_STOP_HOST_ROOM = "com.karaokeapp.action.STOP_HOST_ROOM"
+
         private const val GUARD_STATUS_LOG_EVERY_N_TICKS = 10
         private const val ENABLE_MUSIC_STREAM_MUTE_GUARD = true
 
@@ -152,6 +198,17 @@ class PlaybackCaptureService : Service() {
 
         @Volatile
         private var activeMixerInstance: LowLatencyMixer? = null
+
+        // ✅ MOI: luu QrJoinData cua phong Karaoke DANG CHAY (null = khong co
+        // phong nao) - dung de MainActivity (co the bi tao lai bat ky luc
+        // nao do xoay man hinh hoac OS don dep) hoi lai trang thai HIEN TAI
+        // cua phong ma khong can tu giu bien rieng (von se mat khi Activity
+        // bi huy/tao lai, chinh la nguyen nhan goc cua bug nay).
+        @Volatile
+        private var activeRoomQrData: QrJoinData? = null
+
+        fun isHostRoomActive(): Boolean = activeRoomQrData != null
+        fun getActiveRoomQrData(): QrJoinData? = activeRoomQrData
 
         private val vocalPushLock = Any()
 
@@ -199,9 +256,9 @@ class PlaybackCaptureService : Service() {
 
         /**
          * ✅ MOI: goi khi 1 May B/C ngat ket noi (SignalingServer.Listener.
-         * onMicDisconnected, xem MainActivity.kt) - don sach ring buffer +
-         * Limiter rieng cua no khoi mixer, tranh giu lai 1 nguon "ma" (khong
-         * con push nua nhung van chiem cho trong vocalBuffers cua mixer).
+         * onMicDisconnected) - don sach ring buffer + Limiter rieng cua no
+         * khoi mixer, tranh giu lai 1 nguon "ma" (khong con push nua nhung
+         * van chiem cho trong vocalBuffers cua mixer).
          */
         fun removeRemoteVocalSource(clientId: String) {
             remoteVocalLimiters.remove(clientId)
@@ -257,6 +314,10 @@ class PlaybackCaptureService : Service() {
 
     private fun stopCurrentSessionIfAny() {
         cancelPendingReactivation()
+        // ✅ MOI: dong Phong Karaoke (neu co) TRUOC khi dung Mixer Test - ca
+        // phien Phase 1 ket thuc nghia la khong con noi nao de PCM cua Mic
+        // tu xa hoa vao nua, nen phong cung khong con y nghia gi de giu lai.
+        stopHostRoomInternal()
         stopMixerTestInternal()
         musicInput?.stopCapture()
         musicInput = null
@@ -403,6 +464,115 @@ class PlaybackCaptureService : Service() {
                 "co su kien chuyen foreground THAT nao xay ra.",
             isError = true
         )
+    }
+
+    /**
+     * ✅ MOI (fix goc "May B mat ket noi moi lan bam play/pause tren May A"):
+     * chuyen TOAN BO logic mo Phong Karaoke (truoc day nam trong
+     * MainActivity.startHostRoom()) vao chay trong Service - noi duoc bao
+     * ve boi foreground service, KHONG bi OS chu dong huy khi nguoi dung
+     * chuyen sang app khac (YouTube) nhu Activity truoc day. Logic ben
+     * trong (tao QrJoinData, tao WebRtcManager, tao SignalingServer voi
+     * Listener) giu NGUYEN so voi ban goc trong MainActivity, chi doi noi
+     * chay va cach bao ket qua ve UI (qua callback tinh trong MainActivity:
+     * onRoomReadyCallback/onRoomErrorCallback/onRoomMicStatusCallback thay
+     * vi goi truc tiep AlertDialog/Toast tai cho, vi Service KHONG co quyen
+     * truy cap UI truc tiep).
+     */
+    private fun startHostRoomInternal() {
+        if (hostSignalingServer != null || hostWebRtcManager != null) {
+            logBoth("[PhongKaraoke] Dang co phong cu chay - tu dong dong truoc khi tao phong moi")
+            stopHostRoomInternal()
+        }
+
+        if (!mixerTestActive) {
+            logBoth(
+                "[PhongKaraoke] ⚠️ Chua bat Mixer Test - Mic tu xa se khong co cho de hoa vao " +
+                    "cho toi khi ban bat Mixer Test."
+            )
+        }
+
+        val qrData = QrJoinData.generate(applicationContext)
+        if (qrData == null) {
+            logBoth("[PhongKaraoke] ❌ Khong tim thay IP Wi-Fi - khong the tao phong.", isError = true)
+            MainActivity.onRoomErrorCallback?.invoke(
+                "Khong tim thay IP Wi-Fi! Hay ket noi cung mang Wi-Fi (hoac bat Hotspot)."
+            )
+            return
+        }
+
+        val manager = WebRtcManager(applicationContext).apply {
+            onRemotePcmChunk = { clientId, buffer, size ->
+                pushRemoteVocalChunk(clientId, buffer, size)
+            }
+        }
+
+        val server = SignalingServer(
+            port = qrData.port,
+            expectedRoomId = qrData.roomId,
+            expectedToken = qrData.token,
+            listener = object : SignalingServer.Listener {
+                override fun onMicConnected(clientId: String) {
+                    connectedRemoteClientIds.add(clientId)
+                    MainActivity.onRoomMicStatusCallback?.invoke(clientId, true)
+                }
+
+                override fun onMicDisconnected(clientId: String) {
+                    connectedRemoteClientIds.remove(clientId)
+                    hostWebRtcManager?.removeClient(clientId)
+                    // ✅ Don sach dung kenh vocal cua clientId nay khoi mixer
+                    // (xem removeRemoteVocalSource() da co san o companion).
+                    removeRemoteVocalSource(clientId)
+                    MainActivity.onRoomMicStatusCallback?.invoke(clientId, false)
+                }
+
+                override fun onOfferReceived(clientId: String, sdp: String) {
+                    hostWebRtcManager?.handleRemoteOffer(
+                        clientId = clientId,
+                        sdp = sdp,
+                        onAnswerCreated = { answerSdp -> hostSignalingServer?.sendAnswer(clientId, answerSdp) },
+                        onIceCandidateGenerated = { mid, idx, cand -> hostSignalingServer?.sendIce(clientId, mid, idx, cand) }
+                    )
+                }
+
+                override fun onIceReceived(clientId: String, sdpMid: String, sdpMLineIndex: Int, candidate: String) {
+                    hostWebRtcManager?.addRemoteIceCandidate(clientId, sdpMid, sdpMLineIndex, candidate)
+                }
+            }
+        ).apply { start() }
+
+        hostWebRtcManager = manager
+        hostSignalingServer = server
+        activeRoomQrData = qrData
+
+        logBoth(
+            "[PhongKaraoke] ✅ Da mo phong '${qrData.roomId}' tai ${qrData.host}:${qrData.port} " +
+                "- CHAY TRONG SERVICE (khong con bi dong khi Activity bi OS don dep luc backgrounded)."
+        )
+        MainActivity.onRoomReadyCallback?.invoke(qrData)
+    }
+
+    /**
+     * ✅ MOI: dong Phong Karaoke - goi khi nguoi dung bam "Dung phong" (qua
+     * Intent tu MainActivity), hoac tu dong khi ca phien Phase 1 ket thuc
+     * (xem stopCurrentSessionIfAny()). An toan goi nhieu lan / khi chua co
+     * phong nao (tu kiem tra null o dau ham).
+     */
+    private fun stopHostRoomInternal() {
+        if (hostSignalingServer == null && hostWebRtcManager == null) return
+
+        hostSignalingServer?.stopServer()
+        hostSignalingServer = null
+        hostWebRtcManager?.closeAll()
+        hostWebRtcManager = null
+
+        // Don sach het cac "kenh" vocal cua tat ca May B/C con lai cua
+        // phien phong vua dong - tranh mixer giu lai nguon "ma".
+        connectedRemoteClientIds.forEach { removeRemoteVocalSource(it) }
+        connectedRemoteClientIds.clear()
+        activeRoomQrData = null
+
+        logBoth("[PhongKaraoke] 🛑 Da dong Phong Karaoke.")
     }
 
     private fun startMixerTestInternal() {
@@ -606,6 +776,14 @@ class PlaybackCaptureService : Service() {
             ACTION_STOP_MIXER_TEST -> {
                 cancelPendingReactivation()
                 stopMixerTestInternal()
+                return START_NOT_STICKY
+            }
+            ACTION_START_HOST_ROOM -> {
+                startHostRoomInternal()
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_HOST_ROOM -> {
+                stopHostRoomInternal()
                 return START_NOT_STICKY
             }
             ACTION_STOP_ALL -> {

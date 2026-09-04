@@ -29,7 +29,6 @@ import com.karaokeapp.audio.music.PlaybackCaptureService
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.webrtc.QrJoinData
 import com.karaokeapp.webrtc.SignalingClient
-import com.karaokeapp.webrtc.SignalingServer
 import com.karaokeapp.webrtc.WebRtcManager
 
 /**
@@ -38,72 +37,65 @@ import com.karaokeapp.webrtc.WebRtcManager
  * ✅ CAP NHAT: khong con cho nguoi dung bam nut "Test Capture" nua - toan bo
  * flow xin quyen (RECORD_AUDIO -> dialog MediaProjection he thong -> start
  * PlaybackCaptureService) duoc tu dong kich hoat ngay trong onCreate(), moi
- * lan mo app. Ly do: MediaProjection la loai quyen Android BAT BUOC nguoi
- * dung phai tu tay bam dong y dialog he thong moi lan (khong co API nao cho
- * phep app tu xin ngam quyen nay, day la co che chong app len quay man hinh
- * cua chinh Android, khong lien quan gi toi code cua app). Vi vay day la muc
- * tu dong hoa GAN NHAT co the dat duoc: "mo app la thay dialog xin quyen
- * ngay", thay vi phai tim nut bam trong app truoc.
- *
- * Nut "Test Capture" cu van duoc GIU LAI (doi ten thanh "Xin quyen lai") de
- * nguoi dung chu dong bam lai neu vi ly do gi day flow tu dong luc mo app
- * khong chay (vi du: nguoi dung tu choi quyen luc dau, hoac quay lai app
- * sau khi service da bi OS kill va muon thu lai ma khong can khoi dong lai
- * app).
+ * lan mo app.
  *
  * ✅ MOI (fix "Mixer Test chi song ~5 giay roi im, phai thu app xuong moi to
- * lai" - xem giai thich chi tiet trong MixerToggleOverlayButton.kt): them flow xin
- * quyen "Hien thi tren ung dung khac" (SYSTEM_ALERT_WINDOW) - can de
- * PlaybackCaptureService co the hien nut noi "🔊 Kich hoat lai" DE TREN
- * YouTube trong luc Mixer Test dang chay. Day la 1 "special permission" cua
- * Android, KHONG xin duoc qua ActivityResultContracts.RequestPermission()
- * thong thuong nhu RECORD_AUDIO - bat buoc phai dan nguoi dung sang 1 man
- * hinh Settings rieng (Settings.ACTION_MANAGE_OVERLAY_PERMISSION) de ho tu
- * bat cong tac thu cong, roi tu quay lai app (khong co callback "granted"
- * truc tiep nhu request thuong - phai tu kiem tra lai Settings.canDrawOverlays()
- * sau khi quay lai).
+ * lai"): them flow xin quyen "Hien thi tren ung dung khac" (SYSTEM_ALERT_WINDOW).
+ *
+ * ⚠️ CAP NHAT LON NHAT (fix "May B mat ket noi moi lan bam play/pause tren
+ * May A" - xem giai thich chi tiet trong PlaybackCaptureService.kt):
+ * TOAN BO logic mo/dong Phong Karaoke (SignalingServer + WebRtcManager phia
+ * Host) da CHUYEN KHOI file nay, sang chay trong PlaybackCaptureService -
+ * noi duoc bao ve boi foreground service, KHONG bi OS chu dong huy khi
+ * nguoi dung chuyen sang app khac (YouTube) nhu chinh MainActivity nay
+ * truoc day. MainActivity gio CHI con:
+ * 1. Gui Intent ACTION_START_HOST_ROOM/ACTION_STOP_HOST_ROOM toi Service.
+ * 2. Nhan ket qua qua 3 callback TINH (giong tinh than onResumedCallback/
+ *    refreshMixerTestButtonState() da co san tu truoc):
+ *    - onRoomReadyCallback: phong da mo xong, co QrJoinData de hien QR.
+ *    - onRoomErrorCallback: mo phong that bai (vi du khong tim thay IP).
+ *    - onRoomMicStatusCallback: 1 May B/C vua ket noi/ngat ket noi.
+ * 3. Trong onResume(), tu hoi lai PlaybackCaptureService.getActiveRoomQrData()
+ *    de biet phong CO DANG CHAY khong (co the da duoc mo tu truoc khi
+ *    Activity nay bi tao lai do xoay man hinh/OS don dep) - dam bao dialog
+ *    QR/trang thai nut khong bi "quen" mat du Service van dang giu phong.
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        // ✅ MOI (fix "chuoi Bat lai qua nut noi doan gio co dinh 1s la KHONG
-        // du, vi startActivity() tu Service khong dam bao Activity da THAT
-        // SU len foreground trong khoang do"): callback tuy chon, duoc
-        // PlaybackCaptureService gan truoc khi goi startActivity() dua
-        // MainActivity len - se duoc goi CHINH XAC luc onResume() THAT SU
-        // chay (tuc Activity da o trang thai foreground/resumed that), thay
-        // vi Service phai doan mo 1 khoang thoi gian co dinh. Dùng bien
-        // static don gian (khong LiveData/Flow) vi chi co 1 Activity + 1
-        // Service trong cung process, giong tinh than CaptureLogBus.
         @Volatile
         var onResumedCallback: (() -> Unit)? = null
 
-        // ✅ MOI (fix "nut trong app hien sai trang thai vinh vien sau khi
-        // chuoi tu dong bat/tat Mixer Test tu nut noi chay xong"): truoc day
-        // MainActivity CHI dong bo lai chu cua nut trong onResume() - nhung
-        // tu khi co chuoi "Bat lai qua nut noi" (PlaybackCaptureService),
-        // mixerTestActive co the doi trang thai NGAY TRONG LUC Activity nay
-        // dang o foreground/resumed (khong co onResume() moi nao xay ra nua
-        // de kich hoat dong bo), dan den nut bi "lech" so voi trang thai
-        // thuc te cho toi khi nguoi dung roi app roi quay lai lan nua.
-        //
-        // Dung WeakReference (KHONG giu tham chieu manh truc tiep toi
-        // Activity) de Service co the goi refreshMixerTestButtonState() bat
-        // ky luc nao ma khong lam leak Activity neu no da bi huy (xoay man
-        // hinh, nguoi dung thoat app...) - luc do activityRef.get() se tra
-        // null va ham nay tu bo qua an toan.
         @Volatile
         private var activityRef: java.lang.ref.WeakReference<MainActivity>? = null
 
         /**
-         * ✅ MOI: goi tu PlaybackCaptureService moi lan mixerTestActive THAT
-         * SU doi trang thai (bat hoac tat) - bat ke nguyen nhan tu dau (nut
-         * trong app, nut noi tren man hinh, hay chuoi tu dong "Bat lai") -
-         * de cap nhat lai chu cua nut trong app NGAY LAP TUC neu Activity
-         * dang con song, thay vi doi den lan onResume() ke tiep (co the
-         * khong bao gio xay ra neu nguoi dung khong tu quay lai app trong
-         * luc dang xem YouTube).
+         * ✅ MOI (Phong Karaoke - xem giai thich day du o dau file): goi tu
+         * PlaybackCaptureService.startHostRoomInternal() khi phong VUA MO
+         * THANH CONG - dua qrData ve de MainActivity (neu con song) hien
+         * dialog QR. An toan neu Activity da bi huy (activityRef.get() null)
+         * - Service se khong crash, chi la khong co dialog nao hien ra luc
+         * do (nguoi dung co the tu mo lai app, onResume() se tu kiem tra lai
+         * PlaybackCaptureService.getActiveRoomQrData() de bu lai).
          */
+        @Volatile
+        var onRoomReadyCallback: ((QrJoinData) -> Unit)? = null
+
+        /**
+         * ✅ MOI: goi tu Service khi mo phong THAT BAI (vi du khong tim thay
+         * IP Wi-Fi) - dua ly do loi ve de hien Toast.
+         */
+        @Volatile
+        var onRoomErrorCallback: ((String) -> Unit)? = null
+
+        /**
+         * ✅ MOI: goi tu Service moi khi 1 May B/C ket noi/ngat ket noi vao
+         * phong hien tai - dua clientId + trang thai (true=vua ket noi,
+         * false=vua ngat) de hien Toast tuong ung.
+         */
+        @Volatile
+        var onRoomMicStatusCallback: ((String, Boolean) -> Unit)? = null
+
         fun refreshMixerTestButtonState(isRunning: Boolean) {
             val activity = activityRef?.get() ?: return
             activity.runOnUiThread {
@@ -123,57 +115,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logText: TextView
     private lateinit var logScrollView: ScrollView
 
-    // ✅ MOI: co danh dau da tu dong kich hoat flow xin quyen trong lan
-    // onCreate() nay chua - tranh goi lai nhieu lan neu onCreate() bi goi lai
-    // (vi du xoay man hinh) trong khi flow dang cho ket qua dialog.
     private var autoStartTriggered = false
 
-    // ✅ MOI (Phase 2): mic loopback test doc lap, KHONG lien quan gi toi
-    // PlaybackCaptureService/MusicInput cua Phase 1 - chi de do latency
-    // mic -> loa theo dung task Phase 2 trong PLAN.md.
     private var micInput: MicInput? = null
     private var outputRouter: OutputRouter? = null
     private var micLoopbackRunning = false
 
-    // ✅ MOI (Phase 3): trang thai bat/tat mixer test - chi gui Intent
-    // action toi Service, KHONG tu giu MicInput/Mixer o Activity (khac voi
-    // Mic Loopback cua Phase 2, vi mixer test can chay ben trong Service de
-    // song cung MusicInput dang capture nhac ngam).
     private var mixerTestRunning = false
 
-    // ✅ MOI: giu tham chieu toi nut "Bat/Tat Mixer Test" de dong bo lai chu
-    // trong onResume() - can thiet vi GIO Mixer Test co the bi bat/tat tu
-    // ben ngoai Activity (nut noi tren man hinh) trong luc Activity nay
-    // dang o nen, xem giai thich chi tiet trong PlaybackCaptureService.kt
-    // (isMixerTestActive()).
     private var mixerTestButtonRef: Button? = null
 
-    // ✅ MOI (thu nghiem "co the mute YouTube nhung MusicInput van capture
-    // duoc khong?"): CHI mute/unmute STREAM_MUSIC cua he thong - KHONG dung
-    // gi toi Mixer/OutputRouter/PlaybackCaptureService. Muc dich duy nhat: xac
-    // nhan AudioPlaybackCapture co tap tin hieu TRUOC hay SAU buoc ap dung
-    // volume cua STREAM_MUSIC. Neu loa im nhung log amplitude cua MusicInput
-    // van dao dong theo nhac -> capture tap TRUOC volume, mo ra huong kien
-    // truc "app tu mute nguon, chi phat qua OutputRouter cua chinh minh".
-    // streamMusicMuteTestActive=true nghia la dang trong trang thai da tu
-    // ha volume xuong 0 do nut nay gay ra (de biet duong nao can khoi phuc).
     private var streamMusicMuteTestActive = false
     private var savedStreamMusicVolumeBeforeTest = -1
 
-    // ✅ MOI: danh sach usage candidate de A/B test qua loa Bluetooth, dung
-    // lai chinh nut "Mic Loopback" (Phase 2) da co san co che nghe + do
-    // latency bang vo tay - khong viet lai UI/luong test tu dau.
-    //
-    // ⚠️ CO Y bo qua AudioAttributes.USAGE_VOICE_COMMUNICATION khoi danh sach
-    // nay - xem giai thich chi tiet trong OutputRouter.kt (rui ro bi ep sang
-    // Bluetooth SCO mono chat luong thoai thay vi A2DP stereo).
-    // ✅ MOI: them legacyStream tuong ung voi moi usage - can de biet CHINH
-    // XAC stream nao phai tam thoi day len max khi test, vi moi usage khac
-    // MEDIA se di qua 1 thanh volume RIENG, doc lap voi "Am luong media" ma
-    // nguoi dung quen chinh hang ngay (da xac nhan qua test thuc te: voice/
-    // mixer nghe rat nho khi doi usage, KHONG phai do usage do te, ma do
-    // thanh volume tuong ung dang o muc mac dinh thap). usage=MEDIA khong
-    // can boost gi ca - giu nguyen thanh Media hien tai cua nguoi dung.
     private data class UsageCandidate(val label: String, val usage: Int, val legacyStreamToBoost: Int?)
     private val usageCandidates = listOf(
         UsageCandidate("MEDIA (hien tai, STREAM_MUSIC)", AudioAttributes.USAGE_MEDIA, legacyStreamToBoost = null),
@@ -190,30 +144,25 @@ class MainActivity : AppCompatActivity() {
     )
     private var usageCandidateIndex = 0
 
-    // ✅ MOI: luu lai muc volume goc cua legacyStreamToBoost TRUOC khi boost,
-    // de khoi phuc dung luc tat loopback - QUAN TRONG nhat voi STREAM_ALARM
-    // (neu quen khoi phuc, bao thuc that cua may se keu rat to bat ngo lan
-    // sau). Khoi phuc o CA 2 noi: tat Mic Loopback binh thuong VA onDestroy()
-    // (phong truong hop Activity bi huy dot ngot).
     private var savedBoostedStreamVolume: Int? = null
     private var boostedLegacyStream: Int? = null
 
-    // ✅ MOI (Phase 5): phan he Phong Karaoke LAN qua WebRTC. May A (Mixer)
-    // dung signalingServer + webRtcManager (nhan PCM tu xa, day vao
-    // PlaybackCaptureService.pushRemoteVocalChunk). May B (Mic khong day)
-    // dung signalingClient + webRtcManager (gui PCM cua chinh minh di) +
-    // wirelessMicInput (MicInput RIENG, KHONG dung chung voi Mic Loopback
-    // Phase 2 hay Mixer Test Phase 3 - 3 thu nay co the ton tai doc lap,
-    // nhung KHONG nen bat cung luc tren 1 may vi se tranh nhau quyen
-    // RECORD_AUDIO/AudioRecord doc quyen cua he thong).
-    private var signalingServer: SignalingServer? = null
+    // ✅ SUA (Phase 5 - xem giai thich chi tiet o dau file): hostSignalingServer/
+    // hostWebRtcManager DA CHUYEN vao PlaybackCaptureService - Activity nay
+    // KHONG con giu 2 field do nua. wirelessMicInput (vai tro Mic B) VAN o
+    // lai day - day la mic VAT LY cua chinh may dang cam, gan chat voi vong
+    // doi cua thao tac "dang cam mic quet QR", khac ban chat voi vai tro
+    // Host (Mixer) can song ben bi OS don dep Activity.
     private var signalingClient: SignalingClient? = null
     private var webRtcManager: WebRtcManager? = null
     private var wirelessMicInput: MicInput? = null
 
-    // ✅ MOI (Phase 5): launcher quet QR cua ZXing - dang ky o cap Activity
-    // (bat buoc, giong cac ActivityResultContracts khac trong file nay),
-    // KHONG duoc goi tao trong 1 ham thuong hay se crash luc runtime.
+    // ✅ MOI: giu QrJoinData cua phong DANG hien dialog (neu co) - de biet
+    // co can tu dong mo lai dialog QR trong onResume() hay khong (truong
+    // hop phong da duoc mo tu truoc, Activity chi vua bi tao lai).
+    private var currentRoomQrData: QrJoinData? = null
+    private var roomStatusDialog: androidx.appcompat.app.AlertDialog? = null
+
     private val qrScanLauncher = registerForActivityResult(
         com.journeyapps.barcodescanner.ScanContract()
     ) { result ->
@@ -235,11 +184,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ MOI: xin rieng quyen POST_NOTIFICATIONS (bat buoc tu Android 13/API 33
-    // tro len - chi khai bao trong AndroidManifest.xml la CHUA DU, phai xin
-    // runtime permission nhu RECORD_AUDIO). Thieu quyen nay thi Service van
-    // chay binh thuong (khong crash), nhung notification se bi AN HOAN TOAN -
-    // day chinh la ly do khong thay thong bao nao ca du code da dung.
     private val requestNotificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -291,13 +235,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ MOI (xem giai thich chi tiet o dau file/MixerToggleOverlayButton.kt): quyen
-    // SYSTEM_ALERT_WINDOW KHONG co callback "granted=true/false" truc tiep nhu
-    // RequestPermission() thong thuong - Settings.ACTION_MANAGE_OVERLAY_PERMISSION
-    // chi mo 1 man hinh Settings, dong lai roi tra ve KHONG kem ket qua dang tin
-    // cay. Cach dung duoc khuyen nghi chinh thuc: dung StartActivityForResult
-    // chi de biet "nguoi dung da quay lai app", roi TU kiem tra lai
-    // Settings.canDrawOverlays(this) tai thoi diem do de biet ket qua that su.
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
@@ -314,14 +251,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * ✅ MOI: kiem tra quyen SYSTEM_ALERT_WINDOW - neu chua co, dan nguoi dung
-     * sang man hinh Settings de tu bat (co gan san package cua app qua Uri
-     * "package:..." de Settings mo dung trang cua app nay, khong phai trang
-     * danh sach chung chung). Tra ve true/false NGAY LAP TUC (dua vao trang
-     * thai HIEN TAI) de goi noi dung dung - lan dau goi thuong se tra false va
-     * mo Settings, nguoi dung can bam lai nut sau khi cap quyen xong.
-     */
     private fun ensureOverlayPermission(): Boolean {
         if (Settings.canDrawOverlays(this)) return true
         CaptureLogBus.log("[Activity] Chua co quyen 'Hien thi tren ung dung khac' - mo man hinh Settings de xin.")
@@ -341,12 +270,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ✅ MOI: dang ky instance nay vao WeakReference tinh (companion) -
-        // de PlaybackCaptureService co the goi refreshMixerTestButtonState()
-        // cap nhat UI nut Mixer Test NGAY LAP TUC bat ky luc nao, khong chi
-        // doi den onResume() ke tiep. Gan lai moi lan onCreate() (ke ca khi
-        // Activity bi tao lai do xoay man hinh) de luon tro toi instance
-        // DANG SONG hien tai.
         activityRef = java.lang.ref.WeakReference(this)
 
         statusText = TextView(this).apply {
@@ -354,8 +277,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(24, 24, 24, 8)
         }
 
-        // ✅ SUA: doi ten nut cho dung ban chat moi - day gio la nut "xin lai"
-        // du phong, khong phai buoc bat buoc dau tien nua.
         val retryButton = Button(this).apply {
             text = "Xin quyen lai"
             setOnClickListener { onTestCaptureClicked() }
@@ -374,45 +295,27 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ✅ MOI (Phase 2): nut bat/tat mic loopback (mic -> loa truc tiep,
-        // chua co mixer) - dung de vo tay truoc mic va do do tre bang video
-        // quay slow-motion, theo dung tieu chi Phase 2 trong PLAN.md.
         val micLoopbackButton = Button(this).apply {
             text = "Bat Mic Loopback"
             setOnClickListener { toggleMicLoopback(this) }
         }
 
-        // ✅ MOI (Phase 3): nut bat/tat test tron Music + Mic. Chi co tac
-        // dung khi PlaybackCaptureService dang capture nhac (Phase 1) - neu
-        // chua, se bao loi qua log thay vi lam gi ca.
         val mixerTestButton = Button(this).apply {
             text = "Bat Mixer Test"
             setOnClickListener { toggleMixerTest(this) }
         }
         mixerTestButtonRef = mixerTestButton
 
-        // ✅ MOI: nut thu nghiem rieng, KHONG lien quan Mixer/OutputRouter -
-        // chi de kiem tra gia thuyet mute STREAM_MUSIC ve 0 co lam MusicInput
-        // mat tin hieu capture hay khong (xem giai thich chi tiet o khai bao
-        // bien streamMusicMuteTestActive ben tren).
         val muteTestButton = Button(this).apply {
             text = "Test Mute STREAM_MUSIC"
             setOnClickListener { toggleStreamMusicMuteTest(this) }
         }
 
-        // ✅ MOI: nut chon usage candidate cho OutputRouter khi test qua Mic
-        // Loopback - bam de doi vong qua danh sach usageCandidates, ten nut
-        // hien usage dang chon. Bam "Bat Mic Loopback" NGAY SAU do se dung
-        // dung usage nay de tao OutputRouter, test qua loa Bluetooth that.
         val usageSelectButton = Button(this).apply {
             text = "Usage test: ${usageCandidates[usageCandidateIndex].label}"
             setOnClickListener { cycleUsageCandidate(this) }
         }
 
-        // ✅ MOI (xem giai thich chi tiet o dau file): nut xin quyen "Hien thi
-        // tren ung dung khac" - can cho nut noi "Kich hoat lai" cua Mixer Test
-        // (MixerToggleOverlayButton.kt). Doi ten nut theo trang thai hien tai moi lan
-        // onCreate() chay, de nguoi dung biet ngay khong can bam neu da cap roi.
         val overlayPermissionButton = Button(this).apply {
             text = if (Settings.canDrawOverlays(this@MainActivity)) {
                 "✅ Da co quyen hien thi noi"
@@ -446,22 +349,19 @@ class MainActivity : AppCompatActivity() {
             addView(usageSelectButton)
         }
 
-        // ✅ MOI: hang nut rieng cho quyen overlay - de tach biet ro rang voi
-        // cac nut thu nghiem khac, tranh nguoi dung nham lan day chi la 1 test
-        // nua trong so nhieu nut chan doan.
         val buttonRow4 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(overlayPermissionButton)
         }
 
-        // ✅ MOI (Phase 5): 2 nut cho Phong Karaoke LAN - "Tao phong" danh cho
-        // May A (Mixer, phai dang capture nhac + Mixer Test truoc), "Quet QR"
-        // danh cho May B/C (Mic khong day, may nao KHONG phai Mixer chinh).
-        // Ca 2 nut cung ton tai tren MOI may - nguoi dung tu quyet dinh may
-        // nao lam Mixer, may nao lam Mic, khong co UI rieng cho 2 vai tro.
+        // ✅ SUA (Phase 5): "Tao phong" gio CHI gui Intent ACTION_START_HOST_ROOM
+        // toi Service - Service tu lam het viec con lai (tao QrJoinData,
+        // SignalingServer, WebRtcManager) roi bao ket qua ve qua
+        // onRoomReadyCallback/onRoomErrorCallback. KHONG con logic Host nao
+        // chay truc tiep trong Activity nay nua.
         val createRoomButton = Button(this).apply {
             text = "🎤 Tao phong (Mixer A)"
-            setOnClickListener { startHostRoom() }
+            setOnClickListener { requestStartHostRoom() }
         }
 
         val joinRoomButton = Button(this).apply {
@@ -483,20 +383,6 @@ class MainActivity : AppCompatActivity() {
             addView(joinRoomButton)
         }
 
-        // ✅ MOI: nut "Tat hoan toan" - truoc gio KHONG co cach nao dung han
-        // Service + an nut noi tru vao Cai dat he thong > Force Stop. Nut nay
-        // goi ACTION_STOP_ALL: dung capture nhac, dung Mixer Test, AN nut noi
-        // (mixerToggleOverlay.hide()), huy notification, huy Service. Khac
-        // "Tat Mixer Test" (chi tat am thanh, GIU nut noi de bam lai nhanh) -
-        // nut nay danh cho luc muon THOAT HAN, khong con y dinh bat lai qua
-        // nut noi nua (muon dung lai phai mo app va bam "Test Capture" lai
-        // tu dau).
-        // ✅ MOI (theo de xuat nguoi dung, fix tieng ret ret khi vua chay mic
-        // tai cho vua nhan mic tu May B qua WebRTC): nut bat/tat mic vat ly
-        // cua chinh may nay khoi Mixer. Goi THANG companion function (cung
-        // process, khong can Intent/Binder - giong cach isMixerTestActive()
-        // da lam) vi hieu ung can AP DUNG NGAY LAP TUC tren thread dang chay
-        // cua MicInput, khong the doi vong doi Intent/onStartCommand.
         val muteLocalMicButton = Button(this).apply {
             text = if (PlaybackCaptureService.isLocalMicMutedForMixer()) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay (chi nhan qua mang)"
             setOnClickListener {
@@ -559,12 +445,6 @@ class MainActivity : AppCompatActivity() {
         logText.text = CaptureLogBus.getAllLogsText()
         scrollLogToBottom()
 
-        // ✅ SUA LOI QUAN TRONG: chi tu dong kich hoat flow xin quyen NEU service
-        // CHUA dang giu 1 session capture hop le - truoc day luon tu kich hoat
-        // vo dieu kien, khien moi lan mo lai app (ke ca khi capture dang chay
-        // tot tu truoc) deu tao 1 MediaProjection MOI, bo lai session cu chay
-        // "zombie" gay loi -2 lap lai vo han (xem giai thich day du trong
-        // PlaybackCaptureService.kt va MusicInput.kt).
         if (!autoStartTriggered) {
             autoStartTriggered = true
             if (PlaybackCaptureService.isCapturing()) {
@@ -582,6 +462,49 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+
+        // ✅ MOI: dang ky 3 callback Phong Karaoke NGAY khi Activity len
+        // foreground - giong tinh than CaptureLogBus.setListener() ben duoi.
+        // Goi runOnUiThread ben trong vi Service co the goi cac callback nay
+        // tu bat ky thread nao.
+        onRoomReadyCallback = { qrData ->
+            runOnUiThread {
+                currentRoomQrData = qrData
+                showQrCodeDialog(qrData)
+            }
+        }
+        onRoomErrorCallback = { reason ->
+            runOnUiThread {
+                Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+            }
+        }
+        onRoomMicStatusCallback = { clientId, connected ->
+            runOnUiThread {
+                val msg = if (connected) "Mic '$clientId' da ket noi!" else "Mic '$clientId' da ngat ket noi"
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // ✅ MOI: dong bo lai trang thai Phong Karaoke tu Service - can
+        // thiet vi phong co the DA DUOC MO TU TRUOC khi Activity nay bi tao
+        // lai (xoay man hinh, hoac OS don dep Activity nen roi nguoi dung
+        // tu mo lai app) - xem giai thich chi tiet o dau file. Neu Service
+        // bao co phong dang chay ma dialog QR chua hien (currentRoomQrData
+        // con null), TU DONG hien lai dialog de nguoi dung khong bi "mat"
+        // QR code khi quay lai app.
+        val activeRoom = PlaybackCaptureService.getActiveRoomQrData()
+        if (activeRoom != null && currentRoomQrData == null) {
+            currentRoomQrData = activeRoom
+            CaptureLogBus.log("[Activity] Phat hien Phong Karaoke dang chay tu Service (co the da mo truoc do) - hien lai QR.")
+            showQrCodeDialog(activeRoom)
+        } else if (activeRoom == null && currentRoomQrData != null) {
+            // Phong da bi dong tu ben ngoai (vi du Service tu dong dong khi
+            // ket thuc Phase 1) - don dep trang thai dialog cu neu con giu.
+            currentRoomQrData = null
+            roomStatusDialog?.dismiss()
+            roomStatusDialog = null
+        }
+
         CaptureLogBus.setListener { line ->
             runOnUiThread {
                 logText.append("\n$line")
@@ -589,11 +512,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ✅ MOI: dong bo lai trang thai/chu cua nut "Bat/Tat Mixer Test" moi
-        // lan quay lai app - can thiet vi nut noi tren man hinh (xem
-        // MixerToggleOverlayButton.kt) co the da bat/tat Mixer Test trong
-        // luc Activity nay dang o nen (vi du dang xem YouTube), khien bien
-        // mixerTestRunning cu trong Activity khong con dung nua.
         val actuallyRunning = PlaybackCaptureService.isMixerTestActive()
         if (actuallyRunning != mixerTestRunning) {
             mixerTestRunning = actuallyRunning
@@ -601,12 +519,6 @@ class MainActivity : AppCompatActivity() {
             CaptureLogBus.log("[Activity] Da dong bo lai trang thai Mixer Test tu Service: dangChay=$actuallyRunning")
         }
 
-        // ✅ MOI: bao hieu cho PlaybackCaptureService biet Activity nay VUA
-        // THAT SU len foreground/resumed - xem giai thich chi tiet o khai
-        // bao onResumedCallback trong companion object. Doc gia tri xong roi
-        // GAN LAI null NGAY (khong dung callback nay cho nhung lan onResume()
-        // binh thuong khac, vi du nguoi dung tu mo lai app - chi co tac dung
-        // 1 LAN cho dung lan Service dang cho).
         onResumedCallback?.let { callback ->
             onResumedCallback = null
             callback.invoke()
@@ -616,6 +528,13 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         CaptureLogBus.setListener(null)
+        // ✅ MOI: go dang ky 3 callback Phong Karaoke khi Activity roi
+        // foreground - tranh Service goi runOnUiThread() tren 1 Activity da
+        // vao nen/sap bi huy (khong crash gi neu lo goi, nhung don sach cho
+        // ro rang, giong tinh than CaptureLogBus.setListener(null) o tren).
+        onRoomReadyCallback = null
+        onRoomErrorCallback = null
+        onRoomMicStatusCallback = null
     }
 
     private fun scrollLogToBottom() {
@@ -650,9 +569,6 @@ class MainActivity : AppCompatActivity() {
         screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
-    // ✅ MOI (Phase 2): bat/tat mic -> loa truc tiep de do latency. Doc lap
-    // hoan toan voi flow Phase 1 (khong dung chung permission RECORD_AUDIO -
-    // neu chua co, xin luon tai day).
     private fun toggleMicLoopback(button: Button) {
         if (micLoopbackRunning) {
             micInput?.stopCapture()
@@ -666,9 +582,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ✅ MOI: chan chay chong 2 pipeline mic/output cung luc - da xac nhan
-        // qua debug thuc te gay ra "re, rot rot" va mat tieng tung luc do 2
-        // AudioRecord/AudioTrack tranh gianh tai nguyen doc quyen cua mic/loa.
         if (mixerTestRunning) {
             Toast.makeText(
                 this,
@@ -693,12 +606,6 @@ class MainActivity : AppCompatActivity() {
         val mic = MicInput(this)
         outputRouter = router
         micInput = mic
-        // ✅ MOI: truyen them onTransientDetected de tu dong tinh latency khi
-        // phat hien tieng vo tay - xem giai thich chi tiet trong MicInput.kt
-        // va OutputRouter.kt. Thu tu QUAN TRONG: doc router.totalFramesWritten
-        // (frame TRUOC buffer nay) roi MOI goi router.write() cho buffer nay -
-        // MicInput da dam bao goi onTransientDetected TRUOC onPcmChunk nen thu
-        // tu nay tu nhien dung, khong can dong bo gi them.
         mic.startCapture(
             onPcmChunk = { buffer, size ->
                 router.write(buffer, size)
@@ -718,14 +625,6 @@ class MainActivity : AppCompatActivity() {
         button.text = "Tat Mic Loopback"
     }
 
-    /**
-     * ✅ MOI: neu usage dang test khac MEDIA (tuc di qua 1 stream RIENG, chua
-     * tung duoc nguoi dung chinh to), tam thoi day volume cua stream do len
-     * MUC MAX de A/B test cong bang voi STREAM_MUSIC - neu khong lam buoc
-     * nay, moi lan doi usage se nghe "nho" khong phai do usage do te, ma do
-     * thanh volume tuong ung dang o muc mac dinh thap (da xac nhan qua test
-     * thuc te tren may Honor).
-     */
     private fun boostStreamVolumeForTestIfNeeded(candidate: UsageCandidate) {
         val stream = candidate.legacyStreamToBoost ?: return
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -740,12 +639,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * ✅ MOI: khoi phuc volume goc cua stream vua boost - goi khi tat Mic
-     * Loopback binh thuong VA trong onDestroy() (phong Activity bi huy dot
-     * ngot). QUAN TRONG nhat voi STREAM_ALARM: neu khong khoi phuc, bao thuc
-     * that cua nguoi dung se keu rat to bat ngo o lan sau.
-     */
     private fun restoreBoostedStreamVolumeIfAny() {
         val stream = boostedLegacyStream ?: return
         val savedVolume = savedBoostedStreamVolume ?: return
@@ -756,11 +649,6 @@ class MainActivity : AppCompatActivity() {
         savedBoostedStreamVolume = null
     }
 
-    /**
-     * ✅ MOI: doi vong qua danh sach usageCandidates - CHI cho phep doi khi
-     * Mic Loopback dang TAT (tranh doi usage giua chung 1 phien dang chay,
-     * gay nham lan khi doi chieu ket qua nghe/latency voi usage nao).
-     */
     private fun cycleUsageCandidate(button: Button) {
         if (micLoopbackRunning) {
             Toast.makeText(
@@ -781,30 +669,23 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
 
     /**
-     * MAY A (Mixer): khoi dong Phong Karaoke - mo SignalingServer (WebSocket
-     * LAN), sinh ma QR chua thong tin phong, hien thi de May B/C quet.
-     *
-     * ✅ Yeu cau truoc khi bam nut nay: da bat capture nhac (Phase 1) VA da
-     * bat Mixer Test (Phase 3/4) - neu chua, PCM cua mic tu xa se khong co
-     * noi nao de "hoa vao" (PlaybackCaptureService.pushRemoteVocalChunk se
-     * tu bo qua neu mixer chua chay, khong crash nhung cung khong co tac
-     * dung gi - nen canh bao truoc cho ro rang thay vi de nguoi dung tu hoi
-     * sao khong nghe thay gi).
+     * ✅ SUA (fix goc "May B mat ket noi moi lan bam play/pause tren May A"):
+     * truoc day ham nay TU LAM HET (tao QrJoinData, SignalingServer,
+     * WebRtcManager ngay tai Activity). GIO chi gui 1 Intent
+     * ACTION_START_HOST_ROOM toi Service - Service se tu lam toan bo phan
+     * con lai va bao ket qua ve qua onRoomReadyCallback/onRoomErrorCallback
+     * (da dang ky san trong onResume()). Xem giai thich day du trong
+     * PlaybackCaptureService.startHostRoomInternal().
      */
-    private fun startHostRoom() {
-        // ✅ FIX: neu dang co phong chay roi (bam "Tao phong" lan 2 ma quen
-        // bam "Dung phong" truoc), PHAI dong server cu truoc khi tao server
-        // moi. Neu khong, server moi se bind port 8765 that bai (server cu
-        // van dang giu port), nhung loi bind bi nuot am tham trong onError()
-        // (chi Log.e Logcat, khong ra CaptureLogBus) - QR moi hien ra la
-        // room/token moi, nhung server THAT SU dang tra loi ket noi van la
-        // server CU voi room/token CU -> May B quet QR moi se bi bao "Sai
-        // room ID hoac token" du QR vua quet la QR dang hien tren man hinh.
-        if (signalingServer != null || webRtcManager != null) {
-            CaptureLogBus.log("[Phong Karaoke] Dang co phong cu chay - tu dong dong truoc khi tao phong moi")
-            stopHostRoom()
+    private fun requestStartHostRoom() {
+        if (!PlaybackCaptureService.isCapturing()) {
+            Toast.makeText(
+                this,
+                "Chua capture nhac (Phase 1) - hay bam 'Xin quyen lai' truoc khi tao phong",
+                Toast.LENGTH_LONG
+            ).show()
+            return
         }
-
         if (!PlaybackCaptureService.isMixerTestActive()) {
             Toast.makeText(
                 this,
@@ -812,60 +693,16 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
-
-        val qrData = QrJoinData.generate(this)
-        if (qrData == null) {
-            Toast.makeText(this, "Khong tim thay IP Wi-Fi! Hay ket noi cung mang Wi-Fi (hoac bat Hotspot).", Toast.LENGTH_LONG).show()
-            return
+        val intent = Intent(this, PlaybackCaptureService::class.java).apply {
+            action = PlaybackCaptureService.ACTION_START_HOST_ROOM
         }
-
-        webRtcManager = WebRtcManager(this).apply {
-            onRemotePcmChunk = { clientId, buffer, size ->
-                // ✅ SUA (ho tro song ca nhieu may - xem giai thich chi tiet
-                // trong LowLatencyMixer.kt): truoc day BO QUA clientId (dung
-                // "_"), khien moi nguon remote bi don chung vao 1 hang doi
-                // FIFO duy nhat cua mixer, gay tieng ret/giat khi co tu 2
-                // May B/C tro len cung hat. GIO truyen clientId xuong de moi
-                // may co 1 "kenh" vocal RIENG trong mixer, cong dong (khong
-                // xen ke) voi nhau.
-                PlaybackCaptureService.pushRemoteVocalChunk(clientId, buffer, size)
-            }
-        }
-
-        signalingServer = SignalingServer(
-            port = qrData.port,
-            expectedRoomId = qrData.roomId,
-            expectedToken = qrData.token,
-            listener = object : SignalingServer.Listener {
-                override fun onMicConnected(clientId: String) {
-                    runOnUiThread { Toast.makeText(this@MainActivity, "Mic '$clientId' da ket noi!", Toast.LENGTH_SHORT).show() }
-                }
-                override fun onMicDisconnected(clientId: String) {
-                    webRtcManager?.removeClient(clientId)
-                    // ✅ MOI: don sach ca ring buffer/Limiter rieng cua
-                    // clientId nay khoi mixer (xem PlaybackCaptureService.
-                    // removeRemoteVocalSource()) - tranh no bi "treo" trong
-                    // mixer vinh vien du khong con ai push vao nua.
-                    PlaybackCaptureService.removeRemoteVocalSource(clientId)
-                }
-                override fun onOfferReceived(clientId: String, sdp: String) {
-                    webRtcManager?.handleRemoteOffer(
-                        clientId = clientId,
-                        sdp = sdp,
-                        onAnswerCreated = { answerSdp -> signalingServer?.sendAnswer(clientId, answerSdp) },
-                        onIceCandidateGenerated = { mid, idx, cand -> signalingServer?.sendIce(clientId, mid, idx, cand) }
-                    )
-                }
-                override fun onIceReceived(clientId: String, sdpMid: String, sdpMLineIndex: Int, candidate: String) {
-                    webRtcManager?.addRemoteIceCandidate(clientId, sdpMid, sdpMLineIndex, candidate)
-                }
-            }
-        ).apply { start() }
-
-        showQrCodeDialog(qrData)
+        ContextCompat.startForegroundService(this, intent)
+        CaptureLogBus.log("[Activity] Da gui ACTION_START_HOST_ROOM toi Service - dang cho ket qua qua callback.")
     }
 
     private fun showQrCodeDialog(qrData: QrJoinData) {
+        roomStatusDialog?.dismiss()
+
         val barcodeEncoder = com.journeyapps.barcodescanner.BarcodeEncoder()
         val bitmap = barcodeEncoder.encodeBitmap(qrData.toUriString(), com.google.zxing.BarcodeFormat.QR_CODE, 600, 600)
 
@@ -874,17 +711,25 @@ class MainActivity : AppCompatActivity() {
             .setTitle("Phong: ${qrData.roomId} (IP: ${qrData.host})")
             .setView(imageView)
             .setPositiveButton("Dong") { d, _ -> d.dismiss() }
-            .setNegativeButton("Dung phong") { _, _ -> stopHostRoom() }
+            .setNegativeButton("Dung phong") { _, _ -> requestStopHostRoom() }
             .create()
+        roomStatusDialog = dialog
         dialog.show()
     }
 
-    private fun stopHostRoom() {
-        signalingServer?.stopServer()
-        signalingServer = null
-        webRtcManager?.closeAll()
-        webRtcManager = null
-        Toast.makeText(this, "Da dong phong Karaoke", Toast.LENGTH_SHORT).show()
+    /**
+     * ✅ SUA: gui Intent ACTION_STOP_HOST_ROOM toi Service thay vi tu dong
+     * SignalingServer/WebRtcManager tai cho (2 object do khong con ton tai
+     * o Activity nay nua - xem giai thich o dau file).
+     */
+    private fun requestStopHostRoom() {
+        val intent = Intent(this, PlaybackCaptureService::class.java).apply {
+            action = PlaybackCaptureService.ACTION_STOP_HOST_ROOM
+        }
+        startService(intent)
+        currentRoomQrData = null
+        roomStatusDialog = null
+        Toast.makeText(this, "Da gui lenh dong phong Karaoke", Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -931,9 +776,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startWirelessMicStream() {
-        // ✅ MOI: chan chay chong voi Mic Loopback/Mixer Test cua chinh may
-        // nay - dung tinh than kiem tra da co san o toggleMixerTest(), tranh
-        // 2 nguon cung xin AudioRecord doc quyen mic cua he thong.
         if (micLoopbackRunning || mixerTestRunning) {
             Toast.makeText(
                 this,
@@ -972,55 +814,38 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
 
-        // ✅ MOI: chi xoa activityRef neu no VAN DANG tro toi CHINH instance
-        // nay - tranh truong hop hiem gap (onCreate() cua instance MOI da
-        // chay va gan lai activityRef TRUOC KHI onDestroy() cua instance CU
-        // kip chay xong, vi du xoay man hinh) vo tinh xoa mat tham chieu toi
-        // instance moi dang song.
         if (activityRef?.get() === this) {
             activityRef = null
         }
 
-        // ✅ Don dep mic loopback neu Activity bi huy trong luc dang bat -
-        // day la test thu cong, khong can chay nen nhu PlaybackCaptureService.
         micInput?.stopCapture()
         outputRouter?.stop()
 
-        // ✅ AN TOAN: neu nguoi dung thoat app trong luc dang bat "Test Mute
-        // STREAM_MUSIC" ma quen bam nut khoi phuc, chu dong tra lai volume goc
-        // o day - tranh de may bi cam am luon sau khi thoat app.
         if (streamMusicMuteTestActive && savedStreamMusicVolumeBeforeTest >= 0) {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedStreamMusicVolumeBeforeTest, 0)
             CaptureLogBus.log("[Activity] [MuteTest] onDestroy: da tu dong khoi phuc STREAM_MUSIC (quen bam nut).")
         }
 
-        // ✅ AN TOAN (dac biet voi STREAM_ALARM): neu Activity bi huy trong
-        // luc dang boost volume test ma quen tat Mic Loopback, khoi phuc o
-        // day - tranh de bao thuc that cua nguoi dung bi ket o muc max.
         restoreBoostedStreamVolumeIfAny()
 
-        // ✅ MOI (Phase 5): don dep Phong Karaoke LAN neu Activity bi huy
-        // trong luc dang lam Mixer (May A) hoac Mic khong day (May B) -
-        // tranh ro ri WebSocket server/PeerConnection/AudioRecord neu nguoi
-        // dung thoat app dot ngot ma quen bam "Dung phong"/ngat ket noi.
-        signalingServer?.stopServer()
-        signalingServer = null
+        // ✅ SUA (fix goc cua toan bo bug nay): KHONG con goi
+        // signalingServer?.stopServer()/webRtcManager?.closeAll() o day nua
+        // - 2 object do (vai tro Host/Mixer) da chuyen han vao
+        // PlaybackCaptureService va se TU SONG qua moi lan MainActivity bi
+        // huy/tao lai. Chi con don dep phan Mic khong day (wirelessMicInput/
+        // signalingClient/webRtcManager cua vai tro Mic B/C) - day la vai
+        // tro gan chat voi chinh thao tac dang cam mic cua NGUOI DUNG hien
+        // tai, hop ly de dung khi Activity bi huy.
+        wirelessMicInput?.stopCapture()
+        wirelessMicInput = null
         signalingClient?.close()
         signalingClient = null
         webRtcManager?.closeAll()
         webRtcManager = null
-        wirelessMicInput?.stopCapture()
-        wirelessMicInput = null
     }
 
-    // ✅ MOI (Phase 3): bat/tat mixer test qua Intent action gui toi Service
-    // dang chay - xem PlaybackCaptureService.ACTION_START_MIXER_TEST/
-    // ACTION_STOP_MIXER_TEST de biet Service xu ly the nao.
     private fun toggleMixerTest(button: Button) {
-        // ✅ MOI: chan chay chong voi Mic Loopback (xem giai thich chi tiet
-        // trong toggleMicLoopback()) - chi kiem tra khi dang BAT mixer test
-        // (mixerTestRunning=false), khong chan luc TAT.
         if (!mixerTestRunning && micLoopbackRunning) {
             Toast.makeText(
                 this,
@@ -1046,16 +871,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // ✅ MOI (xem giai thich chi tiet o dau file): CHI kiem tra quyen
-        // overlay khi dang BAT mixer test (giong het cach kiem tra
-        // RECORD_AUDIO o tren) - khong chan luc TAT. Neu chua co quyen,
-        // ensureOverlayPermission() se tu mo man hinh Settings VA return
-        // false - dung lai o day, KHONG gui Intent bat Mixer Test, de
-        // nguoi dung cap quyen xong roi tu bam lai nut nay 1 lan nua (luc do
-        // Settings.canDrawOverlays() da tra true, se di tiep binh thuong).
-        // Mixer Test VAN chay duoc du chua co quyen nay (chi la se khong co
-        // nut noi "Kich hoat lai" tren man hinh) - nhung nen nhac nguoi dung
-        // cap truoc de trai nghiem day du dung nhu thiet ke.
         if (!mixerTestRunning && !ensureOverlayPermission()) {
             return
         }
@@ -1073,29 +888,10 @@ class MainActivity : AppCompatActivity() {
         CaptureLogBus.log("[Activity] Gui action=$action toi Service (Mixer Test Phase 3)")
     }
 
-    /**
-     * ✅ MOI: thu nghiem doc lap - CHI mute/unmute STREAM_MUSIC, khong dung gi
-     * toi Mixer/OutputRouter. Yeu cau PlaybackCaptureService (Phase 1) dang
-     * capture san (isCapturing=true) de co the doc log amplitude cua
-     * MusicInput trong luc test.
-     *
-     * Cach doc ket qua: bam nut nay trong luc YouTube dang phat, quan sat 2
-     * dieu:
-     * 1) Loa co thuc su im khong (nghe bang tai).
-     * 2) Dong log "[MusicInput] amplitude trung binh 1s qua: ..." co CON dao
-     *    dong theo nhac (khac 0, thay doi lien tuc) hay tut ve 0/dung yen.
-     *
-     * Neu (1) im VA (2) van dao dong -> capture tap truoc buoc ap volume,
-     * mo duong cho kien truc "app tu mute nguon". Neu (2) cung ve 0/dung -
-     * capture tap SAU buoc ap volume, huong nay khong kha thi, phai chuyen
-     * sang Huong B (PLAN.md - tu phat nhac trong app, khong capture app
-     * ngoai nua).
-     */
     private fun toggleStreamMusicMuteTest(button: Button) {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         if (streamMusicMuteTestActive) {
-            // Khoi phuc volume goc.
             if (savedStreamMusicVolumeBeforeTest >= 0) {
                 audioManager.setStreamVolume(
                     AudioManager.STREAM_MUSIC,
