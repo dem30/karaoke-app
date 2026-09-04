@@ -106,6 +106,26 @@ class PlaybackCaptureService : Service() {
     private var vocalEcho: EchoReverb? = null
     private var finalMixLimiter: Limiter? = null
 
+    // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube, bam Khoa mic thi het"):
+    // trang thai cho bo phat hien+chan PHAN HOI AM HOC THAT (Larsen effect -
+    // loa cua chinh may nay phat lai chinh no vao mic VAT LY cua chinh may,
+    // KHAC voi vong lap SO da fix truoc day o MusicInput qua excludeUid).
+    // Xem giai thich day du va cong thuc tinh o startMixerTestInternal().
+    private var howlPrevRms = 0.0
+    private var howlRisingStreak = 0
+    private var howlSuppressUntilMs = 0L
+    private var howlGain = 1.0f
+
+    // Nguong/he so cho bo chan hu - de private val (khong phai companion,
+    // vi class nay da co 1 companion object rieng o duoi) de tranh trung
+    // khai bao companion object thu 2 (Kotlin khong cho phep).
+    private val HOWL_RMS_MIN_THRESHOLD = 400.0
+    private val HOWL_GROWTH_RATIO = 1.12
+    private val HOWL_RISING_STREAK_TRIGGER = 5
+    private val HOWL_SUPPRESS_MS = 1200L
+    private val HOWL_MIN_GAIN = 0.12f
+    private val HOWL_GAIN_RECOVER_STEP = 0.02f
+
     // ✅ MOI (xem giai thich day du o dau file): Host Room (SignalingServer +
     // WebRtcManager phia May A) chuyen vao Service de song bang vong doi voi
     // Mixer/MusicInput, KHONG con bi huy theo MainActivity.onDestroy() nua.
@@ -678,8 +698,71 @@ class PlaybackCaptureService : Service() {
         finalMixLimiter = finalLimiterInstance
         activeMixerInstance = mix
 
+        // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube"): reset trang
+        // thai bo chan hu moi lan Mixer Test duoc BAT lai (session moi ->
+        // khong ke thua nham trang thai "dang suppress" cua lan chay truoc).
+        howlPrevRms = 0.0
+        howlRisingStreak = 0
+        howlSuppressUntilMs = 0L
+        howlGain = 1.0f
+
         mic.startCapture(onPcmChunk = { buffer, size ->
             if (localMicMutedForMixer) return@startCapture
+
+            // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube, bam Khoa mic
+            // thi het"): day la PHAN HOI AM HOC THAT (Larsen effect) - loa
+            // cua chinh may nay (dang phat ban mix nhac+giong qua STREAM_
+            // SYSTEM) bi CHINH MIC VAT LY cua may nay thu lai, cong vao
+            // mixer, phat ra to hon, roi lai bi thu lai... vong lap co gain
+            // > 1 tu nuoi lon dan -> nghe thanh tieng "hu/rit" tang dan.
+            // Day KHAC voi vong lap SO da fix o MusicInput (excludeUid) -
+            // o day am thanh di qua khong khi that (loa -> mic), phan mem
+            // khong the "loai tru" duong nay bang UID nhu voi MusicInput.
+            // Limiter/Compressor phia duoi CHI chan dinh bien do (chop
+            // dinh), KHONG lam giam GAIN VONG LAP < 1 - nen howl van xay ra
+            // (chi la khong tang VO HAN ve bien do) du co Limiter.
+            //
+            // Cach nhan biet howl (khac tieng hat/noi binh thuong): RMS
+            // TANG LIEN TUC nhieu buffer lien tiep voi ty le tang deu -
+            // giong het (hat to dan) khong tao ra pattern tang DON DIEU va
+            // LIEN TUC nhu vay qua nhieu chu ky lien tiep. Khi phat hien,
+            // ha gain mic xuong rat thap trong 1 khoang ngan de PHA vong
+            // lap (tuong duong ngat mach phan hoi), roi tang dan gain tro
+            // lai (fade-in, tranh cat cup dot ngot nghe on) thay vi mute
+            // cung mot phat.
+            var sumSq = 0.0
+            for (i in 0 until size) {
+                val v = buffer[i].toDouble()
+                sumSq += v * v
+            }
+            val rms = kotlin.math.sqrt(sumSq / size)
+            val now = System.currentTimeMillis()
+
+            if (now < howlSuppressUntilMs) {
+                for (i in 0 until size) {
+                    buffer[i] = (buffer[i] * howlGain).toInt().toShort()
+                }
+                howlGain = (howlGain + HOWL_GAIN_RECOVER_STEP).coerceAtMost(1.0f)
+            } else if (rms > HOWL_RMS_MIN_THRESHOLD && rms > howlPrevRms * HOWL_GROWTH_RATIO) {
+                howlRisingStreak++
+                if (howlRisingStreak >= HOWL_RISING_STREAK_TRIGGER) {
+                    logBoth(
+                        "🚨 [HowlGuard] Phat hien dau hieu HU/RIT phan hoi am hoc (RMS tang lien tuc " +
+                            "$howlRisingStreak buffer, RMS hien tai=${"%.0f".format(rms)}) - ha gain mic " +
+                            "vat ly xuong con ${HOWL_MIN_GAIN} trong ${HOWL_SUPPRESS_MS}ms de pha vong lap. " +
+                            "Neu lap lai thuong xuyen: hay giam am luong loa hoac xoay mic ra xa loa hon."
+                    )
+                    howlSuppressUntilMs = now + HOWL_SUPPRESS_MS
+                    howlGain = HOWL_MIN_GAIN
+                    for (i in 0 until size) {
+                        buffer[i] = (buffer[i] * howlGain).toInt().toShort()
+                    }
+                    howlRisingStreak = 0
+                }
+            } else {
+                howlRisingStreak = 0
+            }
+            howlPrevRms = rms
 
             limiter.process(buffer, size)      // 1. Chan hu/feedback am hoc SOM NHAT co the
             processor.process(buffer, size)    // 2. EQ 3-band

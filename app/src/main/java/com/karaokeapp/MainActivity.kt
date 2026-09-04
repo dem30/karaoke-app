@@ -163,6 +163,14 @@ class MainActivity : AppCompatActivity() {
     private var currentRoomQrData: QrJoinData? = null
     private var roomStatusDialog: androidx.appcompat.app.AlertDialog? = null
 
+    // ✅ MOI (fix "May B can nut de quet lai May A ma khong can mo lai QR"):
+    // luu lai QrJoinData cua LAN QUET THANH CONG GAN NHAT (host/port/roomId/
+    // token) - cho phep bam 1 nut de ket noi lai voi CUNG 1 phong, thay vi
+    // bat buoc phai mo lai dialog QR tren May A moi lan May B bi rot mang/
+    // mat ket noi. Chi mat tac dung neu May A DA DONG phong va mo phong MOI
+    // (token/port co the doi) - luc do van can quet QR moi that.
+    private var lastJoinedQrData: QrJoinData? = null
+
     private val qrScanLauncher = registerForActivityResult(
         com.journeyapps.barcodescanner.ScanContract()
     ) { result ->
@@ -377,21 +385,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // ✅ MOI (fix "May B can nut de quet lai May A ma khong can mo lai
+        // QR"): dung lai QrJoinData cua lan quet gan nhat (xem
+        // reconnectToLastRoom()) - huu ich khi May B bi rot mang/bi OS don
+        // dep giua chung, ma May A van dang mo CUNG 1 phong do.
+        val reconnectButton = Button(this).apply {
+            text = "🔄 Ket noi lai (Mic B)"
+            setOnClickListener { reconnectToLastRoom() }
+        }
+
         val buttonRow5 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(createRoomButton)
             addView(joinRoomButton)
+            addView(reconnectButton)
         }
 
         val muteLocalMicButton = Button(this).apply {
-            text = if (PlaybackCaptureService.isLocalMicMutedForMixer()) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay (chi nhan qua mang)"
+            text = if (PlaybackCaptureService.isLocalMicMutedForMixer()) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay"
             setOnClickListener {
                 val newState = !PlaybackCaptureService.isLocalMicMutedForMixer()
                 PlaybackCaptureService.setLocalMicMutedForMixer(newState)
-                text = if (newState) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay (chi nhan qua mang)"
+                text = if (newState) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay"
                 Toast.makeText(
                     this@MainActivity,
-                    if (newState) "Da khoa mic vat ly cua may nay - chi con giong tu May B (qua mang) duoc hoa vao Mixer"
+                    // ✅ SUA: truoc day chi dung cho vai tro May A ("chi nhan
+                    // qua mang") - gio flag nay ap dung CA HAI vai tro (xem
+                    // fix trong startWirelessMicStream()), nen doi thanh mo
+                    // ta chung chung, dung cho ca May A (Mixer) lan May B
+                    // (Mic khong day dang gui qua mang).
+                    if (newState) "Da khoa mic vat ly cua may nay (Mixer se khong nhan tu mic tai cho / Mic khong day se ngung gui am thanh qua mang)"
                     else "Da bat lai mic vat ly cua may nay",
                     Toast.LENGTH_LONG
                 ).show()
@@ -741,7 +764,40 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Ma QR khong dung dinh dang phong Karaoke!", Toast.LENGTH_LONG).show()
             return
         }
+        lastJoinedQrData = qrData
+        connectToRoomAsMic(qrData)
+    }
 
+    /**
+     * ✅ MOI (fix "May B can nut de quet lai May A ma khong can mo lai QR"):
+     * bam nut nay se ket noi lai voi phong CUOI CUNG da quet thanh cong
+     * (lastJoinedQrData) - dung khi May B bi rot ket noi (vi du doi Wi-Fi,
+     * app bi OS don dep) nhung May A van dang mo CUNG 1 phong do, khong can
+     * phai cam May A len de hien lai dialog QR roi quet lai tu dau.
+     */
+    private fun reconnectToLastRoom() {
+        val qrData = lastJoinedQrData
+        if (qrData == null) {
+            Toast.makeText(
+                this,
+                "Chua tung quet QR lan nao - hay bam 'Quet QR vao phong (Mic B)' truoc",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        // Don sach ket noi cu (neu con) truoc khi thu lai, tranh giu 2
+        // SignalingClient/WebRtcManager song song cung luc.
+        stopWirelessMicStream()
+        Toast.makeText(this, "Dang ket noi lai voi phong cu...", Toast.LENGTH_SHORT).show()
+        connectToRoomAsMic(qrData)
+    }
+
+    /**
+     * Logic thiet lap ket noi Mic B toi May A - tach rieng khoi
+     * joinRoomFromQr() de dung chung duoc voi reconnectToLastRoom() (khong
+     * can parse lai chuoi QR, chi can QrJoinData da co san).
+     */
+    private fun connectToRoomAsMic(qrData: QrJoinData) {
         val myClientId = "Mic-" + (100..999).random()
         webRtcManager = WebRtcManager(this)
 
@@ -795,6 +851,16 @@ class MainActivity : AppCompatActivity() {
                 val mic = MicInput(this)
                 wirelessMicInput = mic
                 mic.startCapture(onPcmChunk = { buffer, size ->
+                    // ✅ FIX ("May B: nut Khoa mic khong hoat dung"): TRUOC DAY
+                    // nut "Khoa mic may nay" chi duoc kiem tra (localMicMutedForMixer)
+                    // trong callback cua Mixer Test (vai tro May A) - callback GUI
+                    // PCM qua WebRTC nay (vai tro May B, Mic tu xa) KHONG he doc
+                    // co flag do, nen bam nut tren May B khong co tac dung gi -
+                    // Mic van tiep tuc gui am thanh qua mang binh thuong. Them
+                    // dieu kien return SOM o day de dung chung 1 flag/1 nut cho
+                    // ca 2 vai tro (May A: khoa mic Mixer local; May B: khoa mic
+                    // dang gui qua mang).
+                    if (PlaybackCaptureService.isLocalMicMutedForMixer()) return@startCapture
                     webRtcManager?.sendPcmChunkFromMic(buffer, size)
                 })
             }
