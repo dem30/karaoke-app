@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 /**
  * Foreground service quan ly toan bo pipeline: capture nhac (Phase 1),
@@ -233,6 +234,56 @@ class PlaybackCaptureService : Service() {
         // KHONG thay the duoc lop nay.
         private val remoteVocalLimiters = ConcurrentHashMap<String, Limiter>()
 
+        // ✅ MOI (CHAN DOAN TAM THOI - do nhip nhan PCM thuc te tu May B/C
+        // qua WebRTC DataChannel, TRUOC khi sua bat ky gi): muc dich la xac
+        // nhan CHINH XAC "giat dut quang" la do MAT GOI/TRE MANG (khoang
+        // cach giua 2 lan nhan PCM lien tiep > binh thuong ~40ms rat nhieu,
+        // vi du 200ms-vai giay) hay do nguyen nhan khac (vi du logic mixer/
+        // buffer). Ghi lai: (1) thoi diem lan nhan GAN NHAT cho tung
+        // clientId, (2) khoang cach (gap) so voi lan truoc, (3) neu gap vuot
+        // qua nguong bat thuong thi log NGAY LAP TUC (khong doi 3s) kem gia
+        // tri gap chinh xac, (4) moi 3s tong ket so chunk da nhan + gap lon
+        // nhat trong khoang do - du kien go bo sau khi xac dinh xong nguyen
+        // nhan, KHONG phai code san xuat lau dai.
+        private val lastRemoteChunkNanoTime = ConcurrentHashMap<String, Long>()
+        private val remoteChunkCountInWindow = ConcurrentHashMap<String, Int>()
+        private val remoteMaxGapMsInWindow = ConcurrentHashMap<String, Long>()
+        private val remoteWindowStartNanoTime = ConcurrentHashMap<String, Long>()
+        private const val REMOTE_CHUNK_GAP_LOG_THRESHOLD_MS = 150L
+        private const val REMOTE_CHUNK_WINDOW_MS = 3000L
+
+        private fun logRemoteChunkTiming(clientId: String) {
+            val now = System.nanoTime()
+            val lastTime = lastRemoteChunkNanoTime.put(clientId, now)
+            if (lastTime != null) {
+                val gapMs = (now - lastTime) / 1_000_000L
+                if (gapMs >= REMOTE_CHUNK_GAP_LOG_THRESHOLD_MS) {
+                    CaptureLogBus.log(
+                        "[RemoteTiming] ⚠️ '$clientId' KHOANG TRONG giua 2 lan nhan PCM = ${gapMs}ms " +
+                            "(binh thuong ~40ms/lan) - nghi van MAT GOI/TRE MANG tai thoi diem nay."
+                    )
+                }
+                remoteMaxGapMsInWindow.merge(clientId, gapMs) { old, new -> max(old, new) }
+            }
+            remoteChunkCountInWindow.merge(clientId, 1) { old, new -> old + new }
+
+            val windowStart = remoteWindowStartNanoTime.getOrPut(clientId) { now }
+            val windowElapsedMs = (now - windowStart) / 1_000_000L
+            if (windowElapsedMs >= REMOTE_CHUNK_WINDOW_MS) {
+                val count = remoteChunkCountInWindow[clientId] ?: 0
+                val maxGap = remoteMaxGapMsInWindow[clientId] ?: 0L
+                val expectedCount = (windowElapsedMs / 40L).toInt()
+                CaptureLogBus.log(
+                    "[RemoteTiming] 📊 '$clientId' trong ${windowElapsedMs}ms qua: " +
+                        "nhan duoc $count chunk (ky vong ~$expectedCount neu khong mat goi), " +
+                        "gap lon nhat=${maxGap}ms."
+                )
+                remoteChunkCountInWindow[clientId] = 0
+                remoteMaxGapMsInWindow[clientId] = 0L
+                remoteWindowStartNanoTime[clientId] = now
+            }
+        }
+
         /**
          * ✅ SUA (ho tro nhieu May B/C cung hat - song ca): truoc day KHONG
          * phan biet clientId nao gui PCM, moi nguon remote (va ca mic tai
@@ -244,6 +295,7 @@ class PlaybackCaptureService : Service() {
          * truoc khi vao mixer.
          */
         fun pushRemoteVocalChunk(clientId: String, buffer: ShortArray, size: Int) {
+            logRemoteChunkTiming(clientId)
             synchronized(vocalPushLock) {
                 val mix = activeMixerInstance ?: return
                 val limiter = remoteVocalLimiters.getOrPut(clientId) {

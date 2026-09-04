@@ -7,6 +7,7 @@ import org.webrtc.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 /**
  * Phase 5 - Quan tri ket noi WebRTC LAN cho karaoke.
@@ -82,6 +83,19 @@ class WebRtcManager(private val context: Context) {
 
     // Callback nhan PCM tu mic remote tren May A
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
+
+    // ✅ MOI (CHAN DOAN TAM THOI - do nhip GUI PCM thuc te tu chinh May B,
+    // TRUOC khi bat cu qua DataChannel): so sanh voi log nhan o
+    // PlaybackCaptureService.logRemoteChunkTiming() de biet giat dut quang
+    // la do MAY B GUI KHONG DEU (vi du chinh MicInput cua May B bi nghen)
+    // hay do MANG/DataChannel lam tre/rot giua duong (May B gui deu nhung
+    // May A nhan khong deu). Du kien go bo sau khi xac dinh xong nguyen
+    // nhan, KHONG phai code san xuat lau dai.
+    private var lastSendNanoTime = 0L
+    private var sendCountInWindow = 0
+    private var sendMaxGapMsInWindow = 0L
+    private var sendWindowStartNanoTime = 0L
+    private var sendChannelNotOpenSkipCount = 0
 
     init {
         initializeFactory()
@@ -160,7 +174,51 @@ class WebRtcManager(private val context: Context) {
      */
     fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
         val channel = localDataChannel ?: return
-        if (channel.state() != DataChannel.State.OPEN) return
+        if (channel.state() != DataChannel.State.OPEN) {
+            // ✅ MOI (chan doan): dem so lan bi bo qua do channel CHUA/KHONG
+            // con o trang thai OPEN - neu con so nay lon bat thuong trong 1
+            // phien dang chay binh thuong, nghia la chinh DataChannel bi
+            // rot/dong lai giua chung (khac voi mat goi UDP don le).
+            sendChannelNotOpenSkipCount++
+            if (sendChannelNotOpenSkipCount % 25 == 0) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-SendSide] ⚠️ DataChannel KHONG o trang thai OPEN " +
+                        "(state=${channel.state()}) - da bo qua $sendChannelNotOpenSkipCount lan gui."
+                )
+            }
+            return
+        }
+
+        // ✅ MOI (chan doan - xem giai thich day du o khai bao cac bien
+        // lastSendNanoTime/sendCountInWindow phia tren): do nhip GUI thuc te
+        // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang.
+        val now = System.nanoTime()
+        if (lastSendNanoTime != 0L) {
+            val gapMs = (now - lastSendNanoTime) / 1_000_000L
+            if (gapMs >= 150L) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-SendSide] ⚠️ May B: khoang trong giua 2 lan GUI PCM = ${gapMs}ms " +
+                        "(binh thuong ~40ms/lan) - neu thay dong nay, nghia la CHINH MicInput/thread " +
+                        "cua May B bi nghen, KHONG phai loi mang/DataChannel."
+                )
+            }
+            sendMaxGapMsInWindow = max(sendMaxGapMsInWindow, gapMs)
+        }
+        lastSendNanoTime = now
+        sendCountInWindow++
+        if (sendWindowStartNanoTime == 0L) sendWindowStartNanoTime = now
+        val windowElapsedMs = (now - sendWindowStartNanoTime) / 1_000_000L
+        if (windowElapsedMs >= 3000L) {
+            val expectedCount = (windowElapsedMs / 40L).toInt()
+            CaptureLogBus.log(
+                "[RemoteTiming-SendSide] 📊 May B trong ${windowElapsedMs}ms qua: " +
+                    "da GUI $sendCountInWindow chunk (ky vong ~$expectedCount), " +
+                    "gap lon nhat=${sendMaxGapMsInWindow}ms."
+            )
+            sendCountInWindow = 0
+            sendMaxGapMsInWindow = 0L
+            sendWindowStartNanoTime = now
+        }
 
         val byteBuffer = ByteBuffer.allocateDirect(size * 2).order(ByteOrder.LITTLE_ENDIAN)
         for (i in 0 until size) {
