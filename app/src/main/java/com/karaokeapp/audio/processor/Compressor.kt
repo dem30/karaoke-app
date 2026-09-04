@@ -22,21 +22,33 @@ import kotlin.math.pow
  *
  * Thiet ke real-time: xu ly in-place tren ShortArray, khong cap phat mang moi
  * trong process() - giong tinh than Limiter.kt/VocalProcessor.kt.
+ *
+ * ✅ CAP NHAT (tang do "day"/ro loi cho giong mic dien thoai, thuong mong
+ * hon mic thu am chuyen dung): threshold ha tu -18dB xuong -25dB (nen bat
+ * dau SOM HON, bat ca nhung doan hat vua phai chu khong chi doan hat to),
+ * ratio tang tu 3.0 len 3.5 (nen chat hon 1 chut), makeupGainDb tang tu
+ * 2.0dB len 4.5dB (bu lai do nen manh hon, tranh giong bi nho hon truoc khi
+ * nen). ⚠️ QUAN TRONG: gia tri nay CHI co hieu luc that su o noi KHONG
+ * truyen tham so tuong minh khi tao Compressor() - kiem tra lai
+ * VocalChannel.kt, noi dang goi Compressor(thresholdDb = ..., ratio = ...,
+ * makeupGainDb = ...) VOI GIA TRI RIENG (named arguments), nen phai sua
+ * DONG BO ca 2 noi, sua rieng file nay se KHONG co tac dung gi neu
+ * VocalChannel.kt van con truyen gia tri cu.
  */
 class Compressor(
     sampleRate: Int = 44100,
     /**
      * Nguong nen (dB, tinh theo dBFS - 0dB la Short.MAX_VALUE). Tin hieu VUOT
-     * nguong nay moi bi nen. -18dB mac dinh - vua voi dynamic range thuc te
-     * cua mic dien thoai khi hat gan/xa mic khac nhau.
+     * nguong nay moi bi nen. -25dB - nen SOM hon truoc (cu la -18dB), phu hop
+     * dynamic range mong cua mic dien thoai khi hat gan/xa mic khac nhau.
      */
-    private val thresholdDb: Float = -18f,
+    private val thresholdDb: Float = -25f,
     /**
-     * Ty le nen. VD 3.0 nghia la tin hieu vuot nguong 3dB thi dau ra chi tang
-     * 1dB. 3:1 - 4:1 la muc pho bien, an toan cho vocal (khong nen qua tay
-     * lam mat tu nhien giong hat).
+     * Ty le nen. VD 3.5 nghia la tin hieu vuot nguong 3.5dB thi dau ra chi
+     * tang 1dB. 3:1 - 4:1 la muc pho bien, an toan cho vocal (khong nen qua
+     * tay lam mat tu nhien giong hat).
      */
-    private val ratio: Float = 3.0f,
+    private val ratio: Float = 3.5f,
     /**
      * Thoi gian dap ung (attack, ms) - toc do bop gain xuong khi gap peak
      * lon. 12ms du nhanh de bat peak nhung khong cat cut am bat cua phu am
@@ -51,9 +63,11 @@ class Compressor(
     releaseMs: Float = 100f,
     /**
      * Bu gain sau nen (dB) - vi tin hieu bi nen bot o doan to, bu lai 1
-     * luong de tong the giong hat khong bi nho hon truoc khi nen.
+     * luong de tong the giong hat khong bi nho hon truoc khi nen. 4.5dB -
+     * bu nhieu hon truoc (cu la 2.0dB) de can bang lai voi threshold thap
+     * hon (nen som hon, nen nhieu hon can bu nhieu hon).
      */
-    private val makeupGainDb: Float = 2.0f
+    private val makeupGainDb: Float = 4.5f
 ) {
 
     // He so lam min attack/release (one-pole, giong tinh than releaseCoeff

@@ -39,6 +39,14 @@ import kotlin.math.min
  *
  * Thu tu xu ly: AutoGain -> EQ -> Compressor -> Echo -> Volume (thu cong) ->
  * Limiter (an toan, luon BAT, khong the tat qua UI - khac voi 4 buoc tren).
+ *
+ * ✅ CAP NHAT (dong bo tham so Compressor moi - xem giai thich day du trong
+ * Compressor.kt): threshold -18dB -> -25dB, ratio 3.0 -> 3.5, makeupGainDb
+ * 2.0dB -> 4.5dB. ⚠️ QUAN TRONG: doi tham so mac dinh trong Compressor.kt
+ * MOT MINH KHONG DU - dong khoi tao ben duoi truyen named arguments TUONG
+ * MINH (thresholdDb=..., ratio=..., makeupGainDb=...), nen SE GHI DE len
+ * moi thay doi default trong Compressor.kt neu khong duoc cap nhat DONG
+ * THOI o day. Day la ly do 2 file nay LUON phai sua cung luc.
  */
 class VocalChannel(
     sampleRate: Int = 44100,
@@ -51,7 +59,18 @@ class VocalChannel(
     // nguoi dung co the dieu chinh tiep tu day qua setEQGains()/v.v.
     val autoGain = AutoGainControl(sampleRate = sampleRate)
     val eq = VocalProcessor(sampleRate = sampleRate, bassGainDb = -2.0f, midGainDb = 1.0f, trebleGainDb = 3.0f)
-    val compressor = Compressor(sampleRate = sampleRate, thresholdDb = -18.0f, ratio = 3.0f, attackMs = 12f, releaseMs = 100f, makeupGainDb = 2.0f)
+
+    // ✅ SUA (dong bo voi Compressor.kt - xem KDoc dau class): -18.0f/3.0f/
+    // 2.0f -> -25.0f/3.5f/4.5f. Sua CA 2 noi (o day va default trong
+    // Compressor.kt) cung luc, neu khong 1 trong 2 se vo hieu.
+    val compressor = Compressor(
+        sampleRate = sampleRate,
+        thresholdDb = -25.0f,
+        ratio = 3.5f,
+        attackMs = 12f,
+        releaseMs = 100f,
+        makeupGainDb = 4.5f
+    )
     val echo = EchoReverb(sampleRate = sampleRate, delayMs = 200f, feedback = 0.38f, wetLevel = 0.32f, damping = 0.35f)
 
     // Limiter an toan CUOI chuoi - luon bat, chi chan clip PCM (KHONG phai

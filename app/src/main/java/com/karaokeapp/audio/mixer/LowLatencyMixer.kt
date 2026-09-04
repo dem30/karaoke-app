@@ -82,6 +82,30 @@ private class ShortRingBuffer(private val capacity: Int) {
  * Moi chu ky mixer (~40ms), TUNG nguon duoc drain() rieng, roi CONG DON lai
  * (co clamp) - giong 1 ban mixer vat ly co nhieu kenh fader, khong phai 1
  * hang doi chung.
+ *
+ * ✅ CAP NHAT MOI (fix "vocal bi CAT VUONG (hard-clip) khi nhieu nguon cung
+ * to, nghe gat/be trong khi da co finalLimiter"): PHIEN BAN TRUOC dung
+ * coerceIn() CUNG 2 lan trong mixMultiSource() - 1 lan ngay sau khi cong don
+ * TAT CA nguon vocal, 1 lan nua sau khi cong voi nhac va nhan masterVolume.
+ * coerceIn() la CAT VUONG (hard clip): bat ky gia tri nao vuot bien do PCM
+ * bi CHAT THANG ve dung +-32767, mat hoan toan hinh dang waveform o phan
+ * vuot do - xay ra TRUOC CA khi finalLimiter (chay SAU mixMultiSource(), xem
+ * start()) kip xu ly, nen finalLimiter khong the "cuu" lai duoc gi (du lieu
+ * da mat that su, khong phai chi bi giam gain). Trieu chung thuc te: khi 2-3
+ * nguon vocal cung to, hoac vocal+nhac cung dinh dinh, am thanh nghe gat/be/
+ * "loa qua tai" ngay ca khi tung nguon rieng le nghe binh thuong.
+ *
+ * Sua: thay 2 lan coerceIn() do bang 1 buoc "soft-knee" (xem ham softKnee()
+ * o duoi) NGAY TRUOC buoc chuyen Float -> Short cuoi cung. Gia tri duoi
+ * nguong SOFT_KNEE_THRESHOLD_ABS giu NGUYEN 100% (khong dong toi, khac voi
+ * han che cua tanh() ap dung tren toan bo tin hieu - se lam "min" ca doan
+ * nho khong can thiet). Chi phan VUOT nguong moi bi nen mem dan ve gan
+ * SOFT_KNEE_CEILING_ABS bang tanh(), thay vi bi CAT THANG. coerceIn() cuoi
+ * cung (sau softKnee()) CHI con vai tro luoi an toan chan wraparound so hoc
+ * khi Float -> Short (vd 40000f.toInt().toShort() se KHONG tu clamp ve
+ * 32767 nhu nhieu nguoi lam, ma wrap thanh 1 gia tri AM/rac - day la ly do
+ * TUYET DOI khong duoc bo qua buoc clamp cuoi nay du softKnee() da xu ly
+ * gan het truong hop thuc te).
  */
 class LowLatencyMixer(
     private val outputRouter: OutputRouter,
@@ -92,6 +116,14 @@ class LowLatencyMixer(
      * hoac Limiter rieng cho tung nguon remote - xem
      * PlaybackCaptureService.vocalChannels - moi kenh co Limiter an toan
      * rieng cua no, xem VocalChannel.kt). null = tat (mac dinh).
+     *
+     * ✅ Van giu nguyen vai tro sau khi them softKnee() - finalLimiter la
+     * bo loc CO TRANG THAI (attack/release, tha dan theo thoi gian, xem
+     * Limiter.kt) chay SAU softKnee(), con softKnee() KHONG co trang thai
+     * (memoryless, xu ly tung sample doc lap). 2 lop nay bo tro nhau: softKnee
+     * dam bao KHONG mat waveform ngay tai buoc cong don (truoc day la diem
+     * yeu nhat), finalLimiter tiep tuc lam muot dong bien do qua thoi gian
+     * (tranh "bom/pumping" neu vuot nguong lien tuc nhieu buffer).
      */
     private val finalLimiter: Limiter? = null
 ) {
@@ -128,13 +160,59 @@ class LowLatencyMixer(
         // go nham/lech chinh ta giua 2 noi goi.
         const val SOURCE_LOCAL_MIC = "local_mic"
 
+        // ✅ MOI (fix hard-clip - xem giai thich day du o KDoc dau class):
+        // nguong bat dau nen mem, tinh tuyet doi tren thang Short (0..32767).
+        // ~28000 tuong duong -1.4dBFS (20*log10(28000/32767) ~= -1.37dB) -
+        // dat mot chut duoi Short.MAX_VALUE de con "khoang dem" cho soft-knee
+        // lam viec (neu dat sat 32767 qua, phan nen se qua gap/gan nhu van
+        // la hard-clip). Dung tinh than voi Limiter.kt (thresholdRatio mac
+        // dinh 0.85f = ~27852) va OutputRouter (khong doi gi o day, chi de
+        // nhat quan y tuong "de lai margin an toan").
+        private const val SOFT_KNEE_THRESHOLD_ABS = 28000f
+        private const val SOFT_KNEE_CEILING_ABS = 32767f
+
         /**
-         * ✅ SUA (Phase 6): khong con nhan/ap VOCAL_GAIN co dinh o day nua -
-         * moi nguon vocal trong vocalChunks coi nhu DA duoc VocalChannel xu
-         * ly xong (EQ/Compressor/Echo/volume rieng) truoc khi drain() vao
-         * day, nen chi CONG DON (clamp RIENG cho tong vocal, roi nhan
-         * musicVolume/masterVolume va clamp lai LAN NUA khi cong voi
-         * music) - vai tro cua ham nay gio THUAN TUY la "cong ban nhac".
+         * ✅ MOI: nen mem 1 sample (dang Float, CHUA chuyen ve Short) - gia
+         * tri trong khoang [-SOFT_KNEE_THRESHOLD_ABS, +SOFT_KNEE_THRESHOLD_ABS]
+         * duoc GIU NGUYEN 100% (khong dung toi limiter/nen gi ca - khac voi
+         * cach dung tanh() tren TOAN BO tin hieu, se lam "min" ca doan nho
+         * khong can thiet). Chi PHAN VUOT nguong (|x| > threshold) moi bi
+         * nen dan theo tanh() sao cho tien dan ve SOFT_KNEE_CEILING_ABS thay
+         * vi bi CAT THANG - giup dinh song van "tron", khong bi vuong goc
+         * cung nhu coerceIn() truoc day.
+         *
+         * Ham nay KHONG co trang thai (memoryless) - khac voi Limiter.kt (co
+         * attack/release qua thoi gian) - dung o day chi de xu ly TUC THOI
+         * ngay tai buoc cong don, con finalLimiter (Limiter.kt, co trang
+         * thai) van chay SAU o start() nhu cu de xu ly muot hon qua nhieu
+         * sample/buffer lien tiep.
+         */
+        private fun softKnee(x: Float): Float {
+            val absX = kotlin.math.abs(x)
+            if (absX <= SOFT_KNEE_THRESHOLD_ABS) return x
+            val over = absX - SOFT_KNEE_THRESHOLD_ABS
+            val range = SOFT_KNEE_CEILING_ABS - SOFT_KNEE_THRESHOLD_ABS
+            val compressed = SOFT_KNEE_THRESHOLD_ABS + range * kotlin.math.tanh(over / range)
+            return if (x < 0f) -compressed else compressed
+        }
+
+        /**
+         * ✅ SUA (fix hard-clip, xem KDoc dau class de biet day du boi canh):
+         * khong con dung coerceIn() CUNG ngay sau khi cong don vocal, cung
+         * khong con coerceIn() CUNG ngay sau khi cong voi music - CA HAI gia
+         * tri trung gian nay gio duoc GIU NGUYEN dang Float (co the vuot
+         * +-32767 tam thoi, hoan toan binh thuong va co chu dich), CHI nen
+         * mem 1 LAN DUY NHAT (qua softKnee()) ngay truoc khi chuyen ve Short
+         * o cuoi ham - dam bao waveform khong bi "cat cut" som truoc khi co
+         * co hoi qua buoc nen mem.
+         *
+         * coerceIn() cuoi cung (sau softKnee()) la BAT BUOC PHAI CO, KHONG
+         * duoc bo qua: day KHONG phai buoc "lam viec" chinh (softKnee() da
+         * dam bao gia tri gan nhu luon nam trong [-32767, 32767] roi), ma la
+         * luoi an toan chan wraparound so hoc thuan tuy khi ep kieu Float ->
+         * Short trong Kotlin/JVM (toShort() KHONG tu dong saturate/clamp -
+         * mot gia tri nhu 40000f.toInt().toShort() se cho ra 1 con so AM/rac
+         * do tran bit, KHONG phai 32767 nhu nhieu nguoi lam tuong).
          */
         private fun mixMultiSource(
             music: ShortArray, musicLen: Int, musicVolume: Float,
@@ -153,12 +231,18 @@ class LowLatencyMixer(
                         vocalSum += vocalChunks[srcIdx][i].toFloat()
                     }
                 }
-                // Clamp TONG vocal (nhieu giong cong lai) TRUOC khi cong voi
-                // music - tranh truong hop 2-3 giong hat to cung luc da tu
-                // vuot bien do truoc ca khi tinh den nhac nen.
-                vocalSum = vocalSum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
+                // ✅ SUA: KHONG con coerceIn() cung o day nua - de vocalSum (co
+                // the tam thoi vuot bien do neu 2-3 nguon cung to) di tiep
+                // xuong buoc softKnee() ben duoi cung voi music, thay vi bi
+                // CAT VUONG rieng le som (mat thong tin waveform truoc ca khi
+                // biet tong the co thuc su vuot nguong hay khong).
 
                 var sum = (m + vocalSum) * masterVolume
+                // ✅ SUA: thay coerceIn() cung bang softKnee() - xem giai
+                // thich day du o KDoc ham softKnee() va dau class.
+                sum = softKnee(sum)
+                // Luoi an toan CUOI CUNG (chan wraparound Float->Short thuan
+                // so hoc) - BAT BUOC giu lai, xem giai thich o KDoc ham nay.
                 sum = sum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
                 out[i] = sum.toInt().toShort()
             }
@@ -171,7 +255,7 @@ class LowLatencyMixer(
     // chinh qua UI (vd 2 thanh truot "Nhac" va "Tong"), doc lap voi volume
     // rieng cua tung nguon vocal (xem VocalChannel.volume).
     @Volatile
-    var musicVolume: Float = 1.0f
+    var musicVolume: Float = 0.4f
         set(value) { field = value.coerceIn(0f, 2f) }
 
     @Volatile
@@ -263,7 +347,7 @@ class LowLatencyMixer(
         vocalScratchBuffers.clear()
 
         mixerJob = scope.launch {
-            logBoth("✅ Bat dau mixer loop (nhieu nguon vocal cong dong), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms), tran buffer=~${RING_BUFFER_CAPACITY}sample/nguon")
+            logBoth("✅ Bat dau mixer loop (nhieu nguon vocal cong dong, soft-knee limiter), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms), tran buffer=~${RING_BUFFER_CAPACITY}sample/nguon")
             val musicChunk = ShortArray(CHUNK_SIZE)
 
             var lastQueueLogTime = System.currentTimeMillis()
@@ -333,7 +417,10 @@ class LowLatencyMixer(
                     CHUNK_SIZE
                 )
                 // Chan clipping tren tin hieu DA MIX (nhac + TAT CA vocal da
-                // cong dong) - vi tri cuoi chuoi, dung y PLAN.md goc.
+                // cong dong) - vi tri cuoi chuoi, dung y PLAN.md goc. Van giu
+                // nguyen sau khi them softKnee() ben trong mixMultiSource() -
+                // xem giai thich vai tro bo tro cua 2 lop nay o KDoc truong
+                // finalLimiter phia tren.
                 finalLimiter?.process(mixed, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
 
