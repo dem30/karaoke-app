@@ -38,7 +38,16 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    // WebRTC: them khi vao Phase 5 (vd org.webrtc:google-webrtc:1.0.+)
+
+    // ✅ Phase 5 - Signaling qua WebSocket LAN (May A = server, May B/C = client)
+    implementation("org.java-websocket:Java-WebSocket:1.5.6")
+
+    // ✅ Phase 5 - WebRTC audio-only (PeerConnection, DataChannel) qua LAN
+    implementation("io.getstream:stream-webrtc-android:1.1.4")
+
+    // ✅ Phase 5 - Tao/quet ma QR de ghep phong (SignalingServer host:port:token)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.3")
 }
 
 // Fix xung dot 2 phien ban kotlin-stdlib (kotlin-stdlib 1.8.22 da gop san chuc nang cua

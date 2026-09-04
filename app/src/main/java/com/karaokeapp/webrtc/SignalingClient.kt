@@ -44,7 +44,7 @@ class SignalingClient(
                 }
                 SignalingMessages.TYPE_JOIN_DENY -> {
                     val reason = json.optString("reason", "Bi tu choi")
-                    CaptureLogBus.log("[SignalingClient] Vao phong that bai: $reason", isError = true)
+                    CaptureLogBus.log("[SignalingClient] ❌ Vao phong that bai: $reason")
                     listener.onJoinFailed(reason)
                 }
                 SignalingMessages.TYPE_ANSWER -> {
