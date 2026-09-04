@@ -1,9 +1,11 @@
 package com.karaokeapp.webrtc
 
 import android.content.Context
+import android.media.AudioManager
 import android.util.Log
 import com.karaokeapp.audio.music.CaptureLogBus
 import org.webrtc.*
+import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
@@ -107,9 +109,51 @@ class WebRtcManager(private val context: Context) {
             .createInitializationOptions()
         PeerConnectionFactory.initialize(options)
 
+        // ✅ FIX ("May A bi nho tieng khi May B ket noi"): TRUOC DAY khong
+        // truyen AudioDeviceModule (ADM) tuong minh -> WebRTC tu dung ADM
+        // mac dinh (JavaAudioDeviceModule). Du ca app CHI dung DataChannel
+        // de truyen PCM tho (KHONG he tao AudioTrack/MediaStreamTrack audio
+        // nao), ADM mac dinh van co the tu xin AudioFocus va/hoac doi
+        // AudioManager.mode sang MODE_IN_COMMUNICATION ngay khi PeerConnection
+        // that su thiet lap (dung luc May B connect) - day la hanh vi NOI BO
+        // cua thu vien WebRTC, KHONG phai code cua app chu dong lam. Hau qua:
+        // giong het kieu "duck HAL/OEM" da ghi chu trong PlaybackCaptureService
+        // - lam STREAM_MUSIC (MusicInput dang capture) hoac STREAM_SYSTEM
+        // (Mixer dang phat) bi nho tieng.
+        //
+        // Sua: tu tao ADM tuong minh, tat het xu ly hardware AEC/NS (khong
+        // can thiet vi app khong dung duong audio chuan cua WebRTC) - giam
+        // toi da kha nang ADM dung cham vao AudioManager.
+        val audioDeviceModule = JavaAudioDeviceModule.builder(context)
+            .setUseHardwareAcousticEchoCanceler(false)
+            .setUseHardwareNoiseSuppressor(false)
+            .createAudioDeviceModule()
+
         factory = PeerConnectionFactory.builder()
             .setOptions(PeerConnectionFactory.Options())
+            .setAudioDeviceModule(audioDeviceModule)
             .createPeerConnectionFactory()
+    }
+
+    // ✅ MOI (lop phong thu thu 2 - phong truong hop set ADM tuong minh o
+    // tren van chua chan het): mot so ban WebRTC van co the doi
+    // AudioManager.mode ngay khi PeerConnection dat trang thai ICE CONNECTED,
+    // bat ke ADM duoc cau hinh the nao. Ep tra ve MODE_NORMAL ngay khi phat
+    // hien bi doi - giong tinh than [AutoReassert] da co san trong
+    // PlaybackCaptureService cho vu "duck HAL/OEM" cua Honor.
+    private fun reassertNormalAudioModeIfNeeded(tag: String) {
+        try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (audioManager.mode != AudioManager.MODE_NORMAL) {
+                CaptureLogBus.log(
+                    "[WebRtcManager-$tag] ⚠️ AudioManager.mode bi doi thanh " +
+                        "${audioManager.mode} (co the do ADM cua WebRTC) - tra ve MODE_NORMAL."
+                )
+                audioManager.mode = AudioManager.MODE_NORMAL
+            }
+        } catch (e: Exception) {
+            CaptureLogBus.log("[WebRtcManager-$tag] ❌ Loi khi kiem tra/reset AudioManager.mode: ${e.message}")
+        }
     }
 
     private fun getRtcConfig(): PeerConnection.RTCConfiguration {
@@ -141,6 +185,7 @@ class WebRtcManager(private val context: Context) {
             override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
                 CaptureLogBus.log("[WebRTC-Client] Trang thai ket noi ICE: $newState")
                 if (newState == PeerConnection.IceConnectionState.CONNECTED) {
+                    reassertNormalAudioModeIfNeeded("Client")
                     onConnected()
                 }
             }
@@ -248,6 +293,13 @@ class WebRtcManager(private val context: Context) {
             override fun onIceCandidate(candidate: IceCandidate?) {
                 candidate?.let {
                     onIceCandidateGenerated(it.sdpMid, it.sdpMLineIndex, it.sdp)
+                }
+            }
+
+            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+                CaptureLogBus.log("[WebRTC-Host] Trang thai ket noi ICE ($clientId): $state")
+                if (state == PeerConnection.IceConnectionState.CONNECTED) {
+                    reassertNormalAudioModeIfNeeded("Host-$clientId")
                 }
             }
 
