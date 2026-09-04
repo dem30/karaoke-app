@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
 <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 <uses-permission android:name="android.permission.INTERNET"/>
 <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
@@ -64,6 +64,7 @@
     android:name="com.journeyapps.barcodescanner.CaptureActivity"
     android:screenOrientation="portrait"
     android:stateNotNeeded="true"
-    android:exported="false"/>
+    android:exported="false"
+    tools:replace="android:screenOrientation"/>
 </application>
 </manifest>
