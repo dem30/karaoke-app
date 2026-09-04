@@ -20,11 +20,9 @@ import androidx.core.app.NotificationCompat
 import com.karaokeapp.MainActivity
 import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
+import com.karaokeapp.audio.mixer.VocalChannel
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
-import com.karaokeapp.audio.processor.VocalProcessor
-import com.karaokeapp.audio.processor.Compressor
-import com.karaokeapp.audio.processor.EchoReverb
 import com.karaokeapp.overlay.MixerToggleOverlayButton
 import com.karaokeapp.webrtc.QrJoinData
 import com.karaokeapp.webrtc.SignalingServer
@@ -62,10 +60,15 @@ import kotlin.math.max
  * remote (va ca mic tai cho) deu bi don chung vao 1 hang doi FIFO DUY NHAT
  * cua mixer, gay interleave/giat khi co tu 2 nguon vocal tro len. GIO moi
  * clientId (va mic tai cho, dinh danh boi LowLatencyMixer.SOURCE_LOCAL_MIC)
- * co 1 "kenh" RIENG trong mixer (xem LowLatencyMixer.pushVocal(sourceId,...)),
- * cong THEM 1 Limiter RIENG cho tung nguon remote (remoteVocalLimiters) -
- * vi PCM tu WebRTC la RAW, CHUA qua chuoi Limiter/EQ/Compressor/Echo (chuoi
- * do CHI ap dung cho mic VAT LY cua chinh May A).
+ * co 1 "kenh" RIENG trong mixer (xem LowLatencyMixer.pushVocal(sourceId,...)).
+ *
+ * ✅ MOI (Phase 6 - "ban mixer" dieu chinh duoc, thay the HowlGuard tu dong
+ * da go bo): moi nguon vocal (local hoac tung clientId remote) gio di qua 1
+ * VocalChannel RIENG - CUNG mot chuoi xu ly (AutoGain nhe -> EQ -> Compressor
+ * -> Echo -> volume nguoi dung -> Limiter an toan) cho CA HAI loai nguon,
+ * khong con bat doi xung "local day du, remote chi co Limiter" nhu truoc.
+ * Xem VocalChannel.kt va nhom ham setChannelXxx()/setMusicVolume()/
+ * setMasterVolume() trong companion object ben duoi de dieu chinh tu UI.
  *
  * ✅ MOI (fix goc "May B mat ket noi moi lan bam play/pause tren May A" -
  * BUG QUAN TRONG vua phat hien): truoc day hostSignalingServer/hostWebRtcManager
@@ -100,61 +103,24 @@ class PlaybackCaptureService : Service() {
     private var mixer: LowLatencyMixer? = null
     private var mixerOutputRouter: OutputRouter? = null
     private var mixerToggleOverlay: MixerToggleOverlayButton? = null
-    private var vocalLimiter: Limiter? = null
-    private var vocalProcessor: VocalProcessor? = null
-    private var vocalCompressor: Compressor? = null
-    private var vocalEcho: EchoReverb? = null
     private var finalMixLimiter: Limiter? = null
 
-    // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube, bam Khoa mic thi het"):
-    // trang thai cho bo phat hien+chan PHAN HOI AM HOC THAT (Larsen effect -
-    // loa cua chinh may nay phat lai chinh no vao mic VAT LY cua chinh may,
-    // KHAC voi vong lap SO da fix truoc day o MusicInput qua excludeUid).
-    // Xem giai thich day du va cong thuc tinh o startMixerTestInternal().
-    private var howlPrevRms = 0.0
-    private var howlRisingStreak = 0
-    private var howlSuppressUntilMs = 0L
-    private var howlGain = 1.0f
-
-    // ✅ MOI (v2 - fix "van con rit sau khi da them HowlGuard lan dau"): ban
-    // dau chi suppress CO DINH 1.2s roi phuc hoi gain kha nhanh - neu vong
-    // lap phan hoi VAT LY van con nguyen (loa van to, mic van gan loa) thi
-    // ngay khi gain phuc hoi lai, hu se TAI DIEN GAN NHU NGAY LAP TUC, tao
-    // ra kieu "rit - tat - rit - tat" lien tuc - nghe tong the VAN nhu con
-    // rit du tung dot da bi chan. Them CO CHE LEO THANG: neu 1 lan kich hoat
-    // moi xay ra qua GAN lan truoc (con trong HOWL_ESCALATION_WINDOW_MS),
-    // coi la "cung 1 vong lap phan hoi CHUA duoc giai quyet that su" - tang
-    // dan thoi gian suppress (nhan doi moi lan, co tran) VA lam gain phuc
-    // hoi CHAM lai theo cap do leo thang - cho toi khi nguoi dung THAT SU
-    // xu ly nguyen nhan goc (giam am luong loa / dung tai nghe / dua mic ra
-    // xa loa hon - dung y ghi chu san co trong LowLatencyMixer.VOCAL_GAIN).
-    // Cap do leo thang tu RESET ve 0 neu da co 1 khoang YEN du dai
-    // (khong kich hoat lai) - tranh khoa mic vinh vien oan neu chi la 1 lan
-    // hu thoang qua roi het that.
-    private var howlEscalationLevel = 0
-    private var howlLastTriggerMs = 0L
-
-    // Nguong/he so cho bo chan hu - de private val (khong phai companion,
-    // vi class nay da co 1 companion object rieng o duoi) de tranh trung
-    // khai bao companion object thu 2 (Kotlin khong cho phep).
-    //
-    // ✅ SUA (v2): giam HOWL_RISING_STREAK_TRIGGER (5->3) va HOWL_GROWTH_RATIO
-    // (1.12->1.08) - phan ung SOM HON voi dau hieu tang, vi Mixer con khuech
-    // dai nguon vocal them VOCAL_GAIN=1.8x + Compressor makeup gain SAU buoc
-    // nay (xem LowLatencyMixer.kt) - phat hien cang tre, hu cang kip "lan to"
-    // truoc khi bi chan.
-    private val HOWL_RMS_MIN_THRESHOLD = 350.0
-    private val HOWL_GROWTH_RATIO = 1.08
-    private val HOWL_RISING_STREAK_TRIGGER = 3
-    private val HOWL_BASE_SUPPRESS_MS = 1200L
-    private val HOWL_MAX_SUPPRESS_MS = 12_000L
-    private val HOWL_MAX_ESCALATION_LEVEL = 4
-    private val HOWL_ESCALATION_WINDOW_MS = 6_000L
-    private val HOWL_MIN_GAIN = 0.12f
-    // ✅ SUA (v2): giam tu 0.02f -> 0.008f (phuc hoi cham hon nhieu, ~vai
-    // giay thay vi ~1.7s) - o cap do leo thang cao hon, con nhan them he so
-    // chia trong code de phuc hoi CHAM HON NUA (xem cach dung ben duoi).
-    private val HOWL_GAIN_RECOVER_STEP = 0.008f
+    // ✅ DA GO BO (Phase 6) HowlGuard - co che "leo thang" tu dong cam/ha
+    // gain mic khi nghi ngo hu phan hoi am hoc. Ly do go bo: co che nay tu
+    // QUYET DINH luc nao lam vocal nho di/im han theo phat hien RIENG cua
+    // no (RMS tang lien tuc N buffer) - trong thuc te dieu nay khien nguoi
+    // hat nghe thay giong minh LUC TO LUC NHO/mat tieng tam thoi MA KHONG
+    // RO LY DO, va cang o cap do leo thang cao, mic cang bi giu o muc rat
+    // thap rat lau (toi 12s) - trai nghiem te hon ca chinh tieng hu ban dau.
+    // Chong hu phan hoi am hoc VAT LY (loa phat lai vao mic) gio la trach
+    // nhiem cua nguoi dung: giam am luong loa, dua mic ra xa loa hon, hoac
+    // dung tai nghe - day la GIOI HAN VAT LY (am truyen qua khong khi),
+    // khong phai thu phan mem co the tu giai quyet an toan ma khong danh
+    // doi bang trai nghiem hat that that. Thay vao do, tung nguon vocal gio
+    // co 1 VocalChannel (xem VocalChannel.kt) voi AutoGainControl - CHI san
+    // bang am luong GIUA cac nguon hat 1 cach CHAM va co gioi han, khong
+    // bao gio cam mic - cong voi cac tham so nguoi dung TU dieu chinh duoc
+    // (volume, EQ, Compressor, Echo) qua cac ham setChannelXxx() ben duoi.
 
     // ✅ MOI (xem giai thich day du o dau file): Host Room (SignalingServer +
     // WebRtcManager phia May A) chuyen vao Service de song bang vong doi voi
@@ -272,17 +238,96 @@ class PlaybackCaptureService : Service() {
             localMicMutedForMixer = muted
         }
 
-        // ✅ MOI (fix "tieng ret/giat khi 2+ May B/C cung hat" - xem giai
-        // thich day du trong LowLatencyMixer.kt): Limiter RIENG cho TUNG
-        // nguon vocal remote (moi clientId cua May B/C 1 Limiter rieng) -
-        // PCM tu WebRTC la RAW, CHUA qua chuoi Limiter/EQ/Compressor/Echo
-        // (chuoi do CHI ap dung cho mic VAT LY cua chinh May A, xem
-        // startMixerTestInternal()). Khi co 2-3 nguon remote cong dong thoi
-        // trong LowLatencyMixer.mixMultiSource(), can 1 lop chan RIENG cho
-        // tung nguon TRUOC khi cong - finalMixLimiter (chay SAU khi da cong
-        // TAT CA nguon, ben trong LowLatencyMixer) la lop chan CUOI CUNG,
-        // KHONG thay the duoc lop nay.
-        private val remoteVocalLimiters = ConcurrentHashMap<String, Limiter>()
+        // ✅ SUA (Phase 6 - dong bo chat luong local/remote): truoc day chi
+        // co remoteVocalLimiters (moi clientId 1 Limiter RIENG, KHONG co
+        // EQ/Compressor/Echo - PCM tu WebRTC la RAW). Gio dung 1 map DUY
+        // NHAT vocalChannels cho CA mic vat ly cua May A (key =
+        // LowLatencyMixer.SOURCE_LOCAL_MIC) LAN tung clientId cua May B/C -
+        // moi nguon co 1 VocalChannel rieng nhung CUNG mot chuoi xu ly va
+        // cung bo tham so mac dinh (xem VocalChannel.kt), dam bao giong hat
+        // tu xa nghe "day dan" nhu giong hat tai cho, khong con "mộc" hon.
+        private val vocalChannels = ConcurrentHashMap<String, VocalChannel>()
+
+        /** Lay (hoac tao moi neu chua co) VocalChannel cho 1 sourceId - dung chung cho ca local ("local_mic") va remote (clientId). */
+        private fun getOrCreateVocalChannel(sourceId: String): VocalChannel =
+            vocalChannels.getOrPut(sourceId) { VocalChannel(sampleRate = 44100, label = sourceId) }
+
+        // ================= "Ban mixer" - API dieu chinh tu UI =================
+        // ✅ MOI (Phase 6): thay the HowlGuard tu dong bang cac ham nguoi
+        // dung/UI goi truc tiep de dieu chinh TUNG nguon vocal (hoac nhac
+        // nen / tong the qua Mixer). An toan goi voi sourceId chua ton tai -
+        // se tu tao 1 VocalChannel moi voi tham so mac dinh.
+
+        /** Danh sach sourceId dang co kenh (da tung nhan PCM it nhat 1 lan) - dung de UI liet ke cac thanh truot. */
+        fun listActiveChannelIds(): List<String> = vocalChannels.keys.toList()
+
+        /** He so am luong THU CONG cho 1 kenh vocal (0f..2f). */
+        fun setChannelVolume(sourceId: String, volume: Float) {
+            getOrCreateVocalChannel(sourceId).volume = volume
+        }
+
+        fun getChannelVolume(sourceId: String): Float = getOrCreateVocalChannel(sourceId).volume
+
+        /** Cau/mo 1 kenh vocal cu the (vd nut "Tat mic May B"). */
+        fun setChannelMuted(sourceId: String, muted: Boolean) {
+            getOrCreateVocalChannel(sourceId).muted = muted
+        }
+
+        fun isChannelMuted(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).muted
+
+        /** EQ 3 dai cho 1 kenh - moi tham so trong [-12f, 12f] dB. */
+        fun setChannelEQ(sourceId: String, bassDb: Float, midDb: Float, trebleDb: Float) {
+            getOrCreateVocalChannel(sourceId).setEQGains(bassDb, midDb, trebleDb)
+        }
+
+        // ✅ MOI: getter doc lai dung 3 gia tri EQ HIEN TAI cua 1 kenh - dung
+        // de UI (dialog Ban mixer) hien dung gia tri da luu moi lan mo lai,
+        // thay vi luon hien mac dinh -2/1/3 dB nhu truoc (gia tri HIEN THI
+        // sai nhung gia tri THAT trong VocalChannel van dung).
+        fun getChannelEQBass(sourceId: String): Float = getOrCreateVocalChannel(sourceId).eq.bassGainDb
+        fun getChannelEQMid(sourceId: String): Float = getOrCreateVocalChannel(sourceId).eq.midGainDb
+        fun getChannelEQTreble(sourceId: String): Float = getOrCreateVocalChannel(sourceId).eq.trebleGainDb
+
+        fun setChannelAutoGainEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).autoGainEnabled = enabled
+        }
+
+        fun isChannelAutoGainEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).autoGainEnabled
+
+        fun setChannelEQEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).eqEnabled = enabled
+        }
+
+        fun isChannelEQEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).eqEnabled
+
+        fun setChannelCompressorEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).compressorEnabled = enabled
+        }
+
+        fun isChannelCompressorEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).compressorEnabled
+
+        fun setChannelEchoEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).echoEnabled = enabled
+        }
+
+        fun isChannelEchoEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).echoEnabled
+
+        /** He so am luong cho rieng nhac nen (0f..2f). */
+        fun setMusicVolume(volume: Float) {
+            activeMixerInstance?.musicVolume = volume
+        }
+
+        /** ✅ MOI: doc lai volume nhac nen HIEN TAI - tra ve 1.0f (mac dinh) neu Mixer Test chua bat (activeMixerInstance null), an toan cho UI doc truoc khi Mixer song. */
+        fun getMusicVolume(): Float = activeMixerInstance?.musicVolume ?: 1.0f
+
+        /** He so am luong cho TOAN BO ban mix cuoi (nhac + tat ca vocal da cong), 0f..2f. */
+        fun setMasterVolume(volume: Float) {
+            activeMixerInstance?.masterVolume = volume
+        }
+
+        /** ✅ MOI: doc lai volume tong the (master) HIEN TAI - tra ve 1.0f neu Mixer Test chua bat. */
+        fun getMasterVolume(): Float = activeMixerInstance?.masterVolume ?: 1.0f
+        // ================= Het API dieu chinh tu UI =================
 
         // ✅ MOI (CHAN DOAN TAM THOI - do nhip nhan PCM thuc te tu May B/C
         // qua WebRTC DataChannel, TRUOC khi sua bat ky gi): muc dich la xac
@@ -335,35 +380,31 @@ class PlaybackCaptureService : Service() {
         }
 
         /**
-         * ✅ SUA (ho tro nhieu May B/C cung hat - song ca): truoc day KHONG
-         * phan biet clientId nao gui PCM, moi nguon remote (va ca mic tai
-         * cho) deu bi don chung vao 1 hang doi FIFO DUY NHAT cua mixer -
-         * nguyen nhan goc gay tieng ret/giat khi co tu 2 nguon vocal tro
-         * len (xem giai thich day du trong LowLatencyMixer.kt). GIO moi
-         * May B/C day PCM vao 1 "kenh" RIENG cua LowLatencyMixer (dinh danh
-         * boi chinh clientId cua no), qua 1 Limiter RIENG (remoteVocalLimiters)
-         * truoc khi vao mixer.
+         * ✅ SUA (ho tro nhieu May B/C cung hat - song ca, + Phase 6 dong
+         * bo chat luong): moi May B/C day PCM vao 1 "kenh" RIENG cua
+         * LowLatencyMixer (dinh danh boi chinh clientId cua no), qua 1
+         * VocalChannel RIENG (EQ/Compressor/Echo/AutoGain/volume - CUNG
+         * chuoi xu ly voi mic vat ly, xem VocalChannel.kt) truoc khi vao
+         * mixer - khong con chi co Limiter "mộc" nhu truoc.
          */
         fun pushRemoteVocalChunk(clientId: String, buffer: ShortArray, size: Int) {
             logRemoteChunkTiming(clientId)
             synchronized(vocalPushLock) {
                 val mix = activeMixerInstance ?: return
-                val limiter = remoteVocalLimiters.getOrPut(clientId) {
-                    Limiter(sampleRate = 44100, thresholdRatio = 0.85f, releaseMs = 50f)
-                }
-                limiter.process(buffer, size)
+                val channel = getOrCreateVocalChannel(clientId)
+                channel.process(buffer, size)
                 mix.pushVocal(clientId, buffer, size)
             }
         }
 
         /**
          * ✅ MOI: goi khi 1 May B/C ngat ket noi (SignalingServer.Listener.
-         * onMicDisconnected) - don sach ring buffer + Limiter rieng cua no
-         * khoi mixer, tranh giu lai 1 nguon "ma" (khong con push nua nhung
-         * van chiem cho trong vocalBuffers cua mixer).
+         * onMicDisconnected) - don sach VocalChannel rieng cua no khoi
+         * mixer, tranh giu lai 1 nguon "ma" (khong con push nua nhung van
+         * chiem cho trong vocalBuffers cua mixer).
          */
         fun removeRemoteVocalSource(clientId: String) {
-            remoteVocalLimiters.remove(clientId)
+            vocalChannels.remove(clientId)
             activeMixerInstance?.removeVocalSource(clientId)
         }
     }
@@ -712,136 +753,36 @@ class PlaybackCaptureService : Service() {
         val router = OutputRouter(this, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).apply { start() }
         val mix = LowLatencyMixer(router, finalLimiter = finalLimiterInstance).apply { start() }
         val mic = MicInput(this)
-        val limiter = Limiter(sampleRate = 44100, thresholdRatio = 0.85f, releaseMs = 50f)
-
-        val processor = VocalProcessor(sampleRate = 44100, bassGainDb = -2.0f, midGainDb = 1.0f, trebleGainDb = 3.0f)
-        val compressor = Compressor(sampleRate = 44100, thresholdDb = -18.0f, ratio = 3.0f, attackMs = 12f, releaseMs = 100f, makeupGainDb = 2.0f)
-        val echo = EchoReverb(sampleRate = 44100, delayMs = 200f, feedback = 0.38f, wetLevel = 0.32f, damping = 0.35f)
 
         mixerOutputRouter = router
         mixer = mix
         micInput = mic
-        vocalLimiter = limiter
-        vocalProcessor = processor
-        vocalCompressor = compressor
-        vocalEcho = echo
         finalMixLimiter = finalLimiterInstance
         activeMixerInstance = mix
 
-        // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube"): reset trang
-        // thai bo chan hu moi lan Mixer Test duoc BAT lai (session moi ->
-        // khong ke thua nham trang thai "dang suppress"/leo thang cua lan
-        // chay truoc).
-        howlPrevRms = 0.0
-        howlRisingStreak = 0
-        howlSuppressUntilMs = 0L
-        howlGain = 1.0f
-        howlEscalationLevel = 0
-        howlLastTriggerMs = 0L
+        // ✅ SUA (Phase 6 - bo HowlGuard): khong con reset bien howl* (da go
+        // bo hoan toan). Thay vao do, reset state DSP NOI BO (filter/
+        // compressor/echo/auto-gain/limiter) cua CAC kenh vocal DA TON TAI
+        // tu truoc (vd sau 1 chu ky "Tat roi Bat lai" cua overlay) - tranh
+        // tan du (click/pop) tu session truoc, nhung GIU NGUYEN volume/EQ/
+        // cong tac nguoi dung da tu dieu chinh (khong reset ve mac dinh moi
+        // lan bat lai Mixer Test - xem VocalChannel.reset()).
+        vocalChannels.values.forEach { it.reset() }
 
         mic.startCapture(onPcmChunk = { buffer, size ->
             if (localMicMutedForMixer) return@startCapture
 
-            // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube, bam Khoa mic
-            // thi het"): day la PHAN HOI AM HOC THAT (Larsen effect) - loa
-            // cua chinh may nay (dang phat ban mix nhac+giong qua STREAM_
-            // SYSTEM) bi CHINH MIC VAT LY cua may nay thu lai, cong vao
-            // mixer, phat ra to hon, roi lai bi thu lai... vong lap co gain
-            // > 1 tu nuoi lon dan -> nghe thanh tieng "hu/rit" tang dan.
-            // Day KHAC voi vong lap SO da fix o MusicInput (excludeUid) -
-            // o day am thanh di qua khong khi that (loa -> mic), phan mem
-            // khong the "loai tru" duong nay bang UID nhu voi MusicInput.
-            // Limiter/Compressor phia duoi CHI chan dinh bien do (chop
-            // dinh), KHONG lam giam GAIN VONG LAP < 1 - nen howl van xay ra
-            // (chi la khong tang VO HAN ve bien do) du co Limiter.
-            //
-            // Cach nhan biet howl (khac tieng hat/noi binh thuong): RMS
-            // TANG LIEN TUC nhieu buffer lien tiep voi ty le tang deu -
-            // giong het (hat to dan) khong tao ra pattern tang DON DIEU va
-            // LIEN TUC nhu vay qua nhieu chu ky lien tiep. Khi phat hien,
-            // ha gain mic xuong rat thap trong 1 khoang ngan de PHA vong
-            // lap (tuong duong ngat mach phan hoi), roi tang dan gain tro
-            // lai (fade-in, tranh cat cup dot ngot nghe on) thay vi mute
-            // cung mot phat.
-            var sumSq = 0.0
-            for (i in 0 until size) {
-                val v = buffer[i].toDouble()
-                sumSq += v * v
-            }
-            val rms = kotlin.math.sqrt(sumSq / size)
-            val now = System.currentTimeMillis()
+            // ✅ SUA (Phase 6 - bo HowlGuard, xem giai thich day du o khai
+            // bao truong howl* cu da bi xoa phia tren): mic vat ly gio chi
+            // con di qua 1 VocalChannel DUY NHAT (dung chung logic voi tung
+            // nguon remote - xem VocalChannel.kt), KHONG con co che tu dong
+            // "cam mic" khi nghi ngo hu nua. Chong hu vat ly la trach nhiem
+            // cua nguoi dung (giam am loa / dua mic ra xa / dung tai nghe).
+            val channel = getOrCreateVocalChannel(LowLatencyMixer.SOURCE_LOCAL_MIC)
+            channel.process(buffer, size)
 
-            if (now < howlSuppressUntilMs) {
-                for (i in 0 until size) {
-                    buffer[i] = (buffer[i] * howlGain).toInt().toShort()
-                }
-                // ✅ SUA (v2): buoc phuc hoi CHIA THEO CAP DO LEO THANG - cap
-                // do cang cao (hu tai dien cang nhieu lan lien tiep), gain
-                // cang phuc hoi CHAM hon, giu mic o muc rat thap lau hon cho
-                // toi khi nguoi dung thuc su xu ly nguyen nhan vat ly.
-                val recoverStep = HOWL_GAIN_RECOVER_STEP / (howlEscalationLevel + 1)
-                howlGain = (howlGain + recoverStep).coerceAtMost(1.0f)
-            } else if (rms > HOWL_RMS_MIN_THRESHOLD && rms > howlPrevRms * HOWL_GROWTH_RATIO) {
-                howlRisingStreak++
-                if (howlRisingStreak >= HOWL_RISING_STREAK_TRIGGER) {
-                    // ✅ MOI (v2 - leo thang): neu lan kich hoat nay xay ra
-                    // qua GAN lan truoc (con trong HOWL_ESCALATION_WINDOW_MS),
-                    // coi la CUNG 1 vong lap phan hoi CHUA duoc giai quyet
-                    // that su (chi tam thoi bi chan roi lai tai dien ngay khi
-                    // gain phuc hoi) - tang cap do leo thang. Neu da qua lau
-                    // khong tai dien, reset ve cap 0 (coi nhu 1 su co rieng
-                    // le, khong can "nghi ngo" ke nua).
-                    val sinceLastTrigger = now - howlLastTriggerMs
-                    howlEscalationLevel = if (howlLastTriggerMs != 0L && sinceLastTrigger < HOWL_ESCALATION_WINDOW_MS) {
-                        (howlEscalationLevel + 1).coerceAtMost(HOWL_MAX_ESCALATION_LEVEL)
-                    } else {
-                        0
-                    }
-                    howlLastTriggerMs = now
-
-                    val suppressMs = (HOWL_BASE_SUPPRESS_MS shl howlEscalationLevel)
-                        .coerceAtMost(HOWL_MAX_SUPPRESS_MS)
-                    // Cap do leo thang cang cao, gain sau khi chan cang thap
-                    // (chia them theo cap do) - tranh truong hop 0.12 van con
-                    // du "he" lai vong lap neu do loi vat ly (loa qua to/mic
-                    // qua gan) rat nghiem trong.
-                    val effectiveMinGain = (HOWL_MIN_GAIN / (1 + howlEscalationLevel * 0.5f))
-
-                    logBoth(
-                        "🚨 [HowlGuard] Phat hien HU/RIT phan hoi am hoc (RMS tang lien tuc " +
-                            "$howlRisingStreak buffer, RMS=${"%.0f".format(rms)}, cap do leo thang=" +
-                            "$howlEscalationLevel) - ha gain mic con ${"%.3f".format(effectiveMinGain)} " +
-                            "trong ${suppressMs}ms. " +
-                            if (howlEscalationLevel >= 2) {
-                                "⚠️ Hu TAI DIEN NHIEU LAN LIEN TIEP - day la dau hieu vong lap phan hoi " +
-                                    "VAT LY (loa/mic) CHUA duoc xu ly tan goc. HAY: giam am luong loa, " +
-                                    "dua mic ra xa loa hon, hoac dung tai nghe (xem ghi chu VOCAL_GAIN " +
-                                    "trong LowLatencyMixer.kt) - phan mem chi giam thieu duoc mot phan."
-                            } else {
-                                "Neu lap lai thuong xuyen: hay giam am luong loa hoac xoay mic ra xa loa hon."
-                            }
-                    )
-                    howlSuppressUntilMs = now + suppressMs
-                    howlGain = effectiveMinGain
-                    for (i in 0 until size) {
-                        buffer[i] = (buffer[i] * howlGain).toInt().toShort()
-                    }
-                    howlRisingStreak = 0
-                }
-            } else {
-                howlRisingStreak = 0
-            }
-            howlPrevRms = rms
-
-            limiter.process(buffer, size)      // 1. Chan hu/feedback am hoc SOM NHAT co the
-            processor.process(buffer, size)    // 2. EQ 3-band
-            compressor.process(buffer, size)   // 3. Nen dai dong
-            echo.process(buffer, size)         // 4. Vang/nhai
             synchronized(vocalPushLock) {
-                // ✅ SUA: dinh danh ro nguon nay la mic VAT LY cua chinh May
-                // A (khac voi tung clientId cua May B/C qua WebRTC) - xem
-                // giai thich day du trong LowLatencyMixer.kt.
-                mix.pushVocal(LowLatencyMixer.SOURCE_LOCAL_MIC, buffer, size)   // 5. Day vao Mixer
+                mix.pushVocal(LowLatencyMixer.SOURCE_LOCAL_MIC, buffer, size)
             }
         })
 
@@ -871,7 +812,7 @@ class PlaybackCaptureService : Service() {
     }
 
     private fun stopMixerTestInternal() {
-        if (mixer == null && micInput == null && mixerOutputRouter == null && vocalLimiter == null) return
+        if (mixer == null && micInput == null && mixerOutputRouter == null) return
 
         volumeGuardJob?.cancel()
         volumeGuardJob = null
@@ -893,23 +834,17 @@ class PlaybackCaptureService : Service() {
         mixer = null
         mixerOutputRouter?.stop()
         mixerOutputRouter = null
-        vocalLimiter?.reset()
-        vocalLimiter = null
-        vocalProcessor?.reset()
-        vocalProcessor = null
-        vocalCompressor?.reset()
-        vocalCompressor = null
-        vocalEcho?.reset()
-        vocalEcho = null
         finalMixLimiter?.reset()
         finalMixLimiter = null
         activeMixerInstance = null
 
-        // ✅ MOI: mixer da dung -> khong con nguon remote nao con y nghia
-        // nua, don sach het (tranh Limiter/state cu cua May B/C cu bi tai
-        // su dung sai neu bat lai Mixer Test voi 1 phien Phong Karaoke moi
-        // sau nay, vi cac clientId co the trung nhau giua cac phien).
-        remoteVocalLimiters.clear()
+        // ✅ SUA (Phase 6): KHONG con xoa vocalChannels o day - lam vay se
+        // mat het volume/EQ nguoi dung da chinh moi lan Tat/Bat Mixer Test
+        // (vd trong chuoi "Kich hoat lai" cua overlay, xay ra rat thuong
+        // xuyen). Cac kenh remote van duoc don rieng khi TUNG clientId that
+        // su ngat ket noi (removeRemoteVocalSource(), goi tu
+        // onMicDisconnected/stopHostRoomInternal) - dung noi de don, khong
+        // phai o day.
 
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (musicMuteAppliedByMixerTest) {

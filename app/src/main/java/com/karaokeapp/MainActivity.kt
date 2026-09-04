@@ -454,6 +454,21 @@ class MainActivity : AppCompatActivity() {
             addView(stopAllButton)
         }
 
+        // ✅ MOI (Phase 6 - "ban mixer"): mo dialog dieu chinh volume/EQ/
+        // Compressor/Echo/AutoGain rieng cho tung nguon vocal (mic tai cho +
+        // tung May B/C dang hat) va volume nhac nen/tong the - thay the
+        // HowlGuard tu dong da go bo, xem giai thich chi tiet trong
+        // PlaybackCaptureService.kt va VocalChannel.kt.
+        val mixerBoardButton = Button(this).apply {
+            text = "🎚️ Ban mixer"
+            setOnClickListener { showMixerBoardDialog() }
+        }
+
+        val buttonRow7 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(mixerBoardButton)
+        }
+
         logText = TextView(this).apply {
             setPadding(16, 16, 16, 16)
             textSize = 12f
@@ -477,6 +492,7 @@ class MainActivity : AppCompatActivity() {
             addView(buttonRow4)
             addView(buttonRow5)
             addView(buttonRow6)
+            addView(buttonRow7)
             addView(logScrollView)
         }
         setContentView(rootLayout)
@@ -574,6 +590,200 @@ class MainActivity : AppCompatActivity() {
         onRoomReadyCallback = null
         onRoomErrorCallback = null
         onRoomMicStatusCallback = null
+    }
+
+    /**
+     * ✅ MOI (Phase 6 - "ban mixer"): dialog liet ke tat ca nguon vocal dang
+     * hoat dong (mic tai cho "local_mic" + tung clientId May B/C dang hat -
+     * lay tu PlaybackCaptureService.listActiveChannelIds(), tu dong rong
+     * khi 1 May B/C ngat ket noi vi Service da tu don channel tuong ung) va
+     * cho phep dieu chinh volume/EQ/AutoGain/Compressor/Echo cho tung
+     * kenh, cong voi 2 thanh truot rieng cho volume Nhac nen va Tong the.
+     * Thay the hoan toan HowlGuard tu dong da go bo (xem VocalChannel.kt).
+     */
+    private fun showMixerBoardDialog() {
+        val scrollContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+        }
+
+        scrollContent.addView(buildMasterVolumeSection())
+
+        val channelIds = PlaybackCaptureService.listActiveChannelIds()
+        if (channelIds.isEmpty()) {
+            scrollContent.addView(TextView(this).apply {
+                text = "\nChua co kenh vocal nao dang hoat dong (chua bat Mixer Test / chua co ai hat).\nMo lai 'Ban mixer' sau khi bat mic de thay danh sach."
+                setPadding(0, 24, 0, 0)
+            })
+        } else {
+            channelIds.forEach { sourceId ->
+                scrollContent.addView(buildChannelSection(sourceId))
+            }
+        }
+
+        val scrollView = ScrollView(this).apply { addView(scrollContent) }
+
+        val refreshButton = Button(this).apply {
+            text = "🔄 Lam moi danh sach kenh"
+        }
+
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("🎚️ Ban mixer")
+            .setView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(refreshButton)
+                addView(scrollView)
+            })
+            .setPositiveButton("Dong", null)
+            .create()
+
+        refreshButton.setOnClickListener {
+            dialog.dismiss()
+            showMixerBoardDialog()
+        }
+
+        dialog.show()
+    }
+
+    /** Nhan mo ta ngan gon cho 1 sourceId - "Mic tai cho (May nay)" cho local_mic, con lai hien nguyen clientId. */
+    private fun channelDisplayLabel(sourceId: String): String {
+        return if (sourceId == com.karaokeapp.audio.mixer.LowLatencyMixer.SOURCE_LOCAL_MIC) {
+            "🎤 Mic tai cho (may nay)"
+        } else {
+            "🎤 May: $sourceId"
+        }
+    }
+
+    /** Slider [-12f, 12f] dB dung chung cho ca 3 dai EQ (bass/mid/treble) - progress 0..240, 120 = 0dB. */
+    private fun addDbSeekBar(
+        container: LinearLayout,
+        label: String,
+        initialDb: Float,
+        onChange: (Float) -> Unit
+    ) {
+        val valueLabel = TextView(this).apply {
+            text = "$label: ${"%.1f".format(initialDb)} dB"
+        }
+        val seekBar = android.widget.SeekBar(this).apply {
+            max = 240
+            progress = ((initialDb + 12f) * 10f).toInt().coerceIn(0, 240)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                    val db = (progress / 10f) - 12f
+                    valueLabel.text = "$label: ${"%.1f".format(db)} dB"
+                    if (fromUser) onChange(db)
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {}
+            })
+        }
+        container.addView(valueLabel)
+        container.addView(seekBar)
+    }
+
+    /** Slider [0f, 2f] dung chung cho volume kenh/nhac nen/tong the - progress 0..200, 100 = 1.0x. */
+    private fun addVolumeSeekBar(
+        container: LinearLayout,
+        label: String,
+        initialVolume: Float,
+        onChange: (Float) -> Unit
+    ) {
+        val valueLabel = TextView(this).apply {
+            text = "$label: ${"%.0f".format(initialVolume * 100)}%"
+        }
+        val seekBar = android.widget.SeekBar(this).apply {
+            max = 200
+            progress = (initialVolume * 100f).toInt().coerceIn(0, 200)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                    val volume = progress / 100f
+                    valueLabel.text = "$label: ${"%.0f".format(volume * 100)}%"
+                    if (fromUser) onChange(volume)
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {}
+            })
+        }
+        container.addView(valueLabel)
+        container.addView(seekBar)
+    }
+
+    private fun buildMasterVolumeSection(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 24)
+            addView(TextView(this@MainActivity).apply {
+                text = "— Tong the —"
+                textSize = 16f
+            })
+            addVolumeSeekBar(this, "Nhac nen", PlaybackCaptureService.getMusicVolume()) { v -> PlaybackCaptureService.setMusicVolume(v) }
+            addVolumeSeekBar(this, "Tong the (master)", PlaybackCaptureService.getMasterVolume()) { v -> PlaybackCaptureService.setMasterVolume(v) }
+        }
+    }
+
+    private fun buildChannelSection(sourceId: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 24, 0, 24)
+
+            addView(TextView(this@MainActivity).apply {
+                text = "— ${channelDisplayLabel(sourceId)} —"
+                textSize = 16f
+            })
+
+            val mutedCheckBox = android.widget.CheckBox(this@MainActivity).apply {
+                text = "Cau kenh nay"
+                isChecked = PlaybackCaptureService.isChannelMuted(sourceId)
+                setOnCheckedChangeListener { _, checked ->
+                    PlaybackCaptureService.setChannelMuted(sourceId, checked)
+                }
+            }
+            addView(mutedCheckBox)
+
+            addVolumeSeekBar(this, "Volume", PlaybackCaptureService.getChannelVolume(sourceId)) { v ->
+                PlaybackCaptureService.setChannelVolume(sourceId, v)
+            }
+
+            // ✅ SUA: doc dung 3 gia tri EQ HIEN TAI tu Service (thay vi hang
+            // so mac dinh -2/1/3 dB truoc day) - dialog gio hien DUNG nhung
+            // gi nguoi dung da chinh o lan mo truoc, khong bi "quen" ve mac dinh.
+            var bassDb = PlaybackCaptureService.getChannelEQBass(sourceId)
+            var midDb = PlaybackCaptureService.getChannelEQMid(sourceId)
+            var trebleDb = PlaybackCaptureService.getChannelEQTreble(sourceId)
+            addDbSeekBar(this, "Bass", bassDb) { db -> bassDb = db; PlaybackCaptureService.setChannelEQ(sourceId, bassDb, midDb, trebleDb) }
+            addDbSeekBar(this, "Mid", midDb) { db -> midDb = db; PlaybackCaptureService.setChannelEQ(sourceId, bassDb, midDb, trebleDb) }
+            addDbSeekBar(this, "Treble", trebleDb) { db -> trebleDb = db; PlaybackCaptureService.setChannelEQ(sourceId, bassDb, midDb, trebleDb) }
+
+            val toggleRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(android.widget.CheckBox(this@MainActivity).apply {
+                    text = "AutoGain"
+                    isChecked = PlaybackCaptureService.isChannelAutoGainEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelAutoGainEnabled(sourceId, checked) }
+                })
+                addView(android.widget.CheckBox(this@MainActivity).apply {
+                    text = "EQ"
+                    isChecked = PlaybackCaptureService.isChannelEQEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelEQEnabled(sourceId, checked) }
+                })
+            }
+            addView(toggleRow)
+
+            val toggleRow2 = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(android.widget.CheckBox(this@MainActivity).apply {
+                    text = "Compressor"
+                    isChecked = PlaybackCaptureService.isChannelCompressorEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelCompressorEnabled(sourceId, checked) }
+                })
+                addView(android.widget.CheckBox(this@MainActivity).apply {
+                    text = "Echo"
+                    isChecked = PlaybackCaptureService.isChannelEchoEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelEchoEnabled(sourceId, checked) }
+                })
+            }
+            addView(toggleRow2)
+        }
     }
 
     private fun scrollLogToBottom() {

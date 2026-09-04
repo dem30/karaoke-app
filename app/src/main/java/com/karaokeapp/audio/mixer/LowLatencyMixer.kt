@@ -90,7 +90,8 @@ class LowLatencyMixer(
      * dong) NGAY SAU khi mix, TRUOC khi ghi ra OutputRouter. Doc lap voi
      * Limiter rieng cua tung nguon vocal (chay o PlaybackCaptureService.kt,
      * hoac Limiter rieng cho tung nguon remote - xem
-     * PlaybackCaptureService.remoteVocalLimiters). null = tat (mac dinh).
+     * PlaybackCaptureService.vocalChannels - moi kenh co Limiter an toan
+     * rieng cua no, xem VocalChannel.kt). null = tat (mac dinh).
      */
     private val finalLimiter: Limiter? = null
 ) {
@@ -111,10 +112,15 @@ class LowLatencyMixer(
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
 
-        // ⚠️ Xem giai thich chi tiet ve gioi han vat ly (feedback loop mic-loa)
-        // o ban goc cua file nay - KHUYEN NGHI dung tai nghe khi test.
-        private const val VOCAL_GAIN = 1.8f
-
+        // ✅ SUA (Phase 6 - bo VOCAL_GAIN co dinh): truoc day moi nguon vocal
+        // bi nhan CUNG 1 he so 1.8x co dinh o day, KHONG the tuy chinh -
+        // day chinh la 1 phan nguyen nhan HowlGuard (da bi go bo) phai phan
+        // ung qua nhay: gain vao mixer luon bi day cao san. Gio MOI nguon
+        // tu quyet dinh gain cua rieng no qua VocalChannel.volume (nguoi
+        // dung dieu chinh duoc qua UI) TRUOC KHI push() vao day - Mixer o
+        // day chi CONG DON cac nguon DA duoc gain san, khong nhan them gi
+        // nua (xem mixMultiSource()).
+        //
         // ✅ MOI: id co dinh cho nguon vocal cua MIC VAT LY tren chinh May A
         // (Mixer) - phan biet voi id cua tung May B/C (dung chinh clientId
         // cua chung, xem WebRtcManager/SignalingServer). Dat 1 hang so o day
@@ -123,46 +129,54 @@ class LowLatencyMixer(
         const val SOURCE_LOCAL_MIC = "local_mic"
 
         /**
-         * ✅ SUA (ho tro song ca nhieu may): truoc day mix() nhan DUY NHAT 1
-         * mang vocal. Gio nhan 1 DANH SACH cac nguon vocal (moi nguon la 1
-         * ShortArray scratch + do dai THAT SU vua drain duoc) - CONG DON
-         * tung nguon lai (clamp RIENG cho tong vocal, roi clamp lai LAN NUA
-         * khi cong voi music) thay vi chi co 1 nguon nhu ban truoc.
+         * ✅ SUA (Phase 6): khong con nhan/ap VOCAL_GAIN co dinh o day nua -
+         * moi nguon vocal trong vocalChunks coi nhu DA duoc VocalChannel xu
+         * ly xong (EQ/Compressor/Echo/volume rieng) truoc khi drain() vao
+         * day, nen chi CONG DON (clamp RIENG cho tong vocal, roi nhan
+         * musicVolume/masterVolume va clamp lai LAN NUA khi cong voi
+         * music) - vai tro cua ham nay gio THUAN TUY la "cong ban nhac".
          */
         private fun mixMultiSource(
-            music: ShortArray, musicLen: Int,
+            music: ShortArray, musicLen: Int, musicVolume: Float,
             vocalChunks: List<ShortArray>, vocalLens: List<Int>,
+            masterVolume: Float,
             outLength: Int
         ): ShortArray {
             val out = ShortArray(outLength)
             for (i in 0 until outLength) {
-                val m = if (i < musicLen) music[i].toInt() else 0
+                val m = if (i < musicLen) music[i] * musicVolume else 0f
 
-                var vocalSum = 0
+                var vocalSum = 0f
                 for (srcIdx in vocalChunks.indices) {
                     val len = vocalLens[srcIdx]
                     if (i < len) {
-                        val raw = vocalChunks[srcIdx][i].toInt()
-                        var boosted = (raw * VOCAL_GAIN).toInt()
-                        if (boosted > Short.MAX_VALUE) boosted = Short.MAX_VALUE.toInt()
-                        if (boosted < Short.MIN_VALUE) boosted = Short.MIN_VALUE.toInt()
-                        vocalSum += boosted
+                        vocalSum += vocalChunks[srcIdx][i].toFloat()
                     }
                 }
                 // Clamp TONG vocal (nhieu giong cong lai) TRUOC khi cong voi
                 // music - tranh truong hop 2-3 giong hat to cung luc da tu
                 // vuot bien do truoc ca khi tinh den nhac nen.
-                if (vocalSum > Short.MAX_VALUE) vocalSum = Short.MAX_VALUE.toInt()
-                if (vocalSum < Short.MIN_VALUE) vocalSum = Short.MIN_VALUE.toInt()
+                vocalSum = vocalSum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
 
-                var sum = m + vocalSum
-                if (sum > Short.MAX_VALUE) sum = Short.MAX_VALUE.toInt()
-                if (sum < Short.MIN_VALUE) sum = Short.MIN_VALUE.toInt()
-                out[i] = sum.toShort()
+                var sum = (m + vocalSum) * masterVolume
+                sum = sum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
+                out[i] = sum.toInt().toShort()
             }
             return out
         }
     }
+
+    // ✅ MOI (Phase 6 - "ban mixer" dieu chinh duoc): he so am luong rieng
+    // cho nhac nen va cho TOAN BO ban mix cuoi (master) - nguoi dung dieu
+    // chinh qua UI (vd 2 thanh truot "Nhac" va "Tong"), doc lap voi volume
+    // rieng cua tung nguon vocal (xem VocalChannel.volume).
+    @Volatile
+    var musicVolume: Float = 1.0f
+        set(value) { field = value.coerceIn(0f, 2f) }
+
+    @Volatile
+    var masterVolume: Float = 1.0f
+        set(value) { field = value.coerceIn(0f, 2f) }
 
     private val musicBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
 
@@ -312,7 +326,12 @@ class LowLatencyMixer(
                     vocalLens.add(len)
                 }
 
-                val mixed = mixMultiSource(musicChunk, musicLen, vocalChunks, vocalLens, CHUNK_SIZE)
+                val mixed = mixMultiSource(
+                    musicChunk, musicLen, musicVolume,
+                    vocalChunks, vocalLens,
+                    masterVolume,
+                    CHUNK_SIZE
+                )
                 // Chan clipping tren tin hieu DA MIX (nhac + TAT CA vocal da
                 // cong dong) - vi tri cuoi chuoi, dung y PLAN.md goc.
                 finalLimiter?.process(mixed, CHUNK_SIZE)
