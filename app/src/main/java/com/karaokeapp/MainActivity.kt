@@ -394,11 +394,27 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { reconnectToLastRoom() }
         }
 
+        // ✅ FIX ("hoan toan khong thay nut Ket noi lai"): nguyen nhan THAT
+        // SU la loi bo tri UI, khong phai loi logic - buttonRow5 truoc day
+        // dat 3 nut CO TEXT DAI (vd "📷 Quet QR vao phong (Mic B)") vao 1
+        // LinearLayout HORIZONTAL voi chieu rong MAC DINH (WRAP_CONTENT).
+        // Khi tong chieu rong 3 nut vuot qua chieu rong man hinh,
+        // LinearLayout KHONG tu xuong dong va KHONG the cuon ngang - noi
+        // dung vuot qua chi don gian bi VE RA NGOAI vung nhin thay (mat
+        // hoan toan, khong phai bi cat 1 phan) - dung 100% trieu chung
+        // "hoan toan khong thay nut" da bao.
+        //
+        // Sua: ep moi nut trong hang nay chia deu chieu rong man hinh
+        // (width=0 + weight=1, kieu "match_parent chia deu") - dam bao
+        // LUON du 3 nut nam gon trong 1 hang bat ke text dai bao nhieu (chi
+        // bi thu nho/xuong dong NOI BO trong nut, khong bao gio bi day ra
+        // ngoai man hinh nua).
         val buttonRow5 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(createRoomButton)
-            addView(joinRoomButton)
-            addView(reconnectButton)
+            listOf(createRoomButton, joinRoomButton, reconnectButton).forEach { btn ->
+                btn.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                addView(btn)
+            }
         }
 
         val muteLocalMicButton = Button(this).apply {

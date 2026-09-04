@@ -116,15 +116,45 @@ class PlaybackCaptureService : Service() {
     private var howlSuppressUntilMs = 0L
     private var howlGain = 1.0f
 
+    // ✅ MOI (v2 - fix "van con rit sau khi da them HowlGuard lan dau"): ban
+    // dau chi suppress CO DINH 1.2s roi phuc hoi gain kha nhanh - neu vong
+    // lap phan hoi VAT LY van con nguyen (loa van to, mic van gan loa) thi
+    // ngay khi gain phuc hoi lai, hu se TAI DIEN GAN NHU NGAY LAP TUC, tao
+    // ra kieu "rit - tat - rit - tat" lien tuc - nghe tong the VAN nhu con
+    // rit du tung dot da bi chan. Them CO CHE LEO THANG: neu 1 lan kich hoat
+    // moi xay ra qua GAN lan truoc (con trong HOWL_ESCALATION_WINDOW_MS),
+    // coi la "cung 1 vong lap phan hoi CHUA duoc giai quyet that su" - tang
+    // dan thoi gian suppress (nhan doi moi lan, co tran) VA lam gain phuc
+    // hoi CHAM lai theo cap do leo thang - cho toi khi nguoi dung THAT SU
+    // xu ly nguyen nhan goc (giam am luong loa / dung tai nghe / dua mic ra
+    // xa loa hon - dung y ghi chu san co trong LowLatencyMixer.VOCAL_GAIN).
+    // Cap do leo thang tu RESET ve 0 neu da co 1 khoang YEN du dai
+    // (khong kich hoat lai) - tranh khoa mic vinh vien oan neu chi la 1 lan
+    // hu thoang qua roi het that.
+    private var howlEscalationLevel = 0
+    private var howlLastTriggerMs = 0L
+
     // Nguong/he so cho bo chan hu - de private val (khong phai companion,
     // vi class nay da co 1 companion object rieng o duoi) de tranh trung
     // khai bao companion object thu 2 (Kotlin khong cho phep).
-    private val HOWL_RMS_MIN_THRESHOLD = 400.0
-    private val HOWL_GROWTH_RATIO = 1.12
-    private val HOWL_RISING_STREAK_TRIGGER = 5
-    private val HOWL_SUPPRESS_MS = 1200L
+    //
+    // ✅ SUA (v2): giam HOWL_RISING_STREAK_TRIGGER (5->3) va HOWL_GROWTH_RATIO
+    // (1.12->1.08) - phan ung SOM HON voi dau hieu tang, vi Mixer con khuech
+    // dai nguon vocal them VOCAL_GAIN=1.8x + Compressor makeup gain SAU buoc
+    // nay (xem LowLatencyMixer.kt) - phat hien cang tre, hu cang kip "lan to"
+    // truoc khi bi chan.
+    private val HOWL_RMS_MIN_THRESHOLD = 350.0
+    private val HOWL_GROWTH_RATIO = 1.08
+    private val HOWL_RISING_STREAK_TRIGGER = 3
+    private val HOWL_BASE_SUPPRESS_MS = 1200L
+    private val HOWL_MAX_SUPPRESS_MS = 12_000L
+    private val HOWL_MAX_ESCALATION_LEVEL = 4
+    private val HOWL_ESCALATION_WINDOW_MS = 6_000L
     private val HOWL_MIN_GAIN = 0.12f
-    private val HOWL_GAIN_RECOVER_STEP = 0.02f
+    // ✅ SUA (v2): giam tu 0.02f -> 0.008f (phuc hoi cham hon nhieu, ~vai
+    // giay thay vi ~1.7s) - o cap do leo thang cao hon, con nhan them he so
+    // chia trong code de phuc hoi CHAM HON NUA (xem cach dung ben duoi).
+    private val HOWL_GAIN_RECOVER_STEP = 0.008f
 
     // ✅ MOI (xem giai thich day du o dau file): Host Room (SignalingServer +
     // WebRtcManager phia May A) chuyen vao Service de song bang vong doi voi
@@ -700,11 +730,14 @@ class PlaybackCaptureService : Service() {
 
         // ✅ MOI (fix "May A hu rit tang dan khi mo YouTube"): reset trang
         // thai bo chan hu moi lan Mixer Test duoc BAT lai (session moi ->
-        // khong ke thua nham trang thai "dang suppress" cua lan chay truoc).
+        // khong ke thua nham trang thai "dang suppress"/leo thang cua lan
+        // chay truoc).
         howlPrevRms = 0.0
         howlRisingStreak = 0
         howlSuppressUntilMs = 0L
         howlGain = 1.0f
+        howlEscalationLevel = 0
+        howlLastTriggerMs = 0L
 
         mic.startCapture(onPcmChunk = { buffer, size ->
             if (localMicMutedForMixer) return@startCapture
@@ -742,18 +775,54 @@ class PlaybackCaptureService : Service() {
                 for (i in 0 until size) {
                     buffer[i] = (buffer[i] * howlGain).toInt().toShort()
                 }
-                howlGain = (howlGain + HOWL_GAIN_RECOVER_STEP).coerceAtMost(1.0f)
+                // ✅ SUA (v2): buoc phuc hoi CHIA THEO CAP DO LEO THANG - cap
+                // do cang cao (hu tai dien cang nhieu lan lien tiep), gain
+                // cang phuc hoi CHAM hon, giu mic o muc rat thap lau hon cho
+                // toi khi nguoi dung thuc su xu ly nguyen nhan vat ly.
+                val recoverStep = HOWL_GAIN_RECOVER_STEP / (howlEscalationLevel + 1)
+                howlGain = (howlGain + recoverStep).coerceAtMost(1.0f)
             } else if (rms > HOWL_RMS_MIN_THRESHOLD && rms > howlPrevRms * HOWL_GROWTH_RATIO) {
                 howlRisingStreak++
                 if (howlRisingStreak >= HOWL_RISING_STREAK_TRIGGER) {
+                    // ✅ MOI (v2 - leo thang): neu lan kich hoat nay xay ra
+                    // qua GAN lan truoc (con trong HOWL_ESCALATION_WINDOW_MS),
+                    // coi la CUNG 1 vong lap phan hoi CHUA duoc giai quyet
+                    // that su (chi tam thoi bi chan roi lai tai dien ngay khi
+                    // gain phuc hoi) - tang cap do leo thang. Neu da qua lau
+                    // khong tai dien, reset ve cap 0 (coi nhu 1 su co rieng
+                    // le, khong can "nghi ngo" ke nua).
+                    val sinceLastTrigger = now - howlLastTriggerMs
+                    howlEscalationLevel = if (howlLastTriggerMs != 0L && sinceLastTrigger < HOWL_ESCALATION_WINDOW_MS) {
+                        (howlEscalationLevel + 1).coerceAtMost(HOWL_MAX_ESCALATION_LEVEL)
+                    } else {
+                        0
+                    }
+                    howlLastTriggerMs = now
+
+                    val suppressMs = (HOWL_BASE_SUPPRESS_MS shl howlEscalationLevel)
+                        .coerceAtMost(HOWL_MAX_SUPPRESS_MS)
+                    // Cap do leo thang cang cao, gain sau khi chan cang thap
+                    // (chia them theo cap do) - tranh truong hop 0.12 van con
+                    // du "he" lai vong lap neu do loi vat ly (loa qua to/mic
+                    // qua gan) rat nghiem trong.
+                    val effectiveMinGain = (HOWL_MIN_GAIN / (1 + howlEscalationLevel * 0.5f))
+
                     logBoth(
-                        "🚨 [HowlGuard] Phat hien dau hieu HU/RIT phan hoi am hoc (RMS tang lien tuc " +
-                            "$howlRisingStreak buffer, RMS hien tai=${"%.0f".format(rms)}) - ha gain mic " +
-                            "vat ly xuong con ${HOWL_MIN_GAIN} trong ${HOWL_SUPPRESS_MS}ms de pha vong lap. " +
-                            "Neu lap lai thuong xuyen: hay giam am luong loa hoac xoay mic ra xa loa hon."
+                        "🚨 [HowlGuard] Phat hien HU/RIT phan hoi am hoc (RMS tang lien tuc " +
+                            "$howlRisingStreak buffer, RMS=${"%.0f".format(rms)}, cap do leo thang=" +
+                            "$howlEscalationLevel) - ha gain mic con ${"%.3f".format(effectiveMinGain)} " +
+                            "trong ${suppressMs}ms. " +
+                            if (howlEscalationLevel >= 2) {
+                                "⚠️ Hu TAI DIEN NHIEU LAN LIEN TIEP - day la dau hieu vong lap phan hoi " +
+                                    "VAT LY (loa/mic) CHUA duoc xu ly tan goc. HAY: giam am luong loa, " +
+                                    "dua mic ra xa loa hon, hoac dung tai nghe (xem ghi chu VOCAL_GAIN " +
+                                    "trong LowLatencyMixer.kt) - phan mem chi giam thieu duoc mot phan."
+                            } else {
+                                "Neu lap lai thuong xuyen: hay giam am luong loa hoac xoay mic ra xa loa hon."
+                            }
                     )
-                    howlSuppressUntilMs = now + HOWL_SUPPRESS_MS
-                    howlGain = HOWL_MIN_GAIN
+                    howlSuppressUntilMs = now + suppressMs
+                    howlGain = effectiveMinGain
                     for (i in 0 until size) {
                         buffer[i] = (buffer[i] * howlGain).toInt().toShort()
                     }
