@@ -4,6 +4,7 @@ import android.os.Process
 import android.util.Log
 import com.karaokeapp.audio.music.CaptureLogBus
 import com.karaokeapp.audio.output.OutputRouter
+import com.karaokeapp.audio.processor.Limiter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
@@ -73,7 +74,20 @@ private class ShortRingBuffer(private val capacity: Int) {
  * ShortRingBuffer (mang nguyen thuy, khong boxing) VA giam tran xuong con
  * ~200ms - neu co tut lai, do tre toi da cung chi ~200ms thay vi ca giay.
  */
-class LowLatencyMixer(private val outputRouter: OutputRouter) {
+class LowLatencyMixer(
+    private val outputRouter: OutputRouter,
+    /**
+     * ✅ MOI (Phase 4 - phan con lai): Limiter TUY CHON, ap dung cho MIX
+     * TONG (nhac + vocal) NGAY SAU khi cong 2 nguon, TRUOC khi ghi ra
+     * OutputRouter. Doc lap voi Limiter dang chay tren rieng vocal (o
+     * PlaybackCaptureService.kt, TRUOC khi vao day) - vi tri nay chan
+     * truong hop nhac + vocal (da qua EQ/Compressor/Echo, co the co gain
+     * cao hon tin hieu goc) cong lai vuot nguong DU tung nguon rieng le van
+     * on, dung y PLAN.md goc ("Limiter cuoi chuoi"). null = tat (mac dinh,
+     * giu tuong thich nguoc cho code cu/test cu khong truyen tham so nay).
+     */
+    private val finalLimiter: Limiter? = null
+) {
 
     companion object {
         private const val TAG = "LowLatencyMixer"
@@ -247,6 +261,11 @@ class LowLatencyMixer(private val outputRouter: OutputRouter) {
                 wasMusicSilentAtMixer = musicSilentNow
 
                 val mixed = mix(musicChunk, musicLen, vocalChunk, vocalLen, CHUNK_SIZE)
+                // ✅ MOI (Phase 4 - phan con lai): chan clipping tren tin
+                // hieu DA MIX, sau khi vocal da qua EQ/Compressor/Echo (co
+                // the co gain cao hon dau vao goc) - xem giai thich day du o
+                // khai bao finalLimiter phia tren.
+                finalLimiter?.process(mixed, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
 
                 // ✅ MOI: log dinh ky (~1 lan/giay) do sau (tinh theo ms) cua

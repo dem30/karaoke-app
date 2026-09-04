@@ -22,6 +22,9 @@ import com.karaokeapp.audio.mic.MicInput
 import com.karaokeapp.audio.mixer.LowLatencyMixer
 import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
+import com.karaokeapp.audio.processor.VocalProcessor
+import com.karaokeapp.audio.processor.Compressor
+import com.karaokeapp.audio.processor.EchoReverb
 import com.karaokeapp.overlay.MixerToggleOverlayButton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -86,6 +89,22 @@ class PlaybackCaptureService : Service() {
     private var mixerOutputRouter: OutputRouter? = null
     private var mixerToggleOverlay: MixerToggleOverlayButton? = null
     private var vocalLimiter: Limiter? = null
+    // ✅ MOI (Phase 4 - phan con lai): 3 khoi xu ly vocal con thieu, chay
+    // NGAY SAU vocalLimiter (KHONG thay the vi tri cua no) - xem giai thich
+    // day du o startMixerTestInternal().
+    private var vocalProcessor: VocalProcessor? = null
+    private var vocalCompressor: Compressor? = null
+    private var vocalEcho: EchoReverb? = null
+    // ✅ MOI: Limiter THU HAI, doc lap voi vocalLimiter - ap dung cho MIX
+    // TONG (nhac + vocal) SAU khi LowLatencyMixer da cong 2 nguon, dung vi
+    // tri ma PLAN.md goc va comment dau Limiter.kt da du tinh tu dau ("dung
+    // chung 1 class cho 2 vi tri") nhung truoc gio chua ai noi vi tri thu 2
+    // nay vao. Ly do can CA HAI (khong chi 1): vocalLimiter chan feedback
+    // AM HOC tu som (truoc khi EQ/Compressor/Echo kip khuyech dai them);
+    // finalMixLimiter chan CLIPPING SO khi nhac + vocal (da qua Compressor
+    // makeup-gain va Echo feedback) cong lai co the vuot nguong dù tung
+    // nguon rieng le van on.
+    private var finalMixLimiter: Limiter? = null
 
     private var savedStreamSystemVolume = -1
 
@@ -555,19 +574,46 @@ class PlaybackCaptureService : Service() {
 
         requestFocusObserver(audioManager)
 
+        // ✅ MOI (Phase 4 - phan con lai): finalMixLimiter tao TRUOC LowLatencyMixer
+        // vi mixer can nhan no qua constructor (ap dung SAU khi mix, TRUOC khi
+        // ghi ra OutputRouter - xem thay doi tuong ung trong LowLatencyMixer.kt).
+        val finalLimiterInstance = Limiter(sampleRate = 44100, thresholdRatio = 0.9f, releaseMs = 50f)
         val router = OutputRouter(this, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION).apply { start() }
-        val mix = LowLatencyMixer(router).apply { start() }
+        val mix = LowLatencyMixer(router, finalLimiter = finalLimiterInstance).apply { start() }
         val mic = MicInput(this)
         val limiter = Limiter(sampleRate = 44100, thresholdRatio = 0.85f, releaseMs = 50f)
+
+        // ✅ MOI (Phase 4 - phan con lai): EQ 3-band -> Compressor -> Echo/Reverb,
+        // ca 3 chay TREN VOCAL RIENG (truoc khi vao mixer), SAU vocalLimiter -
+        // xem giai thich day du ve thu tu nay trong comment khai bao field
+        // finalMixLimiter phia tren. Gia tri gain mac dinh (bass -2dB, mid
+        // +1dB, treble +3dB) dua theo de xuat cua nguoi dung (huong_dan.txt) -
+        // giam nhe truc de bot duc, tang nhe mid de ro loi, tang treble de
+        // sang giong - can nghe thu thuc te de tinh chinh lai, day chi la
+        // diem khoi dau hop ly, KHONG phai con so da kiem chung bang tai.
+        val processor = VocalProcessor(sampleRate = 44100, bassGainDb = -2.0f, midGainDb = 1.0f, trebleGainDb = 3.0f)
+        val compressor = Compressor(sampleRate = 44100, thresholdDb = -18.0f, ratio = 3.0f, attackMs = 12f, releaseMs = 100f, makeupGainDb = 2.0f)
+        val echo = EchoReverb(sampleRate = 44100, delayMs = 200f, feedback = 0.38f, wetLevel = 0.32f, damping = 0.35f)
 
         mixerOutputRouter = router
         mixer = mix
         micInput = mic
         vocalLimiter = limiter
+        vocalProcessor = processor
+        vocalCompressor = compressor
+        vocalEcho = echo
+        finalMixLimiter = finalLimiterInstance
 
+        // ✅ MOI: chuoi xu ly vocal day du - Limiter (chan feedback am hoc,
+        // vi tri quan trong nhat, KHONG doi) -> EQ -> Compressor -> Echo ->
+        // day vao Mixer. finalMixLimiter chay o BEN TRONG LowLatencyMixer,
+        // SAU khi mix, khong chay o day.
         mic.startCapture(onPcmChunk = { buffer, size ->
-            limiter.process(buffer, size)
-            mix.pushVocal(buffer, size)
+            limiter.process(buffer, size)      // 1. Chan hu/feedback am hoc SOM NHAT co the
+            processor.process(buffer, size)    // 2. EQ 3-band
+            compressor.process(buffer, size)   // 3. Nen dai dong
+            echo.process(buffer, size)         // 4. Vang/nhai
+            mix.pushVocal(buffer, size)        // 5. Day vao Mixer (finalMixLimiter chay sau day, trong Mixer)
         })
 
         guardTickCount = 0
@@ -628,6 +674,15 @@ class PlaybackCaptureService : Service() {
         mixerOutputRouter = null
         vocalLimiter?.reset()
         vocalLimiter = null
+        // ✅ MOI (Phase 4 - phan con lai): don dep dung 3 khoi moi + Limiter thu 2.
+        vocalProcessor?.reset()
+        vocalProcessor = null
+        vocalCompressor?.reset()
+        vocalCompressor = null
+        vocalEcho?.reset()
+        vocalEcho = null
+        finalMixLimiter?.reset()
+        finalMixLimiter = null
 
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (musicMuteAppliedByMixerTest) {
