@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 
 /**
@@ -22,11 +23,25 @@ import kotlin.math.min
  * dong bo mau CU NHAT de nhuong cho mau moi - uu tien phat am thanh moi
  * nhat thay vi de do tre phinh to vo han khi ben san xuat nhanh hon ben
  * tieu thu.
+ *
+ * ✅ MOI (chan doan tieng "ret/giat" - xem giai thich day du trong
+ * LowLatencyMixer.start()): them dem overflowCount - moi lan buffer DAY va
+ * phai bo 1 sample cu de nhuong cho sample moi (nhanh "else" trong push()),
+ * dem tang 1. Neu dem nay tang LIEN TUC voi toc do cao trong luc dang
+ * capture/mixer chay binh thuong (khong phai luc moi bat dau/dang cho du
+ * du lieu), day la BANG CHUNG CU THE rang ben SAN XUAT (MicInput/MusicInput)
+ * dang nhanh hon ben TIEU THU (mixer loop) mot cach CO HE THONG - khac voi
+ * truong hop mixer loop bi CPU gianh mat (xem mixerLoopDelay ben duoi).
  */
 private class ShortRingBuffer(private val capacity: Int) {
     private val buffer = ShortArray(capacity)
     private var head = 0
     private var count = 0
+
+    // ✅ MOI: AtomicLong (khong can @Synchronized rieng, doc/ghi doc lap voi
+    // lock cua push()/drain() - chi dung de CHAN DOAN, khong anh huong logic
+    // audio chinh).
+    private val overflowCount = AtomicLong(0)
 
     @Synchronized
     fun push(src: ShortArray, size: Int) {
@@ -38,6 +53,7 @@ private class ShortRingBuffer(private val capacity: Int) {
             } else {
                 // Da day - bo mau cu nhat (tien head len 1) de nhuong cho mau moi.
                 head = (head + 1) % capacity
+                overflowCount.incrementAndGet()
             }
         }
     }
@@ -61,7 +77,11 @@ private class ShortRingBuffer(private val capacity: Int) {
     fun clear() {
         head = 0
         count = 0
+        overflowCount.set(0)
     }
+
+    /** Lay va RESET ve 0 dem overflow tich luy tu lan doc truoc - dung cho log dinh ky (giong tinh than cac bo dem windowed khac trong PlaybackCaptureService). */
+    fun drainOverflowCount(): Long = overflowCount.getAndSet(0)
 }
 
 /**
@@ -83,29 +103,34 @@ private class ShortRingBuffer(private val capacity: Int) {
  * (co clamp) - giong 1 ban mixer vat ly co nhieu kenh fader, khong phai 1
  * hang doi chung.
  *
- * ✅ CAP NHAT MOI (fix "vocal bi CAT VUONG (hard-clip) khi nhieu nguon cung
- * to, nghe gat/be trong khi da co finalLimiter"): PHIEN BAN TRUOC dung
- * coerceIn() CUNG 2 lan trong mixMultiSource() - 1 lan ngay sau khi cong don
- * TAT CA nguon vocal, 1 lan nua sau khi cong voi nhac va nhan masterVolume.
- * coerceIn() la CAT VUONG (hard clip): bat ky gia tri nao vuot bien do PCM
- * bi CHAT THANG ve dung +-32767, mat hoan toan hinh dang waveform o phan
- * vuot do - xay ra TRUOC CA khi finalLimiter (chay SAU mixMultiSource(), xem
- * start()) kip xu ly, nen finalLimiter khong the "cuu" lai duoc gi (du lieu
- * da mat that su, khong phai chi bi giam gain). Trieu chung thuc te: khi 2-3
- * nguon vocal cung to, hoac vocal+nhac cung dinh dinh, am thanh nghe gat/be/
- * "loa qua tai" ngay ca khi tung nguon rieng le nghe binh thuong.
+ * ✅ CAP NHAT (fix hard-clip - soft-knee limiter thay coerceIn() cung trong
+ * mixMultiSource(), xem KDoc ham softKnee() o duoi).
  *
- * Sua: thay 2 lan coerceIn() do bang 1 buoc "soft-knee" (xem ham softKnee()
- * o duoi) NGAY TRUOC buoc chuyen Float -> Short cuoi cung. Gia tri duoi
- * nguong SOFT_KNEE_THRESHOLD_ABS giu NGUYEN 100% (khong dong toi, khac voi
- * han che cua tanh() ap dung tren toan bo tin hieu - se lam "min" ca doan
- * nho khong can thiet). Chi phan VUOT nguong moi bi nen mem dan ve gan
- * SOFT_KNEE_CEILING_ABS bang tanh(), thay vi bi CAT THANG. coerceIn() cuoi
- * cung (sau softKnee()) CHI con vai tro luoi an toan chan wraparound so hoc
- * khi Float -> Short (vd 40000f.toInt().toShort() se KHONG tu clamp ve
- * 32767 nhu nhieu nguoi lam, ma wrap thanh 1 gia tri AM/rac - day la ly do
- * TUYET DOI khong duoc bo qua buoc clamp cuoi nay du softKnee() da xu ly
- * gan het truong hop thuc te).
+ * ✅ CAP NHAT MOI (fix "ban mixer fly mat gia tri musicVolume/masterVolume
+ * moi lan bam play/pause de kich hoat lai am thanh"): PHIEN BAN TRUOC
+ * musicVolume/masterVolume la 2 property CUA INSTANCE (var musicVolume: ...
+ * ngay trong class body) - moi lan startMixerTestInternal() trong
+ * PlaybackCaptureService.kt chay (bao gom CA LUC TU DONG trong chuoi
+ * "Kich hoat lai" khi FocusObserver/nut noi kich hoat, KHONG chi khi nguoi
+ * dung tu tay bam "Bat/Tat Mixer Test"), 1 object LowLatencyMixer HOAN TOAN
+ * MOI duoc tao (val mix = LowLatencyMixer(router, ...)), khien 2 gia tri
+ * nay bi RESET VE DEFAULT - khac han vocalChannels (Volume/EQ rieng cua
+ * tung mic), von duoc luu trong 1 ConcurrentHashMap o COMPANION OBJECT cua
+ * PlaybackCaptureService nen KHONG bi mat khi LowLatencyMixer bi tao lai.
+ * Day la ly do nguoi dung thay Volume/EQ tung kenh mic thi con, nhung
+ * "Nhac nen"/"Tong the" (master) thi bi ve lai mac dinh moi lan bam play/
+ * pause tren YouTube (kich hoat chuoi Reactivation tu dong tat/bat lai
+ * Mixer Test).
+ *
+ * Sua: chuyen musicVolume/masterVolume tu INSTANCE property sang COMPANION
+ * (static) property - giong dung tinh than vocalChannels: gia tri song o
+ * cap "toan cuc" (mot lan set la giu mai, khong phu thuoc instance nao dang
+ * chay), khong con bi reset khi 1 LowLatencyMixer moi duoc tao ra. Noi goi
+ * (PlaybackCaptureService.setMusicVolume/getMusicVolume/setMasterVolume/
+ * getMasterVolume) cung duoc doi tu "activeMixerInstance?.musicVolume = ..."
+ * (chi co tac dung khi mixer DANG chay) sang "LowLatencyMixer.musicVolume =
+ * ..." (luon co tac dung, ke ca khi mixer dang TAT - gia tri se duoc ap
+ * dung ngay khi mixer bat lai, khong can cho "dang chay" moi set duoc).
  */
 class LowLatencyMixer(
     private val outputRouter: OutputRouter,
@@ -116,14 +141,6 @@ class LowLatencyMixer(
      * hoac Limiter rieng cho tung nguon remote - xem
      * PlaybackCaptureService.vocalChannels - moi kenh co Limiter an toan
      * rieng cua no, xem VocalChannel.kt). null = tat (mac dinh).
-     *
-     * ✅ Van giu nguyen vai tro sau khi them softKnee() - finalLimiter la
-     * bo loc CO TRANG THAI (attack/release, tha dan theo thoi gian, xem
-     * Limiter.kt) chay SAU softKnee(), con softKnee() KHONG co trang thai
-     * (memoryless, xu ly tung sample doc lap). 2 lop nay bo tro nhau: softKnee
-     * dam bao KHONG mat waveform ngay tai buoc cong don (truoc day la diem
-     * yeu nhat), finalLimiter tiep tuc lam muot dong bien do qua thoi gian
-     * (tranh "bom/pumping" neu vuot nguong lien tuc nhieu buffer).
      */
     private val finalLimiter: Limiter? = null
 ) {
@@ -144,145 +161,99 @@ class LowLatencyMixer(
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
 
-        // ✅ SUA (Phase 6 - bo VOCAL_GAIN co dinh): truoc day moi nguon vocal
-        // bi nhan CUNG 1 he so 1.8x co dinh o day, KHONG the tuy chinh -
-        // day chinh la 1 phan nguyen nhan HowlGuard (da bi go bo) phai phan
-        // ung qua nhay: gain vao mixer luon bi day cao san. Gio MOI nguon
-        // tu quyet dinh gain cua rieng no qua VocalChannel.volume (nguoi
-        // dung dieu chinh duoc qua UI) TRUOC KHI push() vao day - Mixer o
-        // day chi CONG DON cac nguon DA duoc gain san, khong nhan them gi
-        // nua (xem mixMultiSource()).
-        //
-        // ✅ MOI: id co dinh cho nguon vocal cua MIC VAT LY tren chinh May A
-        // (Mixer) - phan biet voi id cua tung May B/C (dung chinh clientId
-        // cua chung, xem WebRtcManager/SignalingServer). Dat 1 hang so o day
-        // de PlaybackCaptureService khong phai tu bia 1 chuoi rieng, tranh
-        // go nham/lech chinh ta giua 2 noi goi.
         const val SOURCE_LOCAL_MIC = "local_mic"
 
-        // ✅ MOI (fix hard-clip - xem giai thich day du o KDoc dau class):
-        // nguong bat dau nen mem, tinh tuyet doi tren thang Short (0..32767).
-        // ~28000 tuong duong -1.4dBFS (20*log10(28000/32767) ~= -1.37dB) -
-        // dat mot chut duoi Short.MAX_VALUE de con "khoang dem" cho soft-knee
-        // lam viec (neu dat sat 32767 qua, phan nen se qua gap/gan nhu van
-        // la hard-clip). Dung tinh than voi Limiter.kt (thresholdRatio mac
-        // dinh 0.85f = ~27852) va OutputRouter (khong doi gi o day, chi de
-        // nhat quan y tuong "de lai margin an toan").
+        // ✅ MOI (fix hard-clip): nguong bat dau nen mem, tinh tuyet doi tren
+        // thang Short (0..32767). Xem giai thich day du trong softKnee().
         private const val SOFT_KNEE_THRESHOLD_ABS = 28000f
         private const val SOFT_KNEE_CEILING_ABS = 32767f
 
-        /**
-         * ✅ MOI: nen mem 1 sample (dang Float, CHUA chuyen ve Short) - gia
-         * tri trong khoang [-SOFT_KNEE_THRESHOLD_ABS, +SOFT_KNEE_THRESHOLD_ABS]
-         * duoc GIU NGUYEN 100% (khong dung toi limiter/nen gi ca - khac voi
-         * cach dung tanh() tren TOAN BO tin hieu, se lam "min" ca doan nho
-         * khong can thiet). Chi PHAN VUOT nguong (|x| > threshold) moi bi
-         * nen dan theo tanh() sao cho tien dan ve SOFT_KNEE_CEILING_ABS thay
-         * vi bi CAT THANG - giup dinh song van "tron", khong bi vuong goc
-         * cung nhu coerceIn() truoc day.
-         *
-         * Ham nay KHONG co trang thai (memoryless) - khac voi Limiter.kt (co
-         * attack/release qua thoi gian) - dung o day chi de xu ly TUC THOI
-         * ngay tai buoc cong don, con finalLimiter (Limiter.kt, co trang
-         * thai) van chay SAU o start() nhu cu de xu ly muot hon qua nhieu
-         * sample/buffer lien tiep.
-         */
-        private fun softKnee(x: Float): Float {
-            val absX = kotlin.math.abs(x)
-            if (absX <= SOFT_KNEE_THRESHOLD_ABS) return x
-            val over = absX - SOFT_KNEE_THRESHOLD_ABS
-            val range = SOFT_KNEE_CEILING_ABS - SOFT_KNEE_THRESHOLD_ABS
-            val compressed = SOFT_KNEE_THRESHOLD_ABS + range * kotlin.math.tanh(over / range)
-            return if (x < 0f) -compressed else compressed
-        }
+        // ✅ MOI (chan doan tieng "ret/giat" - CPU hay khong): neu 1 vong
+        // lap mixer (ly thuyet moi ~CHUNK_MS=40ms/lan) thuc te mat LAU HON
+        // nguong nay de hoan tat 1 chu ky, nghia la thread mixer (du da
+        // THREAD_PRIORITY_URGENT_AUDIO) van bi he thong/CPU tre lai - day la
+        // BANG CHUNG TRUC TIEP cua tranh chap CPU (vd YouTube dang decode
+        // video nang), khac voi hien tuong "buffer overflow" (ben san xuat
+        // nhanh hon tieu thu). 80ms = gap doi CHUNK_MS, du bat thuong de
+        // dang tin, du "long tay" de khong bao dong gia do jitter nho binh
+        // thuong cua scheduler.
+        private const val MIXER_LOOP_DELAY_WARN_THRESHOLD_MS = 80L
 
-        /**
-         * ✅ SUA (fix hard-clip, xem KDoc dau class de biet day du boi canh):
-         * khong con dung coerceIn() CUNG ngay sau khi cong don vocal, cung
-         * khong con coerceIn() CUNG ngay sau khi cong voi music - CA HAI gia
-         * tri trung gian nay gio duoc GIU NGUYEN dang Float (co the vuot
-         * +-32767 tam thoi, hoan toan binh thuong va co chu dich), CHI nen
-         * mem 1 LAN DUY NHAT (qua softKnee()) ngay truoc khi chuyen ve Short
-         * o cuoi ham - dam bao waveform khong bi "cat cut" som truoc khi co
-         * co hoi qua buoc nen mem.
-         *
-         * coerceIn() cuoi cung (sau softKnee()) la BAT BUOC PHAI CO, KHONG
-         * duoc bo qua: day KHONG phai buoc "lam viec" chinh (softKnee() da
-         * dam bao gia tri gan nhu luon nam trong [-32767, 32767] roi), ma la
-         * luoi an toan chan wraparound so hoc thuan tuy khi ep kieu Float ->
-         * Short trong Kotlin/JVM (toShort() KHONG tu dong saturate/clamp -
-         * mot gia tri nhu 40000f.toInt().toShort() se cho ra 1 con so AM/rac
-         * do tran bit, KHONG phai 32767 nhu nhieu nguoi lam tuong).
-         */
-        private fun mixMultiSource(
-            music: ShortArray, musicLen: Int, musicVolume: Float,
-            vocalChunks: List<ShortArray>, vocalLens: List<Int>,
-            masterVolume: Float,
-            outLength: Int
-        ): ShortArray {
-            val out = ShortArray(outLength)
-            for (i in 0 until outLength) {
-                val m = if (i < musicLen) music[i] * musicVolume else 0f
+        // ✅ SUA (fix mat gia tri khi Mixer Test bi tat/bat lai tu dong - xem
+        // giai thich day du o KDoc dau class): chuyen tu INSTANCE property
+        // sang COMPANION (static) property - "song" doc lap voi tung
+        // instance LowLatencyMixer, giong dung tinh than vocalChannels o
+        // PlaybackCaptureService. 2 gia tri nay gio la CUA CHUNG TOAN APP
+        // (chi co 1 Mixer Test chay tai 1 thoi diem), khong phai cua rieng
+        // 1 instance. QUAN TRONG: phai khai bao THUC SU BEN TRONG companion
+        // object nay (khong phai ngay sau dau "}" dong companion) thi
+        // @JvmStatic moi hop le va gia tri moi thuc su la static.
+        @JvmStatic
+        @Volatile
+        var musicVolume: Float = 0.4f
+            set(value) { field = value.coerceIn(0f, 2f) }
 
-                var vocalSum = 0f
-                for (srcIdx in vocalChunks.indices) {
-                    val len = vocalLens[srcIdx]
-                    if (i < len) {
-                        vocalSum += vocalChunks[srcIdx][i].toFloat()
-                    }
-                }
-                // ✅ SUA: KHONG con coerceIn() cung o day nua - de vocalSum (co
-                // the tam thoi vuot bien do neu 2-3 nguon cung to) di tiep
-                // xuong buoc softKnee() ben duoi cung voi music, thay vi bi
-                // CAT VUONG rieng le som (mat thong tin waveform truoc ca khi
-                // biet tong the co thuc su vuot nguong hay khong).
-
-                var sum = (m + vocalSum) * masterVolume
-                // ✅ SUA: thay coerceIn() cung bang softKnee() - xem giai
-                // thich day du o KDoc ham softKnee() va dau class.
-                sum = softKnee(sum)
-                // Luoi an toan CUOI CUNG (chan wraparound Float->Short thuan
-                // so hoc) - BAT BUOC giu lai, xem giai thich o KDoc ham nay.
-                sum = sum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
-                out[i] = sum.toInt().toShort()
-            }
-            return out
-        }
+        @JvmStatic
+        @Volatile
+        var masterVolume: Float = 1.0f
+            set(value) { field = value.coerceIn(0f, 2f) }
     }
 
-    // ✅ MOI (Phase 6 - "ban mixer" dieu chinh duoc): he so am luong rieng
-    // cho nhac nen va cho TOAN BO ban mix cuoi (master) - nguoi dung dieu
-    // chinh qua UI (vd 2 thanh truot "Nhac" va "Tong"), doc lap voi volume
-    // rieng cua tung nguon vocal (xem VocalChannel.volume).
-    @Volatile
-    var musicVolume: Float = 0.4f
-        set(value) { field = value.coerceIn(0f, 2f) }
+    /**
+     * ✅ MOI: nen mem 1 sample (dang Float, CHUA chuyen ve Short) - gia
+     * tri trong khoang [-SOFT_KNEE_THRESHOLD_ABS, +SOFT_KNEE_THRESHOLD_ABS]
+     * duoc GIU NGUYEN 100%. Chi PHAN VUOT nguong moi bi nen dan theo tanh()
+     * sao cho tien dan ve SOFT_KNEE_CEILING_ABS thay vi bi CAT THANG.
+     */
+    private fun softKnee(x: Float): Float {
+        val absX = kotlin.math.abs(x)
+        if (absX <= SOFT_KNEE_THRESHOLD_ABS) return x
+        val over = absX - SOFT_KNEE_THRESHOLD_ABS
+        val range = SOFT_KNEE_CEILING_ABS - SOFT_KNEE_THRESHOLD_ABS
+        val compressed = SOFT_KNEE_THRESHOLD_ABS + range * kotlin.math.tanh(over / range)
+        return if (x < 0f) -compressed else compressed
+    }
 
-    @Volatile
-    var masterVolume: Float = 1.0f
-        set(value) { field = value.coerceIn(0f, 2f) }
+    /**
+     * ✅ SUA (fix hard-clip): khong con coerceIn() cung ngay sau khi cong
+     * don vocal, cung khong con coerceIn() cung ngay sau khi cong voi
+     * music - CA HAI gia tri trung gian duoc giu Float, CHI nen mem 1 LAN
+     * DUY NHAT (qua softKnee()) ngay truoc khi chuyen ve Short.
+     */
+    private fun mixMultiSource(
+        music: ShortArray, musicLen: Int, musicVolumeSnapshot: Float,
+        vocalChunks: List<ShortArray>, vocalLens: List<Int>,
+        masterVolumeSnapshot: Float,
+        outLength: Int
+    ): ShortArray {
+        val out = ShortArray(outLength)
+        for (i in 0 until outLength) {
+            val m = if (i < musicLen) music[i] * musicVolumeSnapshot else 0f
+
+            var vocalSum = 0f
+            for (srcIdx in vocalChunks.indices) {
+                val len = vocalLens[srcIdx]
+                if (i < len) {
+                    vocalSum += vocalChunks[srcIdx][i].toFloat()
+                }
+            }
+
+            var sum = (m + vocalSum) * masterVolumeSnapshot
+            sum = softKnee(sum)
+            // Luoi an toan CUOI CUNG (chan wraparound Float->Short thuan so
+            // hoc) - BAT BUOC giu lai, xem giai thich o KDoc softKnee().
+            sum = sum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
+            out[i] = sum.toInt().toShort()
+        }
+        return out
+    }
 
     private val musicBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
-
-    // ✅ SUA (fix goc "tieng ret/giat khi 2+ may cung hat"): truoc day CHI 1
-    // vocalBuffer DUY NHAT dung chung cho moi nguon. Gio moi nguon co 1
-    // ShortRingBuffer RIENG, dinh danh boi sourceId. ConcurrentHashMap vi
-    // nguon co the duoc them/bo BAT KY LUC NAO tu thread khac (WebRTC
-    // DataChannel callback add/remove client) trong khi mixer loop dang doc
-    // o thread rieng cua no (mixerDispatcher).
     private val vocalBuffers = ConcurrentHashMap<String, ShortRingBuffer>()
-
-    // Scratch buffer TAI SU DUNG cho tung nguon (tranh cap phat ShortArray
-    // moi moi vong lap ~40ms/lan) - chi tao MOI khi gap sourceId lan dau,
-    // don khi nguon bi go (removeVocalSource()).
     private val vocalScratchBuffers = ConcurrentHashMap<String, ShortArray>()
 
     private var mixerJob: Job? = null
 
-    // ✅ Vong lap mixer (drain nhieu ring buffer + ghi ra OutputRouter moi
-    // ~40ms) la duong real-time, can thread rieng uu tien
-    // THREAD_PRIORITY_URGENT_AUDIO thay vi Dispatchers.Default dung chung,
-    // de khong bi tre khi app khac (YouTube) dang chiem CPU o foreground.
     private val mixerDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
         object : Thread(runnable, "LowLatencyMixerLoop") {
             override fun run() {
@@ -305,13 +276,6 @@ class LowLatencyMixer(
         musicBuffer.push(buffer, size)
     }
 
-    /**
-     * ✅ SUA: gio BAT BUOC truyen sourceId - dung SOURCE_LOCAL_MIC cho mic
-     * vat ly cua chinh May A, hoac clientId cua tung May B/C (Phase 5) cho
-     * mic khong day. Nguon MOI (sourceId chua tung thay) se tu dong duoc
-     * tao ring buffer rieng qua getOrCreateVocalBuffer() - khong can dang
-     * ky truoc, chi can goi pushVocal() lan dau la du.
-     */
     fun pushVocal(sourceId: String, buffer: ShortArray, size: Int) {
         getOrCreateVocalBuffer(sourceId).push(buffer, size)
     }
@@ -324,12 +288,6 @@ class LowLatencyMixer(
         return vocalScratchBuffers.getOrPut(sourceId) { ShortArray(CHUNK_SIZE) }
     }
 
-    /**
-     * ✅ MOI: go 1 nguon vocal khoi mixer - goi khi May B/C ngat ket noi
-     * (SignalingServer.Listener.onMicDisconnected, xem MainActivity.kt) hoac
-     * khi mic tai cho bi khoa hoan toan. An toan goi voi sourceId khong ton
-     * tai (ConcurrentHashMap.remove tra null, khong crash).
-     */
     fun removeVocalSource(sourceId: String) {
         vocalBuffers.remove(sourceId)
         vocalScratchBuffers.remove(sourceId)
@@ -347,32 +305,52 @@ class LowLatencyMixer(
         vocalScratchBuffers.clear()
 
         mixerJob = scope.launch {
-            logBoth("✅ Bat dau mixer loop (nhieu nguon vocal cong dong, soft-knee limiter), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms), tran buffer=~${RING_BUFFER_CAPACITY}sample/nguon")
+            logBoth(
+                "✅ Bat dau mixer loop (soft-knee limiter, musicVolume/masterVolume " +
+                    "GIU NGUYEN qua cac lan bat/tat), chunk=$CHUNK_SIZE sample (~${CHUNK_MS}ms), " +
+                    "tran buffer=~${RING_BUFFER_CAPACITY}sample/nguon"
+            )
             val musicChunk = ShortArray(CHUNK_SIZE)
 
             var lastQueueLogTime = System.currentTimeMillis()
             var wasMusicSilentAtMixer = false
 
+            // ✅ MOI (chan doan CPU vs buffer overflow - xem giai thich day
+            // du o KDoc hang so MIXER_LOOP_DELAY_WARN_THRESHOLD_MS): moc
+            // thoi gian BAT DAU cua chu ky truoc, dung de tinh khoang cach
+            // THUC TE giua 2 lan ghi ra OutputRouter lien tiep.
+            var lastIterationStartNanoTime = System.nanoTime()
+            var maxIterationGapMsInWindow = 0L
+            var delayedIterationCountInWindow = 0
+
             while (running) {
                 var waitedMs = 0L
 
-                // ✅ SUA (ho tro nhieu nguon vocal dong thoi): CHI cho theo
-                // musicBuffer (nguon LUON on dinh, tu MusicInput chay lien
-                // tuc) - KHONG con cho theo 1 vocalBuffer DUY NHAT nhu ban
-                // truoc. Ly do: gio co THE co nhieu nguon vocal cung luc
-                // (mic tai cho + May B + May C), moi nguon push doc lap voi
-                // toc do rieng. Neu van cho TAT CA nguon vocal deu du 1
-                // chunk moi chay tiep, 1 nguon bi cham/dut mang tam thoi (vi
-                // du May C mat song WiFi 1 nhip) se lam TREO CA mixer, cat
-                // oan tieng luon ca May B dang hat binh thuong - khong chap
-                // nhan duoc cho kich ban song ca. Nguon vocal thieu du lieu
-                // se duoc drain() tra ve it hon CHUNK_SIZE va tu dong duoc
-                // coi la "0" (zero-fill) trong mixMultiSource().
                 while (running && musicBuffer.size() < CHUNK_SIZE && waitedMs < MAX_WAIT_MS) {
                     delay(POLL_INTERVAL_MS)
                     waitedMs += POLL_INTERVAL_MS
                 }
                 if (!running) break
+
+                // ✅ MOI: do khoang cach THUC TE ke tu lan bat dau chu ky
+                // truoc - neu con so nay vuot han CHUNK_MS (~40ms) MA
+                // KHONG PHAI do waitedMs (cho musicBuffer du du lieu, da
+                // tru rieng), nghia la ban than mixer THREAD bi he thong
+                // tre lai (CPU scheduling) - khac voi truong hop buffer
+                // overflow (ben san xuat nhanh hon, xem overflowCount).
+                val now = System.nanoTime()
+                val iterationGapMs = (now - lastIterationStartNanoTime) / 1_000_000L
+                lastIterationStartNanoTime = now
+                val gapExcludingWait = iterationGapMs - waitedMs
+                if (gapExcludingWait >= MIXER_LOOP_DELAY_WARN_THRESHOLD_MS) {
+                    delayedIterationCountInWindow++
+                    logBoth(
+                        "⚠️ [CpuJitterProbe] Chu ky mixer bi TRE ${gapExcludingWait}ms so voi ky vong " +
+                            "(~${CHUNK_MS}ms, DA TRU thoi gian cho musicBuffer=${waitedMs}ms) - " +
+                            "nghi van CPU/scheduler dang gianh thread mixer (vd YouTube dang decode nang)."
+                    )
+                }
+                if (gapExcludingWait > maxIterationGapMsInWindow) maxIterationGapMsInWindow = gapExcludingWait
 
                 val musicLen = musicBuffer.drain(musicChunk, CHUNK_SIZE)
 
@@ -395,10 +373,6 @@ class LowLatencyMixer(
                 }
                 wasMusicSilentAtMixer = musicSilentNow
 
-                // ✅ MOI: chup lai (snapshot) danh sach sourceId HIEN TAI -
-                // co the doi giua cac vong lap do May B/C connect/disconnect
-                // song song voi vong lap mixer nay. Drain TUNG nguon vao
-                // scratch RIENG cua no truoc khi cong dong trong mixMultiSource().
                 val sourceIds = vocalBuffers.keys.toList()
                 val vocalChunks = ArrayList<ShortArray>(sourceIds.size)
                 val vocalLens = ArrayList<Int>(sourceIds.size)
@@ -410,29 +384,46 @@ class LowLatencyMixer(
                     vocalLens.add(len)
                 }
 
+                // Chup gia tri volume tai THOI DIEM mix (co the doi giua
+                // chung do nguoi dung keo slider) - dung 1 gia tri nhat
+                // quan cho toan bo chunk nay, tranh doc lai companion field
+                // nhieu lan trong 1 vong for ben trong mixMultiSource().
+                val musicVolumeSnapshot = musicVolume
+                val masterVolumeSnapshot = masterVolume
+
                 val mixed = mixMultiSource(
-                    musicChunk, musicLen, musicVolume,
+                    musicChunk, musicLen, musicVolumeSnapshot,
                     vocalChunks, vocalLens,
-                    masterVolume,
+                    masterVolumeSnapshot,
                     CHUNK_SIZE
                 )
-                // Chan clipping tren tin hieu DA MIX (nhac + TAT CA vocal da
-                // cong dong) - vi tri cuoi chuoi, dung y PLAN.md goc. Van giu
-                // nguyen sau khi them softKnee() ben trong mixMultiSource() -
-                // xem giai thich vai tro bo tro cua 2 lop nay o KDoc truong
-                // finalLimiter phia tren.
                 finalLimiter?.process(mixed, CHUNK_SIZE)
                 outputRouter.write(mixed, CHUNK_SIZE)
 
-                val now = System.currentTimeMillis()
-                if (now - lastQueueLogTime >= QUEUE_LOG_INTERVAL_MS) {
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastQueueLogTime >= QUEUE_LOG_INTERVAL_MS) {
                     val musicMs = musicBuffer.size() * 1000L / SAMPLE_RATE
                     val vocalSummary = sourceIds.joinToString(", ") { id ->
                         val ms = (vocalBuffers[id]?.size() ?: 0) * 1000L / SAMPLE_RATE
                         "$id=${ms}ms"
                     }
-                    logBoth("queue M=${musicMs}ms | Vocal[$vocalSummary] (waited=${waitedMs}ms lan cuoi)")
-                    lastQueueLogTime = now
+                    // ✅ MOI: gop them so lieu chan doan CPU/overflow vao
+                    // dung 1 dong log dinh ky co san (khong them dong log
+                    // rieng, tranh spam/tran CaptureLogBus.MAX_LINES).
+                    val musicOverflow = musicBuffer.drainOverflowCount()
+                    val vocalOverflowSummary = sourceIds.joinToString(", ") { id ->
+                        val dropped = vocalBuffers[id]?.drainOverflowCount() ?: 0L
+                        "$id=$dropped"
+                    }
+                    logBoth(
+                        "queue M=${musicMs}ms | Vocal[$vocalSummary] (waited=${waitedMs}ms lan cuoi) " +
+                            "| [ChanDoan] maxLoopGap=${maxIterationGapMsInWindow}ms " +
+                            "soLanTre(>=${MIXER_LOOP_DELAY_WARN_THRESHOLD_MS}ms)=$delayedIterationCountInWindow " +
+                            "| overflowDrop: music=$musicOverflow vocal[$vocalOverflowSummary]"
+                    )
+                    lastQueueLogTime = nowMs
+                    maxIterationGapMsInWindow = 0L
+                    delayedIterationCountInWindow = 0
                 }
             }
             logBoth("Mixer loop da dung.")
@@ -446,8 +437,6 @@ class LowLatencyMixer(
         musicBuffer.clear()
         vocalBuffers.clear()
         vocalScratchBuffers.clear()
-        // ✅ mixerJob dang o trong delay() (cancellable) nen cancel() se ngat
-        // vong lap gan nhu ngay lap tuc, an toan de dong dispatcher tiep theo.
         mixerDispatcher.close()
         logBoth("🛑 Da dung mixer")
     }

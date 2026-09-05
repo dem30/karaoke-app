@@ -319,21 +319,29 @@ class PlaybackCaptureService : Service() {
 
         fun isChannelEchoEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).echoEnabled
 
-        /** He so am luong cho rieng nhac nen (0f..2f). */
+        /**
+         * He so am luong cho rieng nhac nen (0f..2f).
+         * ✅ SUA: goi thang vao LowLatencyMixer.musicVolume (companion/static),
+         * KHONG con qua activeMixerInstance?.musicVolume - vi cach cu chi co
+         * tac dung khi mixer DANG chay (activeMixerInstance != null), set luc
+         * mixer dang tat se bi am tham bo qua. Truy cap thang companion luon
+         * co tac dung bat ke mixer bat/tat, va gia tri se duoc ap dung ngay
+         * khi mixer khoi dong lai (doc lai o dong 388-389 cua LowLatencyMixer).
+         */
         fun setMusicVolume(volume: Float) {
-            activeMixerInstance?.musicVolume = volume
+            LowLatencyMixer.musicVolume = volume
         }
 
-        /** ✅ MOI: doc lai volume nhac nen HIEN TAI - tra ve 1.0f (mac dinh) neu Mixer Test chua bat (activeMixerInstance null), an toan cho UI doc truoc khi Mixer song. */
-        fun getMusicVolume(): Float = activeMixerInstance?.musicVolume ?: 1.0f
+        /** ✅ MOI: doc lai volume nhac nen HIEN TAI truc tiep tu companion - luon dung du Mixer Test dang bat hay tat. */
+        fun getMusicVolume(): Float = LowLatencyMixer.musicVolume
 
         /** He so am luong cho TOAN BO ban mix cuoi (nhac + tat ca vocal da cong), 0f..2f. */
         fun setMasterVolume(volume: Float) {
-            activeMixerInstance?.masterVolume = volume
+            LowLatencyMixer.masterVolume = volume
         }
 
-        /** ✅ MOI: doc lai volume tong the (master) HIEN TAI - tra ve 1.0f neu Mixer Test chua bat. */
-        fun getMasterVolume(): Float = activeMixerInstance?.masterVolume ?: 1.0f
+        /** ✅ MOI: doc lai volume tong the (master) HIEN TAI truc tiep tu companion - luon dung du Mixer Test dang bat hay tat. */
+        fun getMasterVolume(): Float = LowLatencyMixer.masterVolume
         // ================= Het API dieu chinh tu UI =================
 
         // ✅ MOI (CHAN DOAN TAM THOI - do nhip nhan PCM thuc te tu May B/C
