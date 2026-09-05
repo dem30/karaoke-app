@@ -338,6 +338,25 @@ class PlaybackCaptureService : Service() {
         fun isChannelReverbEnabled(sourceId: String): Boolean =
             getOrCreateVocalChannel(sourceId).reverbEnabled
 
+        // ✅ MOI: Pitch Correction ("auto-tune nhe" - xem canh bao ve do tre/
+        // octave-error trong PitchCorrector.kt). MAC DINH TAT, dung field
+        // `enabled` co san cua PitchCorrector (khong them bien rieng trong
+        // VocalChannel de tranh 2 nguon su that).
+        fun setChannelPitchCorrectorEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).pitchCorrector.enabled = enabled
+        }
+
+        fun isChannelPitchCorrectorEnabled(sourceId: String): Boolean =
+            getOrCreateVocalChannel(sourceId).pitchCorrector.enabled
+
+        /** Muc do "ep" ve dung tone: 0f = giu nguyen giong that, 1f = ep het muc. */
+        fun setChannelPitchCorrectorStrength(sourceId: String, strength: Float) {
+            getOrCreateVocalChannel(sourceId).pitchCorrector.correctionStrength = strength
+        }
+
+        fun getChannelPitchCorrectorStrength(sourceId: String): Float =
+            getOrCreateVocalChannel(sourceId).pitchCorrector.correctionStrength
+
         /**
          * He so am luong cho rieng nhac nen (0f..2f).
          * ✅ SUA: goi thang vao LowLatencyMixer.musicVolume (companion/static),

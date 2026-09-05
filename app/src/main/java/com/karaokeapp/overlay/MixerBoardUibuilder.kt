@@ -199,6 +199,35 @@ object MixerBoardUiBuilder {
                 })
             }
             addView(toggleRow3)
+
+            // ✅ MOI: Pitch Correction ("auto-tune nhe") - MAC DINH TAT (xem
+            // canh bao ve do tre/octave-error trong PitchCorrector.kt). Rieng
+            // 1 checkbox + 1 slider "muc do ep" (0-100%, chi co tac dung khi
+            // checkbox tren dang bat).
+            val toggleRow4 = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(CheckBox(context).apply {
+                    text = "Pitch Correction (auto-tune)"
+                    isChecked = PlaybackCaptureService.isChannelPitchCorrectorEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked ->
+                        PlaybackCaptureService.setChannelPitchCorrectorEnabled(sourceId, checked)
+                    }
+                })
+            }
+            addView(toggleRow4)
+
+            addVolumeSeekBar(
+                context,
+                this,
+                "Muc do ep tone",
+                PlaybackCaptureService.getChannelPitchCorrectorStrength(sourceId)
+            ) { v ->
+                // addVolumeSeekBar cho pham vi 0f..2f; correctionStrength chi
+                // hop le trong 0f..1f nen ep lai truoc khi ghi (setter cua
+                // PitchCorrector.correctionStrength cung tu coerceIn 0..1,
+                // day chi la lop an toan them o phia UI).
+                PlaybackCaptureService.setChannelPitchCorrectorStrength(sourceId, v.coerceIn(0f, 1f))
+            }
         }
     }
 }

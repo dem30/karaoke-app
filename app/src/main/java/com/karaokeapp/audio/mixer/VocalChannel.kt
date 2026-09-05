@@ -69,6 +69,16 @@ class VocalChannel(
     val label: String = "channel"
 ) {
 
+    /**
+     * ✅ MOI: "Auto-tune nhe" (xem PitchCorrector.kt) - CHAY DAU TIEN trong
+     * toan bo chuoi, TRUOC ca AutoGain, vi module nay can tin hieu giong hat
+     * cang THO cang tot de do cao do chinh xac (EQ/Compressor lam sau se
+     * khong lam lech pho tan dung luc do pitch). MAC DINH TAT (enabled=false
+     * trong chinh PitchCorrector) - nguoi dung tu bat qua
+     * pitchCorrectorEnabled / setChannelPitchCorrectorEnabled().
+     */
+    val pitchCorrector = PitchCorrector(sampleRate = sampleRate)
+
     // ✅ Tham so mac dinh giong het bo tham so truoc day CHI ap dung cho mic
     // vat ly cua May A - gio la mac dinh CHUNG cho MOI nguon (local + remote)
     // nguoi dung co the dieu chinh tiep tu day qua setEQGains()/v.v.
@@ -138,6 +148,12 @@ class VocalChannel(
             return
         }
 
+        // ✅ MOI: Pitch Correction chay DAU TIEN, truoc AutoGain - xem KDoc
+        // pitchCorrector o tren ve ly do thu tu nay. Cong tac bat/tat dung
+        // truc tiep field `enabled` co san cua PitchCorrector (khong them
+        // bien rieng o day de tranh 2 "nguon su that" bi lech nhau).
+        pitchCorrector.process(buffer, size)
+
         if (autoGainEnabled) autoGain.process(buffer, size)
         if (feedbackSuppressorEnabled) feedbackSuppressor.process(buffer, size)
         if (eqEnabled) eq.process(buffer, size)
@@ -166,6 +182,7 @@ class VocalChannel(
 
     /** Reset TOAN BO state DSP (filter/compressor/echo/auto-gain/limiter) - KHONG doi volume/EQ/cong tac nguoi dung da chinh (giu nguyen y muon nguoi dung qua cac lan Bat/Tat Mixer Test). Goi khi bat dau lai 1 session de tranh tan du (click/pop) tu session truoc. */
     fun reset() {
+        pitchCorrector.reset()
         autoGain.reset()
         feedbackSuppressor.reset()
         eq.reset()
