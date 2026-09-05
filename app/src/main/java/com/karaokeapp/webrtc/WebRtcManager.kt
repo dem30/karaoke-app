@@ -70,6 +70,11 @@ class WebRtcManager(private val context: Context) {
     }
 
     private var factory: PeerConnectionFactory? = null
+
+    // ✅ FIX ("dễ rớt và không kết nối lại được" sau vài lần reconnect): giữ
+    // tham chiếu ADM để closeAll() có thể release() nó - trước đây ADM được
+    // tạo local trong initializeFactory() rồi bỏ luôn, không ai giữ để dọn.
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
     // May A luu danh sach PeerConnection cua cac Mic con: clientId -> PeerConnection
     private val peerConnections = ConcurrentHashMap<String, PeerConnection>()
     // May B luu DataChannel gui audio ve A
@@ -128,6 +133,7 @@ class WebRtcManager(private val context: Context) {
             .setUseHardwareAcousticEchoCanceler(false)
             .setUseHardwareNoiseSuppressor(false)
             .createAudioDeviceModule()
+        this.audioDeviceModule = audioDeviceModule
 
         factory = PeerConnectionFactory.builder()
             .setOptions(PeerConnectionFactory.Options())
@@ -378,6 +384,30 @@ class WebRtcManager(private val context: Context) {
         }
         peerConnections.clear()
         pcmScratchBuffers.clear()
+
+        // ✅ FIX (xem giai thich o khai bao truong `factory`/`audioDeviceModule`
+        // phia tren): TRUOC DAY closeAll() chi don PeerConnection/DataChannel,
+        // KHONG BAO GIO giai phong chinh PeerConnectionFactory hay ADM da tao
+        // trong initializeFactory() - moi lan connectToRoomAsMic() tao 1
+        // WebRtcManager MOI (xem MainActivity), nghia la moi lan "Ket noi lai"
+        // hoac quet QR lai la 1 factory+ADM native MOI bi "mo cong" trong khi
+        // ban CU khong bao gio duoc dong - tich luy dan qua nhieu lan roi/ket
+        // noi lai, cuoi cung gay ket noi that bai/khong on dinh. dispose()
+        // factory TRUOC, roi release() ADM SAU (dung thu tu WebRTC yeu cau -
+        // factory co the con giu tham chieu toi ADM ben trong).
+        try {
+            factory?.dispose()
+        } catch (e: Exception) {
+            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi dispose PeerConnectionFactory: ${e.message}")
+        }
+        factory = null
+
+        try {
+            audioDeviceModule?.release()
+        } catch (e: Exception) {
+            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi release AudioDeviceModule: ${e.message}")
+        }
+        audioDeviceModule = null
     }
 }
 

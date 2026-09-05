@@ -13,6 +13,8 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.method.ScrollingMovementMethod
 import android.widget.Button
@@ -113,6 +115,32 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        // ✅ FIX ("May B mat ket noi + phai quet QR lai moi lan xoay man
+        // hinh"): 5 field ben duoi TRUOC DAY la field THUONG cua instance
+        // MainActivity - xoay man hinh lam OS huy Activity CU va tao 1
+        // instance MOI (config change), ma onDestroy() cua instance CU truoc
+        // day luon dong signalingClient/webRtcManager/wirelessMicInput +
+        // instance MOI khong he co lastJoinedQrData de tu ket noi lai ->
+        // bat buoc quet QR tu dau. Chuyen ca 5 field nay len companion
+        // (dung tinh than "song qua vong doi Activity" da ap dung cho vai
+        // tro Host qua activeRoomQrData trong PlaybackCaptureService) de
+        // instance MOI sau khi xoay man hinh nhin thay DUNG phien ket noi cu
+        // dang con song, khong can lam gi them.
+        @Volatile
+        private var signalingClient: SignalingClient? = null
+
+        @Volatile
+        private var webRtcManager: WebRtcManager? = null
+
+        @Volatile
+        private var wirelessMicInput: MicInput? = null
+
+        @Volatile
+        private var micSessionGeneration = 0
+
+        @Volatile
+        private var lastJoinedQrData: QrJoinData? = null
     }
 
     private lateinit var statusText: TextView
@@ -152,30 +180,11 @@ class MainActivity : AppCompatActivity() {
     private var boostedLegacyStream: Int? = null
 
     // ✅ SUA (Phase 5 - xem giai thich chi tiet o dau file): hostSignalingServer/
-    // hostWebRtcManager DA CHUYEN vao PlaybackCaptureService - Activity nay
-    // KHONG con giu 2 field do nua. wirelessMicInput (vai tro Mic B) VAN o
-    // lai day - day la mic VAT LY cua chinh may dang cam, gan chat voi vong
-    // doi cua thao tac "dang cam mic quet QR", khac ban chat voi vai tro
-    // Host (Mixer) can song ben bi OS don dep Activity.
-    private var signalingClient: SignalingClient? = null
-    private var webRtcManager: WebRtcManager? = null
-    private var wirelessMicInput: MicInput? = null
-
-    // ✅ MOI (fix "bam Ket noi lai hoai khong duoc"): moi lan connectToRoomAsMic()
-    // duoc goi (quet QR moi hoac bam nut Ket noi lai) se tang bien nay len 1 -
-    // dinh danh "phien ket noi" HIEN TAI. Cac callback bat dong bo cua
-    // SignalingClient/WebRtcManager (onDisconnected, onJoinedSuccess,
-    // onAnswerReceived, onIceReceived...) deu duoc tao ra ben trong 1 lan goi
-    // connectToRoomAsMic() cu the, va se "chup" (capture) lai gia tri
-    // micSessionGeneration TAI THOI DIEM DO vao 1 val rieng - neu sau nay
-    // callback ay chay TRE (vi du sau khi nguoi dung da bam Ket noi lai them
-    // 1 lan nua), no se so sanh voi gia tri MOI NHAT truoc khi dong/ghi de cac
-    // field dung chung (signalingClient/webRtcManager/wirelessMicInput) - neu
-    // khong con khop, coi nhu callback "ma" cua phien da bi thay the va BO
-    // QUA, tranh tinh trang phien MOI vua thiet lap xong bi callback CU tu
-    // dong "dong nham".
-    @Volatile
-    private var micSessionGeneration = 0
+    // hostWebRtcManager DA CHUYEN vao PlaybackCaptureService. wirelessMicInput/
+    // signalingClient/webRtcManager/micSessionGeneration (vai tro Mic B) GIO
+    // CUNG da chuyen len companion object o dau file (xem comment FIX o do) -
+    // vi ly do tuong tu: can song qua viec Activity bi huy/tao lai do xoay
+    // man hinh, khong chi rieng vai tro Host moi can dieu nay.
 
     /**
      * ✅ MOI (fix "ket noi lai sinh them 1 Mic moi trong mixer"): truoc day
@@ -208,8 +217,8 @@ class MainActivity : AppCompatActivity() {
     // token) - cho phep bam 1 nut de ket noi lai voi CUNG 1 phong, thay vi
     // bat buoc phai mo lai dialog QR tren May A moi lan May B bi rot mang/
     // mat ket noi. Chi mat tac dung neu May A DA DONG phong va mo phong MOI
-    // (token/port co the doi) - luc do van can quet QR moi that.
-    private var lastJoinedQrData: QrJoinData? = null
+    // (token/port co the doi) - luc do van can quet QR moi that. (Bien nay
+    // gio nam o companion object o dau file - xem comment FIX xoay man hinh.)
 
     private val qrScanLauncher = registerForActivityResult(
         com.journeyapps.barcodescanner.ScanContract()
@@ -1106,16 +1115,31 @@ class MainActivity : AppCompatActivity() {
         // signalingServer?.stopServer()/webRtcManager?.closeAll() o day nua
         // - 2 object do (vai tro Host/Mixer) da chuyen han vao
         // PlaybackCaptureService va se TU SONG qua moi lan MainActivity bi
-        // huy/tao lai. Chi con don dep phan Mic khong day (wirelessMicInput/
-        // signalingClient/webRtcManager cua vai tro Mic B/C) - day la vai
-        // tro gan chat voi chinh thao tac dang cam mic cua NGUOI DUNG hien
-        // tai, hop ly de dung khi Activity bi huy.
-        wirelessMicInput?.stopCapture()
-        wirelessMicInput = null
-        signalingClient?.close()
-        signalingClient = null
-        webRtcManager?.closeAll()
-        webRtcManager = null
+        // huy/tao lai.
+        //
+        // ✅ FIX MOI ("xoay man hinh lam May B mat ket noi/phai quet QR
+        // lai"): phan Mic khong day (wirelessMicInput/signalingClient/
+        // webRtcManager, gio da chuyen len companion) TRUOC DAY bi dong O
+        // DAY MOI LAN onDestroy() chay - nhung onDestroy() cung chay khi
+        // Activity chi bi huy TAM THOI do doi cau hinh (xoay man hinh), roi
+        // Android tu tao lai ngay 1 instance MOI. isChangingConfigurations()
+        // phan biet duoc 2 truong hop: TRUE = chi xoay man hinh (giu ket
+        // noi, instance moi se tu thay lai qua companion), FALSE = Activity
+        // that su bi dong (nguoi dung roi app/bam Back, OS thu hoi tien
+        // trinh...) - luc do moi thuc su dong ket noi Mic khong day.
+        if (!isChangingConfigurations()) {
+            wirelessMicInput?.stopCapture()
+            wirelessMicInput = null
+            signalingClient?.close()
+            signalingClient = null
+            webRtcManager?.closeAll()
+            webRtcManager = null
+        } else {
+            CaptureLogBus.log(
+                "[Activity] Xoay man hinh (doi cau hinh) - GIU NGUYEN ket noi Mic khong day, " +
+                    "khong dong signalingClient/webRtcManager/wirelessMicInput."
+            )
+        }
     }
 
     private fun toggleMixerTest(button: Button) {

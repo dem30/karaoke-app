@@ -11,6 +11,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -213,6 +214,67 @@ class MixerBoardOverlay(
             typeface = Typeface.DEFAULT_BOLD
             textSize = 16f
         })
+
+        // ✅ MOI (theo yeu cau: "may B lo rot mic thi quet QR thang tren
+        // man hinh YouTube, khong can vao lai app"): hien QR cua Phong
+        // Karaoke dang mo NGAY TREN ban mixer noi nay - truoc day QR CHI
+        // hien duoc qua dialog trong MainActivity, bat buoc phai roi
+        // YouTube/mo lai app moi lan can quet lai. Dung DUNG 1 nguon du
+        // lieu voi MainActivity: PlaybackCaptureService.getActiveRoomQrData()
+        // (da la "single source of truth" cho ca Host lan overlay nay, xem
+        // giai thich trong MainActivity.onResume()) - null nghia la chua mo
+        // phong, luc do chi hien 1 dong nhac nho thay vi nut.
+        val activeQr = PlaybackCaptureService.getActiveRoomQrData()
+        if (activeQr != null) {
+            val qrSizePx = dpToPx(200)
+            val qrImageView = ImageView(appContext).apply {
+                visibility = android.view.View.GONE
+                layoutParams = LinearLayout.LayoutParams(qrSizePx, qrSizePx).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    topMargin = dpToPx(4)
+                    bottomMargin = dpToPx(8)
+                }
+            }
+            lateinit var qrToggleButton: Button
+            qrToggleButton = Button(appContext).apply {
+                text = "📷 Hien QR phong '${activeQr.roomId}' (May B quet lai)"
+                setOnClickListener {
+                    if (qrImageView.visibility == android.view.View.VISIBLE) {
+                        qrImageView.visibility = android.view.View.GONE
+                        qrToggleButton.text = "📷 Hien QR phong '${activeQr.roomId}' (May B quet lai)"
+                        return@setOnClickListener
+                    }
+                    // Tao bitmap 1 LAN DUY NHAT (cache lai trong chinh
+                    // ImageView qua drawable), tranh ve lai QR moi lan bam
+                    // an/hien - QR khong doi trong suot vong doi 1 phong.
+                    if (qrImageView.drawable == null) {
+                        try {
+                            val bitmap = com.journeyapps.barcodescanner.BarcodeEncoder().encodeBitmap(
+                                activeQr.toUriString(),
+                                com.google.zxing.BarcodeFormat.QR_CODE,
+                                qrSizePx,
+                                qrSizePx
+                            )
+                            qrImageView.setImageBitmap(bitmap)
+                        } catch (e: Exception) {
+                            logBoth("❌ Loi khi tao QR tren ban mixer noi: ${e.message}", isError = true)
+                            return@setOnClickListener
+                        }
+                    }
+                    qrImageView.visibility = android.view.View.VISIBLE
+                    qrToggleButton.text = "📷 An QR phong '${activeQr.roomId}'"
+                }
+            }
+            scrollContent.addView(qrToggleButton)
+            scrollContent.addView(qrImageView)
+        } else {
+            scrollContent.addView(TextView(appContext).apply {
+                text = "(Chua mo Phong Karaoke - vao app tao phong truoc de co QR hien o day.)"
+                setTextColor(Color.argb(200, 255, 255, 255))
+                textSize = 12f
+                setPadding(0, dpToPx(4), 0, dpToPx(8))
+            })
+        }
 
         scrollContent.addView(MixerBoardUiBuilder.buildMasterVolumeSection(appContext).apply {
             colorAllTextWhite(this)
