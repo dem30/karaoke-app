@@ -96,11 +96,48 @@ private class ShortRingBuffer(private val capacity: Int) {
      * phat sinh 1 lan luc khoi dong/gian doan CPU ngan, nhung KHONG BAO
      * GIO tu rut ngan lai vi drain() chi rut dung 1 CHUNK_SIZE/vong lap du
      * dang ton dong bao nhieu).
+     *
+     * ⚠️ SUA LOI MOI (fix "tieng ret/rẹt moi ~vai giay" - phat hien qua
+     * test thuc te NGAY SAU khi bat trimToTarget: ban dau chi "nhay coc"
+     * thang - noi truc tiep sample NGAY SAU diem cat vao sample NGAY TRUOC
+     * diem cat, tao 1 buoc nhay bien do DOT NGOT trong dang song. Ve mat
+     * am thanh, 1 buoc nhay dot ngot nhu vay nghe DUNG Y HET 1 tieng
+     * click/tach - va vi trimToTarget() bi kich hoat gan nhu MOI vai giay
+     * (xac nhan qua log thuc te: trimToTarget bao co so > 0 o hau het cac
+     * cua so log 3s), nguoi dung nghe thanh tieng "ret ret" dinh ky.
+     *
+     * Sua: crossfade tuyen tinh NGAN (fadeSamples, mac dinh 128 sample =
+     * ~2.9ms tai 44100Hz - du ngan de khong lam tang do tre dang ke, du
+     * dai de an het buoc nhay bien do doi voi da so noi dung nhac/giong
+     * hat) NGAY TAI diem cat: pha tron dan giua "duoi" cua doan SAP BI BO
+     * va "dau" cua doan SE GIU LAI, ghi de KET QUA vao dung vi tri dau cua
+     * doan giu lai (TRUOC khi doi head) - thay vi noi cung 2 doan lai voi
+     * nhau. Ket qua nghe duoc: 1 chuyen tiep muot thay vi 1 buoc nhay dot
+     * ngot.
      */
     @Synchronized
-    fun trimToTarget(targetSize: Int) {
+    fun trimToTarget(targetSize: Int, fadeSamples: Int = 128) {
         if (count <= targetSize) return
         val excess = count - targetSize
+
+        // Khong crossfade nhieu hon so sample THAT SU co o ca 2 phia (doan
+        // sap bo va doan giu lai) - tranh doc ra ngoai vung du lieu hop le
+        // khi excess hoac targetSize qua nho (vd ngay sau start()/clear()).
+        val actualFade = minOf(fadeSamples, excess, targetSize)
+
+        if (actualFade > 0) {
+            for (i in 0 until actualFade) {
+                // "Duoi" cua doan SAP BI BO - tinh nguoc tu diem cat.
+                val discardedIdx = (head + excess - actualFade + i) % capacity
+                // "Dau" cua doan SE GIU LAI - se tro thanh sample dau tien
+                // sau khi head duoc doi ben duoi.
+                val retainedIdx = (head + excess + i) % capacity
+                val t = (i + 1).toFloat() / (actualFade + 1).toFloat()
+                val blended = buffer[discardedIdx] * (1f - t) + buffer[retainedIdx] * t
+                buffer[retainedIdx] = blended.toInt().toShort()
+            }
+        }
+
         head = (head + excess) % capacity
         count -= excess
         trimmedForLatencyCount.addAndGet(excess.toLong())
