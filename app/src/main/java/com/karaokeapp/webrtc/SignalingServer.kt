@@ -33,6 +33,28 @@ class SignalingServer(
     // 1 thread rieng theo mac dinh cua Java-WebSocket).
     private val clientMap = ConcurrentHashMap<WebSocket, String>()
 
+    // ✅ MOI (fix "May B ket noi lai bi Host tu dong ngat sau vai chuc giay" -
+    // BUG phat sinh SAU KHI clientId phia Mic B duoc doi thanh ON DINH theo
+    // thiet bi, thay vi random moi lan connect): truoc day chi co clientMap
+    // (conn -> clientId) - neu 1 May B mat mang KHONG dong socket sach se
+    // (rot Wi-Fi dot ngot, khong co goi FIN/Close), socket CU van nam trong
+    // clientMap cho toi khi thu vien Java-WebSocket tu phat hien "connection
+    // lost" (mac dinh ~60s). Trong luc do, neu nguoi dung da bam "Ket noi
+    // lai" va tao 1 socket MOI voi CUNG 1 clientId on dinh do, ca 2 socket
+    // (cu + moi) DEU nam trong clientMap voi cung 1 clientId. Khi socket CU
+    // cuoi cung bi phat hien mat (~60s sau), onClose(connCu) chay ->
+    // listener.onMicDisconnected(clientId) van duoc goi - XOA NHAM
+    // VocalChannel/PeerConnection cua PHIEN MOI dang chay tot (vi ca 2 deu
+    // dung chung 1 key clientId o phia Host).
+    //
+    // Sua: them 1 map RIENG chi luu socket nao dang la "chu" HIEN TAI cua 1
+    // clientId. Khi co JOIN moi voi clientId da ton tai, cap nhat "chu" moi
+    // + chu dong dong socket CU (khong cho no song vo ich nua). Khi 1 socket
+    // dong, CHI bao onMicDisconnected() neu dung socket DANG la "chu" cua
+    // clientId do bi dong - neu no da bi 1 socket moi hon thay the tu truoc,
+    // coi day la tieng vong cua phien CU, bo qua.
+    private val activeConnectionForClientId = ConcurrentHashMap<String, WebSocket>()
+
     override fun onStart() {
         CaptureLogBus.log("[SignalingServer] Da khoi dong server tai cong $port")
     }
@@ -42,10 +64,24 @@ class SignalingServer(
     }
 
     override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
-        val clientId = clientMap.remove(conn)
-        if (clientId != null) {
+        val clientId = clientMap.remove(conn) ?: return
+
+        // ✅ SUA (xem giai thich day du o khai bao activeConnectionForClientId
+        // phia tren): remove(key, value) la thao tac ATOMIC, chi xoa VA tra ve
+        // true neu gia tri hien tai dung bang conn dang dong nay. Neu clientId
+        // do da duoc 1 socket MOI HON "chiem lai" (JOIN sau), gia tri trong map
+        // se KHAC voi conn nay -> remove tra ve false -> ta biet day chi la
+        // socket CU dang tu dong (do mat mang / timeout), KHONG phai phien
+        // dang hoat dong that su -> bo qua, KHONG bao onMicDisconnected.
+        val isStillActiveConnection = activeConnectionForClientId.remove(clientId, conn)
+        if (isStillActiveConnection) {
             CaptureLogBus.log("[SignalingServer] Mic '$clientId' da ngat ket noi")
             listener.onMicDisconnected(clientId)
+        } else {
+            CaptureLogBus.log(
+                "[SignalingServer] Socket CU cua Mic '$clientId' tu dong (da bi 1 lan " +
+                    "ket noi lai moi hon thay the truoc do) - bo qua, khong bao ngat ket noi."
+            )
         }
     }
 
@@ -61,6 +97,23 @@ class SignalingServer(
                     val token = json.optString("token")
                     if (room == expectedRoomId && token == expectedToken) {
                         clientMap[conn] = clientId
+
+                        // ✅ MOI (xem giai thich day du o khai bao
+                        // activeConnectionForClientId phia tren): danh dau
+                        // conn NAY la socket "chu" MOI cua clientId - neu
+                        // truoc do co 1 socket KHAC (cu, vi du tu lan ket noi
+                        // truoc chua kip dong sach vi mat mang) dang giu cung
+                        // clientId nay, chu dong dong luon socket cu do (no da
+                        // "het tac dung" - Mic that su dang o socket moi nay).
+                        val previousConn = activeConnectionForClientId.put(clientId, conn)
+                        if (previousConn != null && previousConn !== conn && previousConn.isOpen) {
+                            CaptureLogBus.log(
+                                "[SignalingServer] Mic '$clientId' ket noi lai bang socket MOI - " +
+                                    "dong socket CU (co the dang treo do mat mang truoc do)."
+                            )
+                            previousConn.close()
+                        }
+
                         conn.send(SignalingMessages.createJoinOk(room, clientId))
                         CaptureLogBus.log("[SignalingServer] Mic '$clientId' da tham gia phong thanh cong")
                         listener.onMicConnected(clientId)
@@ -121,6 +174,13 @@ class SignalingServer(
                 if (conn.isOpen) conn.send(JSONObject().apply { put("type", SignalingMessages.TYPE_ROOM_CLOSED) }.toString())
             }
             stop()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        } finally {
+            // ✅ MOI: don sach map theo doi "socket chu" cung luc voi
+            // clientMap - tranh giu tham chieu WebSocket cu qua nhieu lan
+            // mo/dong phong lien tiep (rat co the xay ra khi test lap di lap
+            // lai bug ket noi lai).
+            activeConnectionForClientId.clear()
+        }
     }
 }

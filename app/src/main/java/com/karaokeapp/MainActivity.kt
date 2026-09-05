@@ -63,6 +63,10 @@ import com.karaokeapp.webrtc.WebRtcManager
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        // ✅ MOI: key luu clientId On dinh cua Mic B trong SharedPreferences -
+        // xem giai thich day du o getOrCreateStableClientId().
+        private const val PREF_KEY_STABLE_MIC_CLIENT_ID = "stable_mic_client_id"
+
         @Volatile
         var onResumedCallback: (() -> Unit)? = null
 
@@ -156,6 +160,42 @@ class MainActivity : AppCompatActivity() {
     private var signalingClient: SignalingClient? = null
     private var webRtcManager: WebRtcManager? = null
     private var wirelessMicInput: MicInput? = null
+
+    // ✅ MOI (fix "bam Ket noi lai hoai khong duoc"): moi lan connectToRoomAsMic()
+    // duoc goi (quet QR moi hoac bam nut Ket noi lai) se tang bien nay len 1 -
+    // dinh danh "phien ket noi" HIEN TAI. Cac callback bat dong bo cua
+    // SignalingClient/WebRtcManager (onDisconnected, onJoinedSuccess,
+    // onAnswerReceived, onIceReceived...) deu duoc tao ra ben trong 1 lan goi
+    // connectToRoomAsMic() cu the, va se "chup" (capture) lai gia tri
+    // micSessionGeneration TAI THOI DIEM DO vao 1 val rieng - neu sau nay
+    // callback ay chay TRE (vi du sau khi nguoi dung da bam Ket noi lai them
+    // 1 lan nua), no se so sanh voi gia tri MOI NHAT truoc khi dong/ghi de cac
+    // field dung chung (signalingClient/webRtcManager/wirelessMicInput) - neu
+    // khong con khop, coi nhu callback "ma" cua phien da bi thay the va BO
+    // QUA, tranh tinh trang phien MOI vua thiet lap xong bi callback CU tu
+    // dong "dong nham".
+    @Volatile
+    private var micSessionGeneration = 0
+
+    /**
+     * ✅ MOI (fix "ket noi lai sinh them 1 Mic moi trong mixer"): truoc day
+     * moi lan connectToRoomAsMic() random 1 clientId MOI ("Mic-" + so 100-999)
+     * - phia May A (PlaybackCaptureService.getOrCreateVocalChannel) coi day la
+     * 1 nguon am hoan toan moi, tao them 1 VocalChannel/kenh mixer MOI thay vi
+     * nhan ra day la CUNG 1 thiet bi vua ket noi lai. Sua: sinh 1 lan DUY NHAT
+     * cho ca vong doi cai dat app (luu trong SharedPreferences), dung lai
+     * NGUYEN VEN cho moi lan connect/ket noi lai - nho vay May A se tu dong
+     * tim lai dung VocalChannel cu (giu nguyen volume/EQ da chinh) thay vi
+     * tao kenh moi.
+     */
+    private fun getOrCreateStableClientId(): String {
+        val prefs = getSharedPreferences("karaoke_prefs", Context.MODE_PRIVATE)
+        val existing = prefs.getString(PREF_KEY_STABLE_MIC_CLIENT_ID, null)
+        if (existing != null) return existing
+        val generated = "Mic-" + java.util.UUID.randomUUID().toString().take(8)
+        prefs.edit().putString(PREF_KEY_STABLE_MIC_CLIENT_ID, generated).apply()
+        return generated
+    }
 
     // ✅ MOI: giu QrJoinData cua phong DANG hien dialog (neu co) - de biet
     // co can tu dong mo lai dialog QR trong onResume() hay khong (truong
@@ -888,7 +928,23 @@ class MainActivity : AppCompatActivity() {
      * can parse lai chuoi QR, chi can QrJoinData da co san).
      */
     private fun connectToRoomAsMic(qrData: QrJoinData) {
-        val myClientId = "Mic-" + (100..999).random()
+        // ✅ SUA (fix "ket noi lai sinh them Mic moi"): dung lai DUNG 1
+        // clientId on dinh cho ca thiet bi (xem getOrCreateStableClientId())
+        // thay vi random moi lan connect - de May A nhan ra day la CUNG 1
+        // mic khi ket noi lai, tai su dung lai dung VocalChannel/kenh mixer
+        // cu (giu nguyen volume/EQ) thay vi tao them 1 kenh moi.
+        val myClientId = getOrCreateStableClientId()
+
+        // ✅ MOI (fix "ket noi lai hoai khong duoc"): tang & chup lai
+        // "phien ket noi" HIEN TAI - xem giai thich day du o khai bao
+        // micSessionGeneration phia tren. myGeneration la gia tri CO DINH
+        // gan voi CHINH LAN GOI connectToRoomAsMic() nay; moi closure/
+        // callback ben duoi deu dung myGeneration (khong dung bien
+        // micSessionGeneration truc tiep, vi no co the da doi khi callback
+        // thuc su chay).
+        micSessionGeneration++
+        val myGeneration = micSessionGeneration
+
         webRtcManager = WebRtcManager(this)
 
         val serverUri = java.net.URI("ws://${qrData.host}:${qrData.port}")
@@ -901,27 +957,70 @@ class MainActivity : AppCompatActivity() {
                 override fun onConnectedToMixer() {}
                 override fun onJoinedSuccess() {
                     runOnUiThread {
+                        if (myGeneration != micSessionGeneration) {
+                            CaptureLogBus.log(
+                                "[Mic] onJoinedSuccess() cua phien CU (gen=$myGeneration, " +
+                                    "hien tai=$micSessionGeneration) - bo qua, da bi Ket noi lai thay the."
+                            )
+                            return@runOnUiThread
+                        }
                         Toast.makeText(this@MainActivity, "Da vao phong! Dang truyen am thanh...", Toast.LENGTH_SHORT).show()
-                        startWirelessMicStream()
+                        startWirelessMicStream(expectedGeneration = myGeneration)
                     }
                 }
                 override fun onJoinFailed(reason: String) {
-                    runOnUiThread { Toast.makeText(this@MainActivity, "Khong the vao phong: $reason", Toast.LENGTH_LONG).show() }
+                    runOnUiThread {
+                        if (myGeneration != micSessionGeneration) return@runOnUiThread
+                        Toast.makeText(this@MainActivity, "Khong the vao phong: $reason", Toast.LENGTH_LONG).show()
+                    }
                 }
                 override fun onAnswerReceived(sdp: String) {
+                    // ✅ MOI: chan doan SDP "lac phien" - vi clientId gio ON
+                    // DINH giua cac lan connect, 1 answer den TRE tu phien CU
+                    // (webRtcManager cu, PeerConnection cu) co the vo tinh
+                    // duoc ap dung nham vao PeerConnection MOI (cung key
+                    // clientId) neu khong kiem tra generation o day.
+                    if (myGeneration != micSessionGeneration) {
+                        CaptureLogBus.log(
+                            "[Mic] Bo qua onAnswerReceived() den TRE tu phien CU " +
+                                "(gen=$myGeneration, hien tai=$micSessionGeneration)."
+                        )
+                        return
+                    }
                     webRtcManager?.handleRemoteAnswer(myClientId, sdp)
                 }
                 override fun onIceReceived(sdpMid: String, sdpMLineIndex: Int, candidate: String) {
+                    if (myGeneration != micSessionGeneration) return
                     webRtcManager?.addRemoteIceCandidate(myClientId, sdpMid, sdpMLineIndex, candidate)
                 }
                 override fun onDisconnected() {
-                    runOnUiThread { stopWirelessMicStream() }
+                    runOnUiThread { stopWirelessMicStream(expectedGeneration = myGeneration) }
                 }
             }
         ).apply { connect() }
     }
 
-    private fun startWirelessMicStream() {
+    /**
+     * ✅ SUA (fix "ket noi lai hoai khong duoc" - xem giai thich day du o
+     * khai bao micSessionGeneration phia tren): them tham so
+     * [expectedGeneration] - CHI truyen vao khi ham nay duoc goi TU BEN
+     * TRONG 1 callback bat dong bo cua mot phien ket noi cu the (vi du
+     * onJoinedSuccess). Neu gia tri nay KHONG khop voi micSessionGeneration
+     * HIEN TAI (nghia la nguoi dung da bam Ket noi lai/quet QR moi tao ra 1
+     * phien khac trong luc callback nay dang "bay" tren duong ve), ham se
+     * TU BO QUA thay vi ghi de len field cua phien MOI. Goi KHONG truyen
+     * tham so (mac dinh null) khi la hanh dong CHU DONG cua nguoi dung (vi
+     * du bam nut Ket noi lai) - luon cho phep, khong can kiem tra.
+     */
+    private fun startWirelessMicStream(expectedGeneration: Int? = null) {
+        if (expectedGeneration != null && expectedGeneration != micSessionGeneration) {
+            CaptureLogBus.log(
+                "[Mic] Bo qua startWirelessMicStream() tu phien ket noi CU " +
+                    "(gen=$expectedGeneration, hien tai=$micSessionGeneration) - da bi Ket noi lai thay the."
+            )
+            return
+        }
+
         if (micLoopbackRunning || mixerTestRunning) {
             Toast.makeText(
                 this,
@@ -936,8 +1035,18 @@ class MainActivity : AppCompatActivity() {
         webRtcManager?.startClientPeer(
             signalingClient = client,
             onIceCandidateGenerated = { mid, idx, cand -> client.sendIce(mid, idx, cand) },
-            onConnected = {
+            onConnected = onConnected@{
                 CaptureLogBus.log("[Mic] WebRTC da thong mang! Bat dau thu am gui di...")
+                // ✅ Kiem tra lai LAN NUA ngay truoc khi gan wirelessMicInput -
+                // ICE co the mat vai giay de CONNECTED, du nguoi dung da bam
+                // Ket noi lai them lan nua trong luc cho.
+                if (expectedGeneration != null && expectedGeneration != micSessionGeneration) {
+                    CaptureLogBus.log(
+                        "[Mic] Bo qua khoi tao MicInput tu phien ket noi CU " +
+                            "(gen=$expectedGeneration, hien tai=$micSessionGeneration)."
+                    )
+                    return@onConnected
+                }
                 val mic = MicInput(this)
                 wirelessMicInput = mic
                 mic.startCapture(onPcmChunk = { buffer, size ->
@@ -957,7 +1066,15 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun stopWirelessMicStream() {
+    private fun stopWirelessMicStream(expectedGeneration: Int? = null) {
+        if (expectedGeneration != null && expectedGeneration != micSessionGeneration) {
+            CaptureLogBus.log(
+                "[Mic] Bo qua stopWirelessMicStream() tu phien ket noi CU " +
+                    "(gen=$expectedGeneration, hien tai=$micSessionGeneration) - " +
+                    "khong dong nham phien MOI vua duoc Ket noi lai thiet lap."
+            )
+            return
+        }
         wirelessMicInput?.stopCapture()
         wirelessMicInput = null
         signalingClient?.close()
