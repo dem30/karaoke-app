@@ -824,22 +824,55 @@ class PlaybackCaptureService : Service() {
         // lan bat lai Mixer Test - xem VocalChannel.reset()).
         vocalChannels.values.forEach { it.reset() }
 
-        mic.startCapture(onPcmChunk = { buffer, size ->
-            if (localMicMutedForMixer) return@startCapture
+        // ✅ SUA LOI GOC RE (fix "tieng ret/giat 60ms-1119ms dinh ky, dac
+        // biet NGAY LUC vua bat Mixer Test" - xac nhan qua chan doan log
+        // thuc te: doi chieu thoi diem "Bat dau mixer loop" voi
+        // "CpuJitterProbe TRE 1119ms" xay ra CHI VAI TRAM ms sau, dung luc
+        // mic.startCapture() dang chay): TRUOC DAY mic.startCapture() (mo
+        // AudioRecord - co the thu toi 2 lan: UNPROCESSED roi fallback MIC
+        // neu lan dau that bai, MOI lan la 1 loi goi native/IPC toi
+        // AudioFlinger co the mat vai chuc ms) chay DONG BO, TRUC TIEP tren
+        // thread goi ham nay - MA thread do la MAIN THREAD (startMixerTestInternal
+        // duoc goi tu Handler.postDelayed trong chuoi Reactivation, khong
+        // phai tu 1 coroutine rieng). Dung luc DO, OutputRouter/AudioTrack o
+        // tren CUNG vua duoc mo (IPC AudioFlinger khac) - 2 chuoi IPC audio
+        // nang dong bo, LIEN TIEP tren main thread, xay ra CHINH XAC luc
+        // LowLatencyMixer (thread rieng, URGENT_AUDIO) vua bat dau vong lap
+        // dau tien va nhay cam nhat voi tranh chap CPU/scheduler - giai
+        // thich dung hien tuong "tre 1119ms" chi xay ra 0 den vai giay SAU
+        // khi mixer start(), khong phai ngau nhien luc nao cung the.
+        //
+        // Sua: chuyen mic.startCapture() sang chay tren serviceScope
+        // (Dispatchers.Default, THREAD POOL RIENG, khong phai main thread)
+        // thay vi goi truc tiep - giai phong main thread NGAY LAP TUC (khong
+        // con phai cho AudioRecord khoi tao xong moi tiep tuc ham nay), giam
+        // manh khoang thoi gian main thread bi "chiem dung" lien tuc boi
+        // chuoi IPC audio, tu do giam co hoi scheduler tranh CPU cua mixer
+        // thread dung luc nhay cam nhat. AN TOAN: `mic`/`mix` la local val,
+        // closure ben trong startCapture() giu dung tham chieu bat ke chay
+        // tren thread nao; `micInput = mic` (o tren) DA duoc gan TRUOC khi
+        // launch, nen neu nguoi dung bam TAT Mixer Test ngay lap tuc,
+        // stopMixerTestInternal() van thay dung instance de goi stopCapture()
+        // (huy AudioRecord dang khoi tao dang do mot cach an toan, xem
+        // MicInput.stopCapture()).
+        serviceScope.launch {
+            mic.startCapture(onPcmChunk = { buffer, size ->
+                if (localMicMutedForMixer) return@startCapture
 
-            // ✅ SUA (Phase 6 - bo HowlGuard, xem giai thich day du o khai
-            // bao truong howl* cu da bi xoa phia tren): mic vat ly gio chi
-            // con di qua 1 VocalChannel DUY NHAT (dung chung logic voi tung
-            // nguon remote - xem VocalChannel.kt), KHONG con co che tu dong
-            // "cam mic" khi nghi ngo hu nua. Chong hu vat ly la trach nhiem
-            // cua nguoi dung (giam am loa / dua mic ra xa / dung tai nghe).
-            val channel = getOrCreateVocalChannel(LowLatencyMixer.SOURCE_LOCAL_MIC)
-            channel.process(buffer, size)
+                // ✅ SUA (Phase 6 - bo HowlGuard, xem giai thich day du o khai
+                // bao truong howl* cu da bi xoa phia tren): mic vat ly gio chi
+                // con di qua 1 VocalChannel DUY NHAT (dung chung logic voi tung
+                // nguon remote - xem VocalChannel.kt), KHONG con co che tu dong
+                // "cam mic" khi nghi ngo hu nua. Chong hu vat ly la trach nhiem
+                // cua nguoi dung (giam am loa / dua mic ra xa / dung tai nghe).
+                val channel = getOrCreateVocalChannel(LowLatencyMixer.SOURCE_LOCAL_MIC)
+                channel.process(buffer, size)
 
-            synchronized(vocalPushLock) {
-                mix.pushVocal(LowLatencyMixer.SOURCE_LOCAL_MIC, buffer, size)
-            }
-        })
+                synchronized(vocalPushLock) {
+                    mix.pushVocal(LowLatencyMixer.SOURCE_LOCAL_MIC, buffer, size)
+                }
+            })
+        }
 
         guardTickCount = 0
         volumeGuardJob = serviceScope.launch {
