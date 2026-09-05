@@ -1,5 +1,6 @@
 package com.karaokeapp.audio.mixer
 
+import com.karaokeapp.audio.music.CaptureLogBus
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -36,13 +37,22 @@ import kotlin.math.sqrt
  *    pitch-shift qua muc) nhung khong xoa het duoc loi nay - can test thuc te va tinh lai MIN/MAX_FREQUENCY_HZ
  *    theo dai giong nguoi dung thuc te cua ban.
  *  - Vong lap autocorrelation la O(cua_so x so_chu_ky_can_do) - da them buoc "do tho truoc (buoc nhay
- *    COARSE_STEP), tinh chinh sau" de giam tai CPU, nhung VAN NEN do dac tren thiet bi that (dac biet
- *    may cu/gia re) truoc khi bat mac dinh cho tat ca nguoi dung - neu qua nang, giam ANALYSIS_WINDOW_SAMPLES
- *    hoac tang PITCH_DETECT_HOP_SAMPLES (do thua hon, doi lay it CPU hon).
+ *    COARSE_STEP), tinh chinh sau" de giam tai CPU, VA da nang PITCH_DETECT_HOP_SAMPLES len 2048 (thay
+ *    vi 256 ban dau) sau khi xac nhan thuc te tren thiet bi CPU yeu: o 256 mau, vong autocorrelation
+ *    chay ~172 lan/giay TREN CHINH audio thread lam audio khong kip deadline (mat tieng/"ret ret" ngay
+ *    khi bat). VAN NEN do dac tren thiet bi that truoc khi bat mac dinh cho tat ca nguoi dung - neu con
+ *    yeu, giam ANALYSIS_WINDOW_SAMPLES hoac tang further PITCH_DETECT_HOP_SAMPLES (vd 4096).
  *  - Ty le ghi/doc cua vong Overlap-Add (olaWritePos/olaReadPos) co the "troi" dan qua thoi gian dai
  *    vi synthesisHop thay doi lien tuc theo ty le pitch-shift - da them 1 lop ep an toan (xem trong
  *    triggerGrain()) de tranh doc/ghi de len nhau gay ra tieng "rac", nhung day la 1 don gian hoa,
  *    khong phai giai phap toi uu tuyet doi.
+ *
+ * ✅ FAIL-SAFE (sua sau khi xac nhan bug thuc te): popOlaOutput() TRUOC DAY tra ve 0f (im lang) khi
+ *   olaWeight tai vi tri doc con qua thap (chua co grain PSOLA nao duoc ghi vao do - xay ra it nhat
+ *   trong processingDelaySamples dau tien sau moi lan bat enabled=true/reset()) - dieu nay lam MIC BI
+ *   CAU HOAN TOAN dung luc nguoi dung vua bat auto-tune, nghe nhu "mat tieng". GIO khi weight qua thap,
+ *   ham BYPASS THANG ve mau mic GOC (tu [history], khong qua PSOLA) thay vi tra im lang/rac - dam bao
+ *   nguoi dung LUON nghe duoc giong minh, chi la CHUA duoc chinh pitch dung khoanh khac do.
  */
 class PitchCorrector(private val sampleRate: Int = 44100) {
 
@@ -61,8 +71,18 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // Do dai cua so phan tich autocorrelation (mau).
         private const val ANALYSIS_WINDOW_SAMPLES = 1024
 
-        // Do lai cao do moi 256 mau (~5.8ms @ 44100Hz) thay vi moi mau - giam tai CPU dang ke.
-        private const val PITCH_DETECT_HOP_SAMPLES = 256
+        // ✅ SUA (giam tai CPU tren audio thread - xac nhan qua chan doan
+        // thuc te tren thiet bi cua nguoi dung): truoc la 256 mau (~5.8ms @
+        // 44100Hz, ~172 lan/giay) - QUA DAY cho 1 vong autocorrelation O(cua
+        // so x so chu ky) chay TRUC TIEP tren audio thread, de lam audio
+        // thread khong kip deadline tren may CPU yeu (bieu hien: mat tieng/
+        // "ret ret" ngay khi bat enabled=true, xem log chan doan). Nang len
+        // 2048 mau (~46ms, ~21 lan/giay) - van du nhanh cho auto-tune "nhe"
+        // (giong hat khong doi cao do nhanh hon vai chuc ms), giam tai CPU
+        // manh. Neu may van yeu/con nghe "ret ret", thu nang tiep len 4096
+        // (~93ms, ~11 lan/giay) - danh doi: pitch-shift phan ung cham hon
+        // mot chut voi thay doi cao do dot ngot cua giong hat.
+        private const val PITCH_DETECT_HOP_SAMPLES = 2048
 
         // Buoc nhay khi do THO truoc khi tinh chinh +-COARSE_STEP quanh ung vien tot nhat.
         private const val COARSE_STEP = 2
@@ -70,10 +90,30 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // Gioi han ty le pitch-shift cho phep - tranh meo giong qua muc khi do sai/octave error.
         private const val MAX_SHIFT_RATIO = 1.5
         private const val MIN_SHIFT_RATIO = 1.0 / 1.5
+
+        // ✅ MOI (chan doan): in log RMS/period/freq/ratio moi bao nhieu lan
+        // goi updatePitchAndRatio() - 1 lan goi ~46ms @ 44100Hz (sau khi nang
+        // PITCH_DETECT_HOP_SAMPLES len 2048), nen 50 lan ~= 1 lan log moi
+        // ~2.3s - du day de doc, khong spam logcat.
+        private const val DIAGNOSTIC_LOG_EVERY_N_UPDATES = 50
     }
+
+    // ✅ MOI (chan doan): dem so lan updatePitchAndRatio() da chay (ke ca
+    // cac lan bi return som vi im lang/khong ro cao do) - dung rieng bien
+    // nay (khong dung totalSamplesWritten) de dieu khien tan suat log doc
+    // lap, khong lien quan gi den logic PSOLA.
+    private var diagnosticTickCount = 0L
 
     /** Bat/tat module - mac dinh TAT, phai duoc UI/nguoi dung chu dong bat. */
     var enabled: Boolean = false
+        set(value) {
+            // ✅ MOI (chan doan): log MOI LAN doi (khong throttle, vi day la
+            // su kien hiem - bam checkbox) - de xac nhan UI co thuc su goi
+            // toi DUNG instance PitchCorrector dang chay trong luong audio
+            // hay khong (loai tru kha nang tham chieu sai/instance khac).
+            CaptureLogBus.log("[PitchCorrector] ${if (value) "✅ BAT" else "⬜ TAT"} (instance=${System.identityHashCode(this)}).")
+            field = value
+        }
 
     /**
      * Muc do "ep" ve dung tone: 0f = giu nguyen giong that (khong chinh gi), 1f = ep het muc ve dung
@@ -111,6 +151,15 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
     // Do lech CO DINH giua vi tri ghi va vi tri doc cua olaBuffer luc khoi tao - chinh la "do tre
     // thuat toan" cua ca module (xem canh bao o dau file).
     private val processingDelaySamples = maxPeriodSamples + ANALYSIS_WINDOW_SAMPLES / 2
+
+    // ✅ MOI (fail-safe popOlaOutput): dem TUYET DOI so mau da duoc "xuat ra"
+    // qua popOlaOutput() tu luc khoi tao/reset - KHONG dung truc tiep
+    // olaReadPos cho viec nay vi olaReadPos la CHI SO VONG (% olaCapacity,
+    // se lap lai gia tri sau moi olaCapacity mau) nen khong the dung de suy
+    // ra "mau nay tuong ung voi mau mic nao trong qua khu" mot khi da vong
+    // qua it nhat 1 lan. Bo dem rieng, tuyen tinh nay moi la thu dung de
+    // tinh dung offset vao [history].
+    private var totalSamplesPopped = 0L
 
     init {
         olaWritePos = processingDelaySamples % olaCapacity
@@ -158,6 +207,7 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         olaWeight.fill(0f)
         olaWritePos = processingDelaySamples % olaCapacity
         olaReadPos = 0
+        totalSamplesPopped = 0L
 
         currentPeriodSamples = (sampleRate / 180.0).toInt()
         currentShiftRatio = 1.0
@@ -182,7 +232,15 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
     // ------------------------- Do cao do (autocorrelation) -------------------------
 
     private fun updatePitchAndRatio() {
-        if (totalSamplesWritten < ANALYSIS_WINDOW_SAMPLES + maxPeriodSamples) return // chua du du lieu
+        diagnosticTickCount++
+        val shouldLog = diagnosticTickCount % DIAGNOSTIC_LOG_EVERY_N_UPDATES == 0L
+
+        if (totalSamplesWritten < ANALYSIS_WINDOW_SAMPLES + maxPeriodSamples) {
+            if (shouldLog) {
+                CaptureLogBus.log("[PitchCorrector] ⏳ Chua du du lieu (totalSamplesWritten=$totalSamplesWritten).")
+            }
+            return // chua du du lieu
+        }
 
         // Bo qua neu dang im lang - tranh do pitch tren noise nen, giu nguyen currentPeriodSamples/
         // currentShiftRatio (gia tri cu) cho toi khi lai co tieng hat that su.
@@ -192,9 +250,20 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
             sumSquares += (s * s).toDouble()
         }
         val rms = sqrt(sumSquares / ANALYSIS_WINDOW_SAMPLES)
-        if (rms < SILENCE_RMS_THRESHOLD) return
+        if (rms < SILENCE_RMS_THRESHOLD) {
+            if (shouldLog) {
+                CaptureLogBus.log("[PitchCorrector] 🔇 RMS=${"%.1f".format(rms)} < nguong $SILENCE_RMS_THRESHOLD - coi la im lang, bo qua do pitch.")
+            }
+            return
+        }
 
-        val period = detectPeriodCoarseThenRefine() ?: return
+        val period = detectPeriodCoarseThenRefine()
+        if (period == null) {
+            if (shouldLog) {
+                CaptureLogBus.log("[PitchCorrector] ❓ RMS=${"%.1f".format(rms)} (co tieng) nhung KHONG do duoc cao do ro rang (tuong quan < $CORRELATION_THRESHOLD) - giu nguyen ratio cu=$currentShiftRatio.")
+            }
+            return
+        }
         currentPeriodSamples = period
 
         val detectedFreq = sampleRate.toDouble() / period
@@ -204,6 +273,14 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // Chi ap dung [correctionStrength] phan cua do lech - 1f la ep het muc, 0f la giu nguyen.
         val blended = 1.0 + (rawRatio - 1.0) * correctionStrength
         currentShiftRatio = blended.coerceIn(MIN_SHIFT_RATIO, MAX_SHIFT_RATIO)
+
+        if (shouldLog) {
+            CaptureLogBus.log(
+                "[PitchCorrector] 🎤 RMS=${"%.1f".format(rms)} period=$period detectedFreq=${"%.1f".format(detectedFreq)}Hz " +
+                    "targetFreq=${"%.1f".format(targetFreq)}Hz rawRatio=${"%.3f".format(rawRatio)} " +
+                    "strength=$correctionStrength -> currentShiftRatio=${"%.3f".format(currentShiftRatio)}"
+            )
+        }
     }
 
     /**
@@ -324,14 +401,44 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         return (0.5 - 0.5 * cos(2.0 * PI * k / (length - 1))).toFloat()
     }
 
+    /**
+     * ✅ SUA (fail-safe, thay the hanh vi cu tra ve 0f khi olaWeight qua thap):
+     * TUYET DOI KHONG duoc phep lam mic bien thanh im lang/rac chi vi PSOLA
+     * chua kip tao grain hop le tai vi tri dang doc (vd ngay sau khi bat
+     * enabled=true, con nam trong processingDelaySamples dau tien, hoac neu
+     * co lo hong tam thoi giua 2 lan trigger grain). Khi weight qua thap,
+     * BYPASS thang ve MAU MIC GOC (khong qua PSOLA) - lay tu chinh [history]
+     * tai dung vi tri tuong ung voi mau dang duoc "xuat ra" o buoc nay, dua
+     * theo do lech co dinh processingDelaySamples giua luc ghi vao history
+     * va luc doc ra o day. Ket qua: nguoi dung LUON nghe duoc giong that cua
+     * minh (co the chua duoc chinh pitch dung luc do), KHONG BAO GIO bi cau
+     * tieng dot ngot - danh doi chap nhan duoc, vi day la tinh nang "auto-tune
+     * nhe" (tang cuong), khong phai duong dan am thanh chinh duy nhat.
+     */
     private fun popOlaOutput(): Float {
         val idx = olaReadPos
         val weight = olaWeight[idx]
-        val sample = if (weight > 1e-3f) olaBuffer[idx] / weight else olaBuffer[idx]
+
+        val sample = if (weight > 1e-3f) {
+            olaBuffer[idx] / weight
+        } else {
+            // Fallback: mau output thu totalSamplesPopped (dem tu 0) tuong
+            // ung voi mau input da duoc pushHistory() luc
+            // totalSamplesWritten == totalSamplesPopped + 1 (vi output tre
+            // sau input dung processingDelaySamples mau). historySamplesAgo(0)
+            // luon la mau MOI NHAT vua ghi (ung voi totalSamplesWritten hien
+            // tai) - nen "cach hien tai" bao nhieu mau duoc tinh bang hieu
+            // giua so mau da ghi va so thu tu mau can lay, KHONG dung
+            // olaReadPos (chi so vong, sai sau khi da vong qua olaCapacity).
+            val samplesAgo = (totalSamplesWritten - 1 - totalSamplesPopped).coerceAtLeast(0L).toInt()
+            historySamplesAgo(samplesAgo)
+        }
+
         // Don sach o vua doc de tai su dung vong sau (day la ring buffer).
         olaBuffer[idx] = 0f
         olaWeight[idx] = 0f
         olaReadPos = (olaReadPos + 1) % olaCapacity
+        totalSamplesPopped++
         return sample
     }
 }
