@@ -25,6 +25,7 @@ import com.karaokeapp.audio.output.OutputRouter
 import com.karaokeapp.audio.processor.Limiter
 import com.karaokeapp.overlay.MixerBoardOverlay
 import com.karaokeapp.overlay.MixerToggleOverlayButton
+import com.karaokeapp.overlay.QuickReactivateOverlayButton
 import com.karaokeapp.webrtc.QrJoinData
 import com.karaokeapp.webrtc.SignalingServer
 import com.karaokeapp.webrtc.WebRtcManager
@@ -111,6 +112,13 @@ class PlaybackCaptureService : Service() {
     // Mixer Test BAT, nhac gio chi con phat qua duong Mixer).
     private var mixerBoardOverlay: MixerBoardOverlay? = null
     private var finalMixLimiter: Limiter? = null
+
+    // ✅ MOI (fix "thong bao THAT lam YouTube im, phai bam Stop/Play 2 lan"):
+    // nut noi THU BA, CHI lam 1 viec: goi thang beginOverlayReactivationSequence()
+    // trong DUNG 1 lan bam, bat ke trang thai Mixer Test hien tai - xem giai
+    // thich day du trong QuickReactivateOverlayButton.kt va tai
+    // toggleMixerTestFromOverlay()/focusObserverListener ben duoi.
+    private var quickReactivateOverlay: QuickReactivateOverlayButton? = null
 
     // ✅ DA GO BO (Phase 6) HowlGuard - co che "leo thang" tu dong cam/ha
     // gain mic khi nghi ngo hu phan hoi am hoc. Ly do go bo: co che nay tu
@@ -522,6 +530,8 @@ class PlaybackCaptureService : Service() {
         capturingActive = false
         mixerToggleOverlay?.hide()
         mixerToggleOverlay = null
+        quickReactivateOverlay?.hide()
+        quickReactivateOverlay = null
         mixerBoardOverlay?.hide()
         mixerBoardOverlay = null
     }
@@ -892,6 +902,24 @@ class PlaybackCaptureService : Service() {
             }
         }
         mixerToggleOverlay?.show(initiallyRunning = true)
+
+        // ✅ MOI (xem giai thich day du trong QuickReactivateOverlayButton.kt):
+        // nut "🔔" rieng - luon chay chuoi Reactivation DAY DU trong 1 lan
+        // bam, khong phu thuoc trang thai Mixer Test dang BAT/TAT (khac nut
+        // ▶/⏸ o tren, von la toggle co trang thai nen can 2 lan bam moi chay
+        // duoc chuoi Reactivation neu Mixer Test "dang BAT" theo phan mem
+        // nhung am thanh da bi duck HAL/OEM cam mat).
+        if (quickReactivateOverlay == null) {
+            quickReactivateOverlay = QuickReactivateOverlayButton(applicationContext) {
+                logBoth(
+                    "🔔 [QuickReactivate] Nguoi dung bam nut Kich hoat lai nhanh - " +
+                        "chay chuoi Reactivation DAY DU ngay, bo qua kiem tra trang thai hien tai."
+                )
+                cancelPendingReactivation()
+                beginOverlayReactivationSequence()
+            }
+        }
+        quickReactivateOverlay?.show()
 
         // ✅ MOI (SUA - ban day du): hien cung luc nut "Ban mixer on fly" -
         // gio MixerBoardOverlay tu goi thang PlaybackCaptureService companion
