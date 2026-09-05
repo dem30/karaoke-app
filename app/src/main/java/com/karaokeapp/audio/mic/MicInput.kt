@@ -91,6 +91,14 @@ class MicInput(private val context: Context) {
         // MusicInput - van du day do phan giai de thay xu huong, giam 3 lan
         // so dong log.
         private const val AMPLITUDE_LOG_INTERVAL_MS = 3000L
+
+        // ✅ MOI (fix GOC RE tieng "ret ret" dinh ky - xem giai thich day du
+        // trong startCapture(), dong bo cung sua doi ben MusicInput.kt): 1
+        // CHUNK dung bang dung 1 chu ky mixer (LowLatencyMixer.CHUNK_MS=
+        // 40ms). PHAI giu dong bo thu cong voi CHUNK_MS ben LowLatencyMixer.kt
+        // va MusicInput.kt neu 1 trong 3 noi thay doi.
+        private const val MIXER_CHUNK_MS = 40L
+        private const val READ_CHUNK_SAMPLES = (SAMPLE_RATE * MIXER_CHUNK_MS / 1000L).toInt()
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -205,7 +213,17 @@ class MicInput(private val context: Context) {
         }
 
         captureJob = scope.launch {
-            val buffer = ShortArray(minBufferSize / 2)
+            // ✅ SUA LOI GOC RE (fix "tieng ret ret dinh ky" - xem giai thich
+            // day du o KDoc READ_CHUNK_SAMPLES/MIXER_CHUNK_MS trong companion
+            // object, va cung sua doi dong bo ben MusicInput.kt): TRUOC DAY
+            // buffer doc = ShortArray(minBufferSize/2), lech nhip so voi chu
+            // ky tieu thu 40ms cua LowLatencyMixer, gay backlog CO HE THONG
+            // (khong phai ngau nhien) trong ring buffer phia mixer. Doi sang
+            // READ_CHUNK_SAMPLES (dung 40ms, dong bo CHINH XAC voi mixer).
+            // Buffer NOI BO AudioRecord (setBufferSizeInBytes trong
+            // tryBuildAudioRecord) van giu nguyen >= minBufferSize, chi kich
+            // thuoc MOI LAN GOI read()/push la thay doi.
+            val buffer = ShortArray(READ_CHUNK_SAMPLES)
             var lastLogTime = System.currentTimeMillis()
             var sumAmplitude = 0L
             var sampleCount = 0L

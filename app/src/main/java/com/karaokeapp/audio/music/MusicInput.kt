@@ -112,6 +112,16 @@ class MusicInput(
         // giam 3 lan so dong log so voi truoc (dong log nay chay lien tuc
         // suot ca session capture nhac, khong chi luc Mixer Test).
         private const val AMPLITUDE_LOG_INTERVAL_MS = 3000L
+
+        // ✅ MOI (fix GOC RE tieng "ret ret" dinh ky - xem giai thich day du
+        // trong startCapture() ve READ_CHUNK_SAMPLES ben duoi): 1 CHUNK dung
+        // bang dung 1 chu ky mixer (LowLatencyMixer.CHUNK_MS=40ms). Khai bao
+        // rieng hang so nay (thay vi import truc tiep tu LowLatencyMixer, vi
+        // 2 class khong nen phu thuoc cheo nhau khong can thiet) - PHAI giu
+        // dong bo thu cong voi CHUNK_MS ben LowLatencyMixer.kt neu 1 trong 2
+        // noi thay doi.
+        private const val MIXER_CHUNK_MS = 40L
+        private const val READ_CHUNK_SAMPLES = (SAMPLE_RATE * MIXER_CHUNK_MS / 1000L).toInt()
     }
 
     private fun logBoth(msg: String, isError: Boolean = false) {
@@ -137,6 +147,13 @@ class MusicInput(
             return
         }
 
+        // ✅ MOI (fix GOC RE tieng "ret ret" dinh ky - xem giai thich day du
+        // o vong lap doc PCM ben duoi, tai READ_CHUNK_SAMPLES): buffer NOI
+        // BO cua AudioRecord (setBufferSizeInBytes) VAN can >= minBufferSize
+        // (yeu cau cua Android, khong lien quan gi den kich thuoc MOI LAN
+        // doc) - giu nguyen he so an toan x2 nhu truoc. Cai THAY DOI la
+        // KICH THUOC MOI LAN GOI record.read() ben duoi, KHONG con la
+        // minBufferSize/2 nua.
         val record = AudioRecord.Builder()
             .setAudioPlaybackCaptureConfig(captureConfig)
             .setAudioFormat(
@@ -160,7 +177,33 @@ class MusicInput(
         logBoth("✅ Bat dau capture, sampleRate=$SAMPLE_RATE, minBufferSize=$minBufferSize, excludeUid=${Process.myUid()}")
 
         captureJob = scope.launch {
-            val buffer = ShortArray(minBufferSize / 2)
+            // ✅ SUA LOI GOC RE (fix "tieng ret ret dinh ky moi vai giay" -
+            // day la NGUYEN NHAN GOC MA trimToTarget()/crossfade o
+            // LowLatencyMixer chi dang XU LY TRIEU CHUNG): TRUOC DAY buffer
+            // doc = ShortArray(minBufferSize/2) - minBufferSize la con so
+            // DO CHINH ANDROID/DRIVER quyet dinh rieng cho tung thiet bi
+            // (dua tren do tre phan cung toi thieu), KHONG he dam bao la
+            // boi so tron cua 40ms (CHUNK_SIZE ben LowLatencyMixer). Vi
+            // record.read() la ham BLOCKING (chi tra ve khi DA CO DU DUNG
+            // buffer.size sample moi), moi lan doc luon tra ve 1 khoi CO
+            // DINH theo kich thuoc buffer nay - NEU khoi do > 1764 sample
+            // (40ms) dau chi vai chuc sample, sau vai chuc lan lap lien
+            // tiep, phan du CONG DON lai deu dan theo thoi gian => ring
+            // buffer trong LowLatencyMixer PHINH TO CO HE THONG (khong phai
+            // ngau nhien/CPU giat) => trimToTarget() phai kich hoat gan nhu
+            // MOI vong log 3s de "don" phan du nay - dung y het hien tuong
+            // da quan sat qua log thuc te.
+            //
+            // Sua: doc theo DUNG boi so cua 1 chu ky mixer (READ_CHUNK_
+            // SAMPLES = 1764 sample = 40ms, dong bo CHINH XAC voi nhip tieu
+            // thu cua LowLatencyMixer) thay vi minBufferSize/2. Buffer NOI
+            // BO cua AudioRecord (setBufferSizeInBytes o tren) van du lon
+            // (>= minBufferSize) de driver khong bi underrun giua 2 lan
+            // read() - chi kich thuoc MOI LAN GOI read()/moi lan PUSH vao
+            // mixer la thay doi. Ket qua: ben san xuat day PCM vao dung
+            // NHIP ben tieu thu mong doi, khong con backlog he thong tich
+            // luy theo thoi gian nua.
+            val buffer = ShortArray(READ_CHUNK_SAMPLES)
             var lastLogTime = System.currentTimeMillis()
             var sumAmplitude = 0L
             var sampleCount = 0L
