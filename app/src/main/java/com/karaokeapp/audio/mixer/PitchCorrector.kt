@@ -24,6 +24,15 @@ import kotlin.math.sqrt
  *     roi chong lap (overlap-add, co cua so Hann) chung o 1 nhip do MOI (ung voi cao do dich) - vi moi
  *     grain la nguyen 1-2 chu ky song THAT cua giong hat (khong keo gian noi dung ben trong grain) nen
  *     giu duoc mau sac giong (formant) tuong doi tot hon so voi cach "resample tho" don gian.
+ *  4. ✅ MOI (PSOLA dong bo pha THAT SU - xac nhan qua chan doan thuc te: strength=0 sach tieng,
+ *     nhung strength cang tang (ratio cang xa 1) thi rè cang tang, du chi lech vai %): buoc (3) o tren
+ *     dung 2 DONG HO DOC LAP thay vi 1 - dong ho PHAN TICH (advanceAnalysisClockAndMaybeExtractGrain())
+ *     trich grain moi CHINH XAC moi currentPeriodSamples mau (dung nhip THAT cua tin hieu, khong bi
+ *     currentShiftRatio lam meo) nen cac grain lien tiep LUON dong bo pha voi nhau; dong ho TONG HOP
+ *     (advanceSynthesisClockAndMaybeTriggerGrain()) rieng biet quyet dinh KHI NAO va CACH NHAU BAO XA
+ *     cac grain do (lay tu hang doi [pendingAnalysisGrains]) duoc DAT vao OLA, theo synthesisHop =
+ *     currentPeriodSamples/currentShiftRatio - chinh su LECH nhip giua 2 dong ho nay moi tao ra hieu
+ *     ung dich cao do, dung tinh than PSOLA "kinh dien" (analysis epoch != synthesis epoch).
  *
  * ⚠️ GIOI HAN THAT SU (doc truoc khi dua vao san xuat):
  *  - Day la thuat toan RUT GON de tham khao/demo, KHONG phai thu vien pitch-shift chuyen dung da duoc
@@ -44,7 +53,7 @@ import kotlin.math.sqrt
  *    yeu, giam ANALYSIS_WINDOW_SAMPLES hoac tang further PITCH_DETECT_HOP_SAMPLES (vd 4096).
  *  - Ty le ghi/doc cua vong Overlap-Add (olaWritePos/olaReadPos) co the "troi" dan qua thoi gian dai
  *    vi synthesisHop thay doi lien tuc theo ty le pitch-shift - da them 1 lop ep an toan (xem trong
- *    triggerGrain()) de tranh doc/ghi de len nhau gay ra tieng "rac", nhung day la 1 don gian hoa,
+ *    placeGrainInOla()) de tranh doc/ghi de len nhau gay ra tieng "rac", nhung day la 1 don gian hoa,
  *    khong phai giai phap toi uu tuyet doi.
  *
  * ✅ FAIL-SAFE V2 (crossfade - sua sau khi xac nhan qua 2 vong test thuc te): popOlaOutput() BAN DAU
@@ -115,6 +124,18 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // tron floating-point khi blended = 1.0 + (rawRatio - 1.0) * strength
         // ra dung 1.0 hoac rat gan 1.0.
         private const val RATIO_BYPASS_EPSILON = 0.0005
+
+        // ✅ MOI (PSOLA dong bo pha THAT SU - xem KDoc updatePitchAndRatio()/
+        // advanceAnalysisClockAndMaybeExtractGrain()): so grain PHAN TICH toi
+        // da duoc giu trong hang doi [pendingAnalysisGrains] cho vong tong hop
+        // tieu thu. Xay ra khi correctionStrength dich xuong (currentShiftRatio
+        // < 1 => nhip tong hop THUA nhip phan tich => grain san xuat nhanh hon
+        // tieu thu) - can chan tren de KHONG cho hang doi phinh to vo han (se
+        // lam do tre "troi" dan qua thoi gian dai). Dat = 4 (~4 chu ky cao do,
+        // vai chuc ms) - du de "dem" qua 1 vai lan dao dong nhip nho, nhung
+        // van xa ngay khi lech nhieu (chap nhan bo bot vai chu ky cu - dung
+        // ban chat cua viec ha cao do bang PSOLA: phai "bo bot" chu ky).
+        private const val MAX_PENDING_ANALYSIS_GRAINS = 4
     }
 
     // ✅ MOI (chan doan): dem so lan updatePitchAndRatio() da chay (ke ca
@@ -165,7 +186,39 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
     // ================= Trang thai dong bo hoa PSOLA =================
     private var currentPeriodSamples = (sampleRate / 180.0).toInt() // gia tri khoi tao tam (~180Hz) truoc khi co du du lieu
     private var currentShiftRatio = 1.0
-    private var synthesisPhase = 0.0 // "so mau" con lai truoc khi trigger grain tiep theo
+
+    // ✅ MOI (PSOLA dong bo pha THAT SU - tach doi dong ho PHAN TICH (analysis)
+    // ra khoi dong ho TONG HOP (synthesis), xem KDoc phia duoi 2 ham
+    // advanceAnalysisClockAndMaybeExtractGrain()/advanceSynthesisClockAndMaybeTriggerGrain()):
+    // truoc day CA HAI dung chung 1 dong ho duy nhat (nhip = synthesisHop =
+    // currentPeriodSamples/currentShiftRatio), nghia la grain duoc TRICH tu
+    // history VOI CUNG nhip ma no duoc DAT vao OLA - khi ratio != 1, nhip do
+    // KHONG con khop voi chu ky THAT cua tin hieu goc nua => moi grain lien
+    // tiep vo tinh lay nhau o pha khac nhau cua song => OLA noi lai bi lech
+    // pha => rè/kim loai (rõ dan khi ratio cang xa 1, dung nhu log thuc te da
+    // xac nhan: strength=0 sach, strength tang dan thi rè tang dan). Bay gio
+    // co 2 dong ho doc lap: [analysisPhase] luon dem theo DUNG currentPeriodSamples
+    // (nhip THAT cua tin hieu do duoc, KHONG bi ratio lam meo) de trich grain
+    // luon dong bo pha voi nhau, con [synthesisPhase] (o duoi) van dem theo
+    // synthesisHop de quyet dinh KHI NAO va CACH NHAU BAO XA cac grain do
+    // duoc dat vao OLA - chinh khoang cach dat lai nay (khac voi khoang cach
+    // trich ra) moi la thu tao ra hieu ung dich cao do, dung tinh than PSOLA
+    // "kinh dien" (analysis epoch va synthesis epoch la 2 thu khac nhau).
+    private var analysisPhase = 0.0 // "so mau" con lai truoc khi trich 1 grain PHAN TICH moi tu history
+
+    // Hang doi FIFO cac grain da trich (chua windowed) dang cho duoc dong ho
+    // TONG HOP tieu thu - xem MAX_PENDING_ANALYSIS_GRAINS o tren (chan phinh
+    // to khi ratio<1) va lastAnalysisGrain o duoi (chan can khi ratio>1).
+    private val pendingAnalysisGrains = ArrayDeque<FloatArray>()
+
+    // Grain PHAN TICH gan nhat da duoc tieu thu - dung de "dung lai" (tai su
+    // dung) khi dong ho TONG HOP chay nhanh hon dong ho PHAN TICH (ratio>1,
+    // dich cao do LEN: synthesisHop < currentPeriodSamples => can nhieu grain
+    // hon so voi so grain moi duoc trich trong cung 1 khoang thoi gian) -
+    // dung ban chat cua viec nang cao do bang PSOLA: phai "lap lai" 1 chu ky.
+    private var lastAnalysisGrain: FloatArray? = null
+
+    private var synthesisPhase = 0.0 // "so mau" con lai truoc khi dat grain tiep theo vao OLA
 
     // Do lech CO DINH giua vi tri ghi va vi tri doc cua olaBuffer luc khoi tao - chinh la "do tre
     // thuat toan" cua ca module (xem canh bao o dau file).
@@ -201,7 +254,8 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
      * pha => nghe "rè/nhoe/rung/metallic" NGAY CA KHI khong can dich cao do
      * chut nao. Bay gio: khi correctionStrength=0 HOAC currentShiftRatio da
      * ~1.0 (xem RATIO_BYPASS_EPSILON), BO QUA HOAN TOAN duong PSOLA (khong
-     * goi triggerGrain, khong cong don OLA) - xuat thang mau mic goc tu
+     * goi advanceAnalysisClockAndMaybeExtractGrain/advanceSynthesisClockAndMaybeTriggerGrain,
+     * khong cong don OLA) - xuat thang mau mic goc tu
      * [history] (qua popBypassSample(), giu dung processingDelaySamples nhu
      * duong PSOLA de khop timing khi chuyen qua lai 2 mode). Vua het rè o
      * ratio=1, vua nhe CPU hon (bo hang loat phep Hann/OLA khi khong can).
@@ -222,6 +276,7 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
             val outSample = if (bypassPsola) {
                 popBypassSample()
             } else {
+                advanceAnalysisClockAndMaybeExtractGrain()
                 advanceSynthesisClockAndMaybeTriggerGrain()
                 popOlaOutput()
             }
@@ -254,6 +309,9 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
 
         currentPeriodSamples = (sampleRate / 180.0).toInt()
         currentShiftRatio = 1.0
+        analysisPhase = 0.0
+        pendingAnalysisGrains.clear()
+        lastAnalysisGrain = null
         synthesisPhase = 0.0
     }
 
@@ -394,20 +452,39 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         return 440.0 * 2.0.pow((bestMidi - 69) / 12.0)
     }
 
-    // ------------------------- Tong hop PSOLA (dong ho tong hop + overlap-add) -------------------------
+    // ------------------------- Tong hop PSOLA (2 dong ho doc lap: PHAN TICH + TONG HOP) -------------------------
 
-    private fun advanceSynthesisClockAndMaybeTriggerGrain() {
-        synthesisPhase -= 1.0
-        if (synthesisPhase <= 0.0) {
-            val synthesisHop = currentPeriodSamples / currentShiftRatio
-            synthesisPhase += synthesisHop
-            triggerGrain(synthesisHop.roundToInt().coerceAtLeast(1))
+    /**
+     * ✅ MOI (PSOLA dong bo pha THAT SU): trich 1 grain THO (chua windowed) tu
+     * [history] moi khi da troi qua DUNG currentPeriodSamples mau ke tu lan
+     * trich truoc - nghia la nhip trich hoan toan theo CHU KY THAT cua tin
+     * hieu dang thu, KHONG bi anh huong boi currentShiftRatio. Vi grain luon
+     * lay "2 chu ky gan nhat tinh den hien tai" (samplesAgo=grainLength..1,
+     * xem extractAnalysisGrain()) VA khoang cach giua 2 lan trich lien tiep
+     * LUON DUNG BANG 1 chu ky that (khong hon khong kem, tru sai so do dac
+     * pitch nho), 2 grain lien tiep se gan nhu la ban sao cua nhau dich di
+     * dung 1 chu ky - tuc DONG BO PHA voi nhau. Day chinh la phan con thieu
+     * so voi PSOLA "chuan": truoc day grain duoc trich theo nhip TONG HOP
+     * (synthesisHop, bi ratio lam meo) nen 2 grain lien tiep KHONG dong bo
+     * pha voi nhau ngay ca khi noi dung tin hieu hoan toan on dinh.
+     */
+    private fun advanceAnalysisClockAndMaybeExtractGrain() {
+        analysisPhase -= 1.0
+        if (analysisPhase <= 0.0) {
+            analysisPhase += currentPeriodSamples
+            pendingAnalysisGrains.addLast(extractAnalysisGrain())
+            // Chan phinh to hang doi khi ratio<1 (xem MAX_PENDING_ANALYSIS_GRAINS) -
+            // bo cac grain CU nhat truoc (giu grain moi nhat, sat voi "hien tai" nhat).
+            while (pendingAnalysisGrains.size > MAX_PENDING_ANALYSIS_GRAINS) {
+                pendingAnalysisGrains.removeFirst()
+            }
         }
     }
 
-    private fun triggerGrain(synthesisHopSamples: Int) {
+    private fun extractAnalysisGrain(): FloatArray {
         val grainHalfLength = currentPeriodSamples.coerceIn(minPeriodSamples, maxPeriodSamples)
         val grainLength = grainHalfLength * 2
+        val grain = FloatArray(grainLength)
 
         // Tam grain lay tu lich su: k=0 la phan CU nhat cua grain (samplesAgo=grainLength, con nam
         // trong qua khu), k=grainLength-1 la phan MOI nhat (samplesAgo=1, van la qua khu gan "hien
@@ -415,10 +492,47 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // toan da giai thich o dau file).
         for (k in 0 until grainLength) {
             val samplesAgo = grainLength - k
-            val sample = historySamplesAgo(samplesAgo)
+            grain[k] = historySamplesAgo(samplesAgo)
+        }
+        return grain
+    }
+
+    /**
+     * ✅ MOI (PSOLA dong bo pha THAT SU): dong ho nay CHI con nhiem vu quyet
+     * dinh KHI NAO va CACH NHAU BAO XA cac grain (da duoc trich san boi dong
+     * ho PHAN TICH o tren) duoc DAT vao OLA - chinh khoang cach dat lai nay
+     * (synthesisHop = currentPeriodSamples/currentShiftRatio, KHAC voi
+     * khoang cach trich ra la currentPeriodSamples) moi la thu thuc su tao
+     * ra hieu ung dich cao do. Lay grain tu hang doi FIFO (grain CU nhat
+     * truoc); neu hang doi rong (ratio>1 - dich LEN, dong ho tong hop chay
+     * nhanh hon dong ho phan tich san xuat) thi TAI SU DUNG grain gan nhat
+     * (lastAnalysisGrain) - dung ban chat PSOLA khi dich cao do len la phai
+     * "lap lai" bot 1 vai chu ky.
+     */
+    private fun advanceSynthesisClockAndMaybeTriggerGrain() {
+        synthesisPhase -= 1.0
+        if (synthesisPhase <= 0.0) {
+            val synthesisHop = currentPeriodSamples / currentShiftRatio
+            synthesisPhase += synthesisHop
+
+            val grain = if (pendingAnalysisGrains.isNotEmpty()) {
+                pendingAnalysisGrains.removeFirst()
+            } else {
+                lastAnalysisGrain
+            }
+            if (grain != null) {
+                lastAnalysisGrain = grain
+                placeGrainInOla(grain, synthesisHop.roundToInt().coerceAtLeast(1))
+            }
+        }
+    }
+
+    private fun placeGrainInOla(grain: FloatArray, synthesisHopSamples: Int) {
+        val grainLength = grain.size
+        for (k in 0 until grainLength) {
             val window = hannWindow(k, grainLength)
             val outIdx = (olaWritePos + k) % olaCapacity
-            olaBuffer[outIdx] += sample * window
+            olaBuffer[outIdx] += grain[k] * window
             olaWeight[outIdx] += window
         }
 
@@ -445,35 +559,6 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
     }
 
     /**
-     * ✅ SUA (fail-safe, thay the hanh vi cu tra ve 0f khi olaWeight qua thap):
-     * TUYET DOI KHONG duoc phep lam mic bien thanh im lang/rac chi vi PSOLA
-     * chua kip tao grain hop le tai vi tri dang doc (vd ngay sau khi bat
-     * enabled=true, con nam trong processingDelaySamples dau tien, hoac neu
-     * co lo hong tam thoi giua 2 lan trigger grain). Khi weight qua thap,
-     * TRON DAN (crossfade) ve MAU MIC GOC (khong qua PSOLA) - lay tu chinh
-     * [history] tai dung vi tri tuong ung voi mau dang duoc "xuat ra" o buoc
-     * nay, dua theo do lech co dinh processingDelaySamples giua luc ghi vao
-     * history va luc doc ra o day.
-     *
-     * ⚠️ SUA TIEP (fail-safe V2 - xac nhan qua test thuc te tren thiet bi):
-     * ban V1 CHUYEN CUNG (hard switch) giua "100% PSOLA" va "100% mic goc"
-     * ngay tai nguong weight > 1e-3f - dieu nay GIAI QUYET duoc mat tieng,
-     * NHUNG lai TAO RA tieng "ret/click" MOI tai moi ranh gioi chuyen doi, vi
-     * 2 nguon tin hieu (da qua PSOLA vs mic goc chua xu ly) co bien do/pha
-     * khac nhau, nhay dot ngot giua chung nghe nhu noi bang bi dut quang.
-     * Tren may CPU yeu (weight de roi vao vung thap thuong xuyen hon do cac
-     * lan trigger grain co the bi tre/nhay coc), so lan chuyen doi cang
-     * nhieu, tieng ret cang ro.
-     *
-     * GIAI PHAP: TRON THEO TY LE (crossfade) dua tren chinh [weight] lam he
-     * so tin cay, KHONG hard-switch. weight=0 -> 100% mic goc; weight >=
-     * CROSSFADE_FULL_CONFIDENCE_WEIGHT -> 100% PSOLA; o giua -> pha tron
-     * tuyen tinh ca 2 nguon. Ket qua: van dam bao KHONG BAO GIO im lang/rac
-     * (dung tinh than fail-safe ban dau), nhung KHONG con ranh gioi cung nao
-     * de gay tieng "ret/click" nua - chuyen tiep giua PSOLA va mic goc muot
-     * dan, tai kho phan biet duoc diem chuyen doi.
-     */
-    /**
      * ✅ MOI (fail-safe V3, xem KDoc process()): duong "tat PSOLA" - dung khi
      * correctionStrength=0 hoac currentShiftRatio~1.0. Van "tien" olaReadPos
      * va don sach olaBuffer/olaWeight tai vi tri do - Y HET nhung gi
@@ -481,7 +566,7 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
      * lai (nguoi hat lech tone/ratio!=1), vi tri do trong OLA buffer khong
      * con "rac" cua lan chay truoc (tranh tieng rac luc chuyen mode). Diem
      * khac biet duy nhat: KHONG doc/chuan hoa olaBuffer (khong co PSOLA sample
-     * nao ca vi triggerGrain() khong duoc goi trong mode nay), ma tra thang
+     * nao ca vi khong grain nao duoc dat vao trong mode nay), ma tra thang
      * mau mic goc tu [history], dung [processingDelaySamples] y het duong
      * PSOLA dung (qua totalSamplesWritten - 1 - totalSamplesPopped) de 2 luong
      * ra co CUNG do tre - tranh buoc nhay/click khi bat/tat correctionStrength
@@ -499,6 +584,35 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         return sample
     }
 
+    /**
+     * ✅ SUA (fail-safe, thay the hanh vi cu tra ve 0f khi olaWeight qua thap):
+     * TUYET DOI KHONG duoc phep lam mic bien thanh im lang/rac chi vi PSOLA
+     * chua kip tao grain hop le tai vi tri dang doc (vd ngay sau khi bat
+     * enabled=true, con nam trong processingDelaySamples dau tien, hoac neu
+     * co lo hong tam thoi giua 2 lan dat grain). Khi weight qua thap,
+     * TRON DAN (crossfade) ve MAU MIC GOC (khong qua PSOLA) - lay tu chinh
+     * [history] tai dung vi tri tuong ung voi mau dang duoc "xuat ra" o buoc
+     * nay, dua theo do lech co dinh processingDelaySamples giua luc ghi vao
+     * history va luc doc ra o day.
+     *
+     * ⚠️ SUA TIEP (fail-safe V2 - xac nhan qua test thuc te tren thiet bi):
+     * ban V1 CHUYEN CUNG (hard switch) giua "100% PSOLA" va "100% mic goc"
+     * ngay tai nguong weight > 1e-3f - dieu nay GIAI QUYET duoc mat tieng,
+     * NHUNG lai TAO RA tieng "ret/click" MOI tai moi ranh gioi chuyen doi, vi
+     * 2 nguon tin hieu (da qua PSOLA vs mic goc chua xu ly) co bien do/pha
+     * khac nhau, nhay dot ngot giua chung nghe nhu noi bang bi dut quang.
+     * Tren may CPU yeu (weight de roi vao vung thap thuong xuyen hon do cac
+     * lan dat grain co the bi tre/nhay coc), so lan chuyen doi cang
+     * nhieu, tieng ret cang ro.
+     *
+     * GIAI PHAP: TRON THEO TY LE (crossfade) dua tren chinh [weight] lam he
+     * so tin cay, KHONG hard-switch. weight=0 -> 100% mic goc; weight >=
+     * CROSSFADE_FULL_CONFIDENCE_WEIGHT -> 100% PSOLA; o giua -> pha tron
+     * tuyen tinh ca 2 nguon. Ket qua: van dam bao KHONG BAO GIO im lang/rac
+     * (dung tinh than fail-safe ban dau), nhung KHONG con ranh gioi cung nao
+     * de gay tieng "ret/click" nua - chuyen tiep giua PSOLA va mic goc muot
+     * dan, tai kho phan biet duoc diem chuyen doi.
+     */
     private fun popOlaOutput(): Float {
         val idx = olaReadPos
         val weight = olaWeight[idx]
