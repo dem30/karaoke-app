@@ -105,6 +105,16 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // PITCH_DETECT_HOP_SAMPLES len 2048), nen 50 lan ~= 1 lan log moi
         // ~2.3s - du day de doc, khong spam logcat.
         private const val DIAGNOSTIC_LOG_EVERY_N_UPDATES = 50
+
+        // ✅ MOI (fail-safe V3 - bypass PSOLA khi ratio~1, xem KDoc process()
+        // va popBypassSample()): sai so cho phep de coi currentShiftRatio la
+        // "dung 1.0" (khong can dich cao do). Dat = 0.0005 (0.05%) - du nho
+        // de khong bao gio bypass nham 1 gia tri ratio thuc su can dich (vi
+        // du 1.005 - lech ~5 cent, van nghe ro), nhung du "co gian" de khong
+        // bi rung/nhap nhang qua lai bypass<->PSOLA lien tuc do sai so lam
+        // tron floating-point khi blended = 1.0 + (rawRatio - 1.0) * strength
+        // ra dung 1.0 hoac rat gan 1.0.
+        private const val RATIO_BYPASS_EPSILON = 0.0005
     }
 
     // ✅ MOI (chan doan): dem so lan updatePitchAndRatio() da chay (ke ca
@@ -178,6 +188,23 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
      * Xu ly TAI CHO (in-place) 1 khoi PCM 16-bit mono. Goi hang dau tien trong chuoi xu ly cua
      * VocalChannel (TRUOC AutoGain/EQ/Compressor/Echo) - vi pitch-shift can tin hieu giong hat cang
      * THO cang tot de do cao do chinh xac, chua bi EQ/nen lam lech pho tan.
+     *
+     * ✅ MOI (fail-safe V3 - bypass PSOLA khi ratio~1): da xac nhan qua chan
+     * doan thuc te la ratio=1.000 (bao gom ca correctionStrength=0) KHONG co
+     * nghia PSOLA tai tao ra dung tin hieu goc - code truoc day van chay
+     * advanceSynthesisClockAndMaybeTriggerGrain()/popOlaOutput() LIEN TUC bat
+     * ke ratio, tuc la van cat grain 2 chu ky tu [history] roi Hann+OLA lai
+     * moi lan, du ratio=1. Vi grain duoc cat theo "so mau" (samplesAgo=
+     * grainLength-k) chu KHONG dong bo theo pha/pitch-mark that su cua song
+     * (xem giai thich chi tiet o cho goi PitchCorrector nay), cac grain lien
+     * tiep co the bat dau o pha khac nhau => waveform sau OLA khong noi dung
+     * pha => nghe "rè/nhoe/rung/metallic" NGAY CA KHI khong can dich cao do
+     * chut nao. Bay gio: khi correctionStrength=0 HOAC currentShiftRatio da
+     * ~1.0 (xem RATIO_BYPASS_EPSILON), BO QUA HOAN TOAN duong PSOLA (khong
+     * goi triggerGrain, khong cong don OLA) - xuat thang mau mic goc tu
+     * [history] (qua popBypassSample(), giu dung processingDelaySamples nhu
+     * duong PSOLA de khop timing khi chuyen qua lai 2 mode). Vua het rè o
+     * ratio=1, vua nhe CPU hon (bo hang loat phep Hann/OLA khi khong can).
      */
     fun process(buffer: ShortArray, size: Int) {
         if (!enabled) return
@@ -189,9 +216,16 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
                 updatePitchAndRatio()
             }
 
-            advanceSynthesisClockAndMaybeTriggerGrain()
+            val bypassPsola = correctionStrength <= 0f ||
+                abs(currentShiftRatio - 1.0) < RATIO_BYPASS_EPSILON
 
-            val outSample = popOlaOutput()
+            val outSample = if (bypassPsola) {
+                popBypassSample()
+            } else {
+                advanceSynthesisClockAndMaybeTriggerGrain()
+                popOlaOutput()
+            }
+
             buffer[i] = outSample.roundToInt()
                 .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                 .toShort()
@@ -439,6 +473,32 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
      * de gay tieng "ret/click" nua - chuyen tiep giua PSOLA va mic goc muot
      * dan, tai kho phan biet duoc diem chuyen doi.
      */
+    /**
+     * ✅ MOI (fail-safe V3, xem KDoc process()): duong "tat PSOLA" - dung khi
+     * correctionStrength=0 hoac currentShiftRatio~1.0. Van "tien" olaReadPos
+     * va don sach olaBuffer/olaWeight tai vi tri do - Y HET nhung gi
+     * popOlaOutput() lam - de dam bao neu sau nay PSOLA duoc kich hoat tro
+     * lai (nguoi hat lech tone/ratio!=1), vi tri do trong OLA buffer khong
+     * con "rac" cua lan chay truoc (tranh tieng rac luc chuyen mode). Diem
+     * khac biet duy nhat: KHONG doc/chuan hoa olaBuffer (khong co PSOLA sample
+     * nao ca vi triggerGrain() khong duoc goi trong mode nay), ma tra thang
+     * mau mic goc tu [history], dung [processingDelaySamples] y het duong
+     * PSOLA dung (qua totalSamplesWritten - 1 - totalSamplesPopped) de 2 luong
+     * ra co CUNG do tre - tranh buoc nhay/click khi bat/tat correctionStrength
+     * hoac khi ratio dao dong qua lai quanh 1.0 giua cac lan updatePitchAndRatio().
+     */
+    private fun popBypassSample(): Float {
+        val idx = olaReadPos
+        olaBuffer[idx] = 0f
+        olaWeight[idx] = 0f
+        olaReadPos = (olaReadPos + 1) % olaCapacity
+
+        val samplesAgo = (totalSamplesWritten - 1 - totalSamplesPopped).coerceAtLeast(0L).toInt()
+        val sample = historySamplesAgo(samplesAgo)
+        totalSamplesPopped++
+        return sample
+    }
+
     private fun popOlaOutput(): Float {
         val idx = olaReadPos
         val weight = olaWeight[idx]
