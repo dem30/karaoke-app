@@ -3,7 +3,9 @@ package com.karaokeapp.audio.mixer
 import com.karaokeapp.audio.processor.AutoGainControl
 import com.karaokeapp.audio.processor.Compressor
 import com.karaokeapp.audio.processor.EchoReverb
+import com.karaokeapp.audio.processor.FeedbackSuppressor
 import com.karaokeapp.audio.processor.Limiter
+import com.karaokeapp.audio.processor.PlateReverb
 import com.karaokeapp.audio.processor.VocalProcessor
 import kotlin.math.max
 import kotlin.math.min
@@ -37,8 +39,10 @@ import kotlin.math.min
  * nguoi dung (giam am luong loa / dua mic ra xa loa / dung tai nghe) - dung
  * tinh than ghi chu san co truoc day trong LowLatencyMixer (VOCAL_GAIN cu).
  *
- * Thu tu xu ly: AutoGain -> EQ -> Compressor -> Echo -> Volume (thu cong) ->
- * Limiter (an toan, luon BAT, khong the tat qua UI - khac voi 4 buoc tren).
+ * Thu tu xu ly: AutoGain -> Anti-Feedback (flag, TAT mac dinh) -> EQ ->
+ * Compressor -> Echo -> Reverb (flag, TAT mac dinh) -> Volume (thu cong) ->
+ * Limiter (an toan, luon BAT, khong the tat qua UI - khac voi cac buoc
+ * tren).
  *
  * ✅ CAP NHAT (dong bo tham so Compressor moi - xem giai thich day du trong
  * Compressor.kt): threshold -18dB -> -25dB, ratio 3.0 -> 3.5, makeupGainDb
@@ -47,6 +51,17 @@ import kotlin.math.min
  * MINH (thresholdDb=..., ratio=..., makeupGainDb=...), nen SE GHI DE len
  * moi thay doi default trong Compressor.kt neu khong duoc cap nhat DONG
  * THOI o day. Day la ly do 2 file nay LUON phai sua cung luc.
+ *
+ * ✅ MOI (dot cuoi ke hoach cai thien chat am - xem canh bao chi tiet trong
+ * KDoc cua tung file): them 2 module moi, CA HAI MAC DINH TAT (co the bat
+ * qua feedbackSuppressorEnabled/reverbEnabled):
+ * - feedbackSuppressor (FeedbackSuppressor.kt): dich tan +5Hz chong hu vat
+ *   ly - he so allpass CHUA duoc kiem chung doc lap, phai nghe thu rieng
+ *   truoc khi bat mac dinh cho nguoi dung that.
+ * - reverb (PlateReverb.kt): Freeverb 8-comb+4-allpass, tao duoi vang. Chay
+ *   SAU echo trong chuoi - vi CA HAI deu tao duoi vang, bat dong thoi de
+ *   dan toi "vang chong vang"; nen test rieng (tam tat echo) truoc khi
+ *   quyet dinh dung song song ca 2.
  */
 class VocalChannel(
     sampleRate: Int = 44100,
@@ -58,6 +73,10 @@ class VocalChannel(
     // vat ly cua May A - gio la mac dinh CHUNG cho MOI nguon (local + remote)
     // nguoi dung co the dieu chinh tiep tu day qua setEQGains()/v.v.
     val autoGain = AutoGainControl(sampleRate = sampleRate)
+
+    /** ✅ MOI: chong hu chu dong (dich +5Hz) - xem canh bao ve do tin cay he so trong FeedbackSuppressor.kt. */
+    val feedbackSuppressor = FeedbackSuppressor(sampleRate = sampleRate, shiftHz = 5.0f)
+
     val eq = VocalProcessor(sampleRate = sampleRate, bassGainDb = -2.0f, midGainDb = 1.0f, trebleGainDb = 3.0f)
 
     // ✅ SUA (dong bo voi Compressor.kt - xem KDoc dau class): -18.0f/3.0f/
@@ -73,6 +92,9 @@ class VocalChannel(
     )
     val echo = EchoReverb(sampleRate = sampleRate, delayMs = 200f, feedback = 0.38f, wetLevel = 0.32f, damping = 0.35f)
 
+    /** ✅ MOI: duoi vang Freeverb - xem canh bao ve "vang chong vang" voi echo trong PlateReverb.kt. */
+    val reverb = PlateReverb(sampleRate = sampleRate)
+
     // Limiter an toan CUOI chuoi - luon bat, chi chan clip PCM (KHONG phai
     // chong hu). Rieng cho tung kenh, khac voi finalMixLimiter (chay tren
     // TOAN BO ban mix, o LowLatencyMixer).
@@ -82,9 +104,16 @@ class VocalChannel(
     // tat AutoGain/EQ/Compressor/Echo neu muon nghe "giong that 100%" ma
     // khong can code lai gi ca.
     @Volatile var autoGainEnabled: Boolean = true
+
+    /** ✅ MOI: MAC DINH TAT - he so allpass chua kiem chung, phai nghe thu rieng truoc khi bat (xem KDoc FeedbackSuppressor.kt). */
+    @Volatile var feedbackSuppressorEnabled: Boolean = false
+
     @Volatile var eqEnabled: Boolean = true
     @Volatile var compressorEnabled: Boolean = true
     @Volatile var echoEnabled: Boolean = true
+
+    /** ✅ MOI: MAC DINH TAT - de tranh "vang chong vang" voi echo khi chua nghe thu rieng (xem KDoc PlateReverb.kt). */
+    @Volatile var reverbEnabled: Boolean = false
 
     /** He so am luong THU CONG (0f = cau hoan toan, 1f = binh thuong, 2f = to gap doi). Nguoi dung dieu chinh qua UI (slider). */
     @Volatile
@@ -98,8 +127,8 @@ class VocalChannel(
 
     /**
      * Xu ly 1 buffer PCM mono TAI CHO (in-place) - ap dung toan bo chuoi
-     * theo dung thu tu AutoGain -> EQ -> Compressor -> Echo -> Volume ->
-     * Limiter an toan.
+     * theo dung thu tu AutoGain -> Anti-Feedback (flag) -> EQ -> Compressor
+     * -> Echo -> Reverb (flag) -> Volume -> Limiter an toan.
      */
     fun process(buffer: ShortArray, size: Int) {
         if (size <= 0) return
@@ -110,9 +139,11 @@ class VocalChannel(
         }
 
         if (autoGainEnabled) autoGain.process(buffer, size)
+        if (feedbackSuppressorEnabled) feedbackSuppressor.process(buffer, size)
         if (eqEnabled) eq.process(buffer, size)
         if (compressorEnabled) compressor.process(buffer, size)
         if (echoEnabled) echo.process(buffer, size)
+        if (reverbEnabled) reverb.process(buffer, size)
 
         if (volume != 1.0f) {
             for (i in 0 until size) {
@@ -136,9 +167,11 @@ class VocalChannel(
     /** Reset TOAN BO state DSP (filter/compressor/echo/auto-gain/limiter) - KHONG doi volume/EQ/cong tac nguoi dung da chinh (giu nguyen y muon nguoi dung qua cac lan Bat/Tat Mixer Test). Goi khi bat dau lai 1 session de tranh tan du (click/pop) tu session truoc. */
     fun reset() {
         autoGain.reset()
+        feedbackSuppressor.reset()
         eq.reset()
         compressor.reset()
         echo.reset()
+        reverb.reset()
         safetyLimiter.reset()
     }
 }

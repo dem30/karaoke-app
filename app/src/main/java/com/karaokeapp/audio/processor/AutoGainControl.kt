@@ -33,12 +33,34 @@ class AutoGainControl(
     private val targetRms: Float = 6000f,
     /** Gain toi thieu/toi da cho phep - chan khuech dai/giam qua tay du muc tieu co lech xa. */
     private val minGain: Float = 0.4f,
-    private val maxGain: Float = 3.0f,
+    /**
+     * ✅ CAP NHAT (tang do nhay cho mic dien thoai UNPROCESSED, thuong rat
+     * be khi de mac dinh): tang tu 3.0 len 6.0 - TANG DAN, KHONG nhay thang
+     * len 18.0 nhu de xuat ban dau. Ly do khong dung 18.0: +25dB gain tran
+     * la rat lon, ket hop voi 1 cau hat to dot ngot se de bi cat cung ngay
+     * tai buoc AGC nay (truoc ca Compressor/Limiter phia sau) gay meo ro
+     * ret, va khuech dai manh ca noise floor cua mic khi nguoi dung hat nho/
+     * chua hat toi (tieng "xi" nen se tang ro). 6.0 (+15.5dB) la muc tang
+     * vua phai hon de thu nghiem truoc - neu van chua du nhay khi test thuc
+     * te, nen tang tiep tung nac (vd 6.0 -> 10.0) va nghe lai, khong nhay
+     * thang len muc cao nhat ngay.
+     */
+    private val maxGain: Float = 6.0f,
     /** Thoi gian dap ung khi CAN GIAM gain (tin hieu dang to hon muc tieu). */
     attackMs: Float = 400f,
     /** Thoi gian dap ung khi CAN TANG gain (tin hieu dang nho hon muc tieu) - co tinh cham hon attack, tranh "duoi" theo tung cau hat nho lam nghe khong tu nhien. */
     releaseMs: Float = 1500f,
-    /** Duoi muc RMS nay coi nhu im lang - khong dieu chinh gain (tranh gain "boi" len rat cao khi khong ai hat). */
+    /**
+     * Duoi muc RMS nay coi nhu im lang - khong dieu chinh gain (tranh gain
+     * "boi" len rat cao khi khong ai hat).
+     * ⚠️ GIU NGUYEN 60f (KHONG ha xuong 25f nhu de xuat ban dau): ha nguong
+     * nay xuong thap hon dong nghia AGC se coi ca tieng on nen/hoi tho nhe
+     * cua mic la "tin hieu that" va bat dau khuech dai no - ket hop voi
+     * maxGain da tang len 6.0, rui ro "boi" noise nen len ro ret se cao hon
+     * nhieu so voi khi con o maxGain=3.0. Giu nguyen 60f de chi thay doi 1
+     * bien so (maxGain) trong dot test nay, de dang xac dinh nguyen nhan
+     * neu nghe thay van de gi phat sinh.
+     */
     private val silenceRmsFloor: Float = 60f
 ) {
     private val attackCoeff = 1f - exp(-1f / (sampleRate * (attackMs / 1000f)))
