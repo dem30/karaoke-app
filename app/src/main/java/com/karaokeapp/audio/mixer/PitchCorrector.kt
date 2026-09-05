@@ -92,7 +92,20 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // la CPU khong kip deadline nua ma la ban chat PSOLA rut gon (xem
         // canh bao dau file) - luc do can doi sang thu vien pitch-shift
         // chuyen dung (SoundTouch/Rubber Band) thay vi tiep tuc nang so nay.
-        private const val PITCH_DETECT_HOP_SAMPLES = 4096
+        // ✅ SUA LAN 3 (ha lai ve 2048 - lan nang len 4096 lam giam tai CPU
+        // dung nhu ky vong, NHUNG gay delay pitch-shift phan ung cham ro ret
+        // khi hat live, nguoi dung xac nhan qua test thuc te). Ly do co the
+        // ha lai an toan: goc re thuc su cua "ret ret" (main thread bi chan
+        // dong bo boi mic.startCapture()+OutputRouter cung luc mixer thread
+        // vua start - xem serviceScope.launch bao quanh mic.startCapture()
+        // trong PlaybackCaptureService.startMixerTestInternal()) DA duoc xu
+        // ly o tang khac, khong con phu thuoc vao hang so nay de "an" trieu
+        // chung nua. 2048 mau (~46ms @ 44100Hz, ~21 lan/giay) can bang tot
+        // hon giua do tre pitch-shift va tai CPU so voi 4096 (~93ms, ~11
+        // lan/giay). Neu sau khi ha van con nghe "ret ret" (khac voi delay),
+        // nghia la CPU that su khong kip - luc do moi can nang lai hoac doi
+        // sang thu vien pitch-shift chuyen dung thay vi tiep tuc chinh so nay.
+        private const val PITCH_DETECT_HOP_SAMPLES = 2048
 
         // Buoc nhay khi do THO truoc khi tinh chinh +-COARSE_STEP quanh ung vien tot nhat.
         private const val COARSE_STEP = 2
