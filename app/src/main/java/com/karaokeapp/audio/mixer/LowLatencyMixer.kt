@@ -168,6 +168,19 @@ class LowLatencyMixer(
         private const val SOFT_KNEE_THRESHOLD_ABS = 28000f
         private const val SOFT_KNEE_CEILING_ABS = 32767f
 
+        // ✅ SUA (giam nguong tu 80ms xuong 60ms - xem giai thich day du o
+        // KDoc mixedOutBuffer/vocalChunksReuse ben duoi): 80ms (=2x CHUNK_MS)
+        // qua long, CHI bat duoc cac cu giat CPU lon (YouTube decode nang -
+        // vd 94ms/121ms da thay trong log thuc te), nhung BO LOT hoan toan
+        // hien tuong chu ky mixer chay THUONG TRUC ~50ms (tren muc tieu
+        // 40ms nhung duoi 80ms) do cap phat heap lien tuc trong vong lap
+        // (ShortArray moi + List moi moi ~40ms) gay ap luc GC nhe nhung DEU
+        // DAN - chinh day la nguyen nhan khien vocal ring buffer (tran
+        // 200ms) LUON nam sat/cham tran thay vi o muc thap nhu ky vong. Sau
+        // khi bo cap phat trong vong lap (xem duoi), 60ms (=1.5x CHUNK_MS)
+        // du "rong tay" cho jitter nho binh thuong, nhung du "chat" de vua
+        // bat lai neu hien tuong nay tai xuat hien.
+        //
         // ✅ MOI (chan doan tieng "ret/giat" - CPU hay khong): neu 1 vong
         // lap mixer (ly thuyet moi ~CHUNK_MS=40ms/lan) thuc te mat LAU HON
         // nguong nay de hoan tat 1 chu ky, nghia la thread mixer (du da
@@ -177,7 +190,7 @@ class LowLatencyMixer(
         // nhanh hon tieu thu). 80ms = gap doi CHUNK_MS, du bat thuong de
         // dang tin, du "long tay" de khong bao dong gia do jitter nho binh
         // thuong cua scheduler.
-        private const val MIXER_LOOP_DELAY_WARN_THRESHOLD_MS = 80L
+        private const val MIXER_LOOP_DELAY_WARN_THRESHOLD_MS = 60L
 
         // ✅ SUA (fix mat gia tri khi Mixer Test bi tat/bat lai tu dong - xem
         // giai thich day du o KDoc dau class): chuyen tu INSTANCE property
@@ -219,14 +232,33 @@ class LowLatencyMixer(
      * don vocal, cung khong con coerceIn() cung ngay sau khi cong voi
      * music - CA HAI gia tri trung gian duoc giu Float, CHI nen mem 1 LAN
      * DUY NHAT (qua softKnee()) ngay truoc khi chuyen ve Short.
+     *
+     * ✅ SUA (giam do tre ~10-15ms/chu ky - xem KDoc day du o
+     * MIXER_LOOP_DELAY_WARN_THRESHOLD_MS o tren): TRUOC DAY ham nay cap
+     * phat 1 "ShortArray(outLength)" MOI moi lan goi (~25 lan/giay). Rieng
+     * le thi khong dang ke, nhung day la 1 trong 3 diem cap phat heap lap
+     * lai trong CHINH vong lap mixer (cung voi vocalChunks/vocalLens truoc
+     * day - xem sua doi o start()) - cong don lai tao ap luc GC DEU DAN
+     * tren thread URGENT_AUDIO, la nguyen nhan chinh khien chu ky mixer
+     * thuc te ~50ms thay vi 40ms nhu thiet ke (da xac nhan qua log
+     * maxLoopGap=50-55ms xay ra LIEN TUC, khong chi luc CpuJitterProbe bao
+     * dong), khien vocal ring buffer (tran 200ms) LUON o gan/cham tran.
+     *
+     * Sua: ghi thang vao "mixedOutBuffer" (field cua instance, cap phat 1
+     * LAN DUY NHAT luc khoi tao class) thay vi tao moi moi lan goi. AN
+     * TOAN vi mixMultiSource() CHI duoc goi tu 1 thread duy nhat
+     * (mixerDispatcher, single-thread executor) va gia tri tra ve duoc
+     * outputRouter.write() tieu thu NGAY LAP TUC (dong bo, cung 1 vong
+     * lap) truoc khi lan goi mixMultiSource() tiep theo co the ghi de.
      */
+    private val mixedOutBuffer = ShortArray(CHUNK_SIZE)
+
     private fun mixMultiSource(
         music: ShortArray, musicLen: Int, musicVolumeSnapshot: Float,
         vocalChunks: List<ShortArray>, vocalLens: List<Int>,
         masterVolumeSnapshot: Float,
         outLength: Int
     ): ShortArray {
-        val out = ShortArray(outLength)
         for (i in 0 until outLength) {
             val m = if (i < musicLen) music[i] * musicVolumeSnapshot else 0f
 
@@ -243,14 +275,21 @@ class LowLatencyMixer(
             // Luoi an toan CUOI CUNG (chan wraparound Float->Short thuan so
             // hoc) - BAT BUOC giu lai, xem giai thich o KDoc softKnee().
             sum = sum.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
-            out[i] = sum.toInt().toShort()
+            mixedOutBuffer[i] = sum.toInt().toShort()
         }
-        return out
+        return mixedOutBuffer
     }
 
     private val musicBuffer = ShortRingBuffer(RING_BUFFER_CAPACITY)
     private val vocalBuffers = ConcurrentHashMap<String, ShortRingBuffer>()
     private val vocalScratchBuffers = ConcurrentHashMap<String, ShortArray>()
+
+    // ✅ MOI (giam do tre - xem KDoc mixedOutBuffer o tren): 2 danh sach
+    // TAI SU DUNG cho vocal chunks/lens moi vong lap mixer, thay vi
+    // "vocalBuffers.keys.toList()" + 2 ArrayList MOI moi ~40ms nhu truoc.
+    // clear() khong cap phat lai vung nho, chi dat size ve 0.
+    private val vocalChunksReuse = ArrayList<ShortArray>()
+    private val vocalLensReuse = ArrayList<Int>()
 
     private var mixerJob: Job? = null
 
@@ -323,6 +362,14 @@ class LowLatencyMixer(
             var maxIterationGapMsInWindow = 0L
             var delayedIterationCountInWindow = 0
 
+            // ✅ MOI (thay MIXER_LOOP_DELAY_WARN_THRESHOLD_MS chi bat "dinh",
+            // 2 bien nay tinh CHU KY TRUNG BINH thuc te trong window 3s -
+            // gia tri nay moi la thu quyet dinh vocal ring buffer day hay
+            // khong, vi backlog tich luy theo TRUNG BINH chu ky, khong phai
+            // theo dinh cao nhat thinh thoang xay ra).
+            var sumIterationGapMsInWindow = 0L
+            var iterationCountInWindow = 0
+
             while (running) {
                 var waitedMs = 0L
 
@@ -351,6 +398,8 @@ class LowLatencyMixer(
                     )
                 }
                 if (gapExcludingWait > maxIterationGapMsInWindow) maxIterationGapMsInWindow = gapExcludingWait
+                sumIterationGapMsInWindow += gapExcludingWait
+                iterationCountInWindow++
 
                 val musicLen = musicBuffer.drain(musicChunk, CHUNK_SIZE)
 
@@ -373,15 +422,19 @@ class LowLatencyMixer(
                 }
                 wasMusicSilentAtMixer = musicSilentNow
 
-                val sourceIds = vocalBuffers.keys.toList()
-                val vocalChunks = ArrayList<ShortArray>(sourceIds.size)
-                val vocalLens = ArrayList<Int>(sourceIds.size)
-                for (sourceId in sourceIds) {
-                    val ringBuffer = vocalBuffers[sourceId] ?: continue
+                // ✅ SUA (giam do tre - xem KDoc mixedOutBuffer/vocalChunksReuse
+                // o tren): KHONG con "vocalBuffers.keys.toList()" (cap phat 1
+                // List moi) + 2 ArrayList moi moi vong lap - duyet TRUC TIEP
+                // vocalBuffers.entries (ConcurrentHashMap duyet an toan dong
+                // thoi, khong can copy snapshot ra List rieng) va ghi vao 2
+                // list TAI SU DUNG, chi clear() truoc khi dung.
+                vocalChunksReuse.clear()
+                vocalLensReuse.clear()
+                for ((sourceId, ringBuffer) in vocalBuffers) {
                     val scratch = getVocalScratch(sourceId)
                     val len = ringBuffer.drain(scratch, CHUNK_SIZE)
-                    vocalChunks.add(scratch)
-                    vocalLens.add(len)
+                    vocalChunksReuse.add(scratch)
+                    vocalLensReuse.add(len)
                 }
 
                 // Chup gia tri volume tai THOI DIEM mix (co the doi giua
@@ -393,7 +446,7 @@ class LowLatencyMixer(
 
                 val mixed = mixMultiSource(
                     musicChunk, musicLen, musicVolumeSnapshot,
-                    vocalChunks, vocalLens,
+                    vocalChunksReuse, vocalLensReuse,
                     masterVolumeSnapshot,
                     CHUNK_SIZE
                 )
@@ -402,6 +455,10 @@ class LowLatencyMixer(
 
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastQueueLogTime >= QUEUE_LOG_INTERVAL_MS) {
+                    // ✅ SUA: sourceIds gio CHI duoc tinh O DAY (moi 3 giay),
+                    // khong con o hot path moi ~40ms - 1 lan copy List moi
+                    // 3 giay khong dang ke, khac han 1 lan moi 40ms.
+                    val sourceIds = vocalBuffers.keys.toList()
                     val musicMs = musicBuffer.size() * 1000L / SAMPLE_RATE
                     val vocalSummary = sourceIds.joinToString(", ") { id ->
                         val ms = (vocalBuffers[id]?.size() ?: 0) * 1000L / SAMPLE_RATE
@@ -415,15 +472,25 @@ class LowLatencyMixer(
                         val dropped = vocalBuffers[id]?.drainOverflowCount() ?: 0L
                         "$id=$dropped"
                     }
+                    // ✅ MOI: avgLoopGap - xem giai thich o KDoc khai bao
+                    // sumIterationGapMsInWindow/iterationCountInWindow o
+                    // tren. Day la so lieu QUAN TRONG NHAT de xac nhan sua
+                    // co hieu qua hay khong: truoc khi sua, gia tri nay se
+                    // ~50ms; neu sua dung, phai ve gan 40ms.
+                    val avgLoopGapMs = if (iterationCountInWindow > 0) {
+                        sumIterationGapMsInWindow / iterationCountInWindow
+                    } else 0L
                     logBoth(
                         "queue M=${musicMs}ms | Vocal[$vocalSummary] (waited=${waitedMs}ms lan cuoi) " +
-                            "| [ChanDoan] maxLoopGap=${maxIterationGapMsInWindow}ms " +
+                            "| [ChanDoan] avgLoopGap=${avgLoopGapMs}ms maxLoopGap=${maxIterationGapMsInWindow}ms " +
                             "soLanTre(>=${MIXER_LOOP_DELAY_WARN_THRESHOLD_MS}ms)=$delayedIterationCountInWindow " +
                             "| overflowDrop: music=$musicOverflow vocal[$vocalOverflowSummary]"
                     )
                     lastQueueLogTime = nowMs
                     maxIterationGapMsInWindow = 0L
                     delayedIterationCountInWindow = 0
+                    sumIterationGapMsInWindow = 0L
+                    iterationCountInWindow = 0
                 }
             }
             logBoth("Mixer loop da dung.")
