@@ -35,17 +35,21 @@ class AutoGainControl(
     private val minGain: Float = 0.4f,
     /**
      * ✅ CAP NHAT (tang do nhay cho mic dien thoai UNPROCESSED, thuong rat
-     * be khi de mac dinh): tang tu 3.0 len 6.0 - TANG DAN, KHONG nhay thang
-     * len 18.0 nhu de xuat ban dau. Ly do khong dung 18.0: +25dB gain tran
-     * la rat lon, ket hop voi 1 cau hat to dot ngot se de bi cat cung ngay
-     * tai buoc AGC nay (truoc ca Compressor/Limiter phia sau) gay meo ro
-     * ret, va khuech dai manh ca noise floor cua mic khi nguoi dung hat nho/
-     * chua hat toi (tieng "xi" nen se tang ro). 6.0 (+15.5dB) la muc tang
-     * vua phai hon de thu nghiem truoc - neu van chua du nhay khi test thuc
-     * te, nen tang tiep tung nac (vd 6.0 -> 10.0) va nghe lai, khong nhay
-     * thang len muc cao nhat ngay.
+     * be khi de mac dinh): tang tu 3.0 len 6.0, roi tiep tuc tang len 9.0
+     * sau khi test thuc te cho thay 6.0 VAN CHUA DU (RMS mic thuc te thuong
+     * ~800-2000, trong khi targetRms=6000 - can gain ~3-7.5x, 6.0 la
+     * nguong tren VUA DU nhung khong CHAM den target o nhung doan hat rat
+     * nho). TANG DAN tung nac, KHONG nhay thang len 18.0 nhu de xuat ban
+     * dau. Ly do khong dung 18.0: +25dB gain tran la rat lon, ket hop voi 1
+     * cau hat to dot ngot se de bi cat cung ngay tai buoc AGC nay (truoc ca
+     * Compressor/Limiter phia sau) gay meo ro ret, va khuech dai manh ca
+     * noise floor cua mic khi nguoi dung hat nho/chua hat toi. Neu 9.0 van
+     * chua du nhay, nen tang tiep tung nac (vd 9.0 -> 12.0) va nghe lai,
+     * khong nhay thang len muc cao nhat ngay - dac biet CAN THAN neu dang
+     * bat ca FeedbackSuppressor/Reverb cung luc, vi AGC cang cao cang cong
+     * them gain vao vong lap phan hoi am hoc (loa - mic), de hu hon.
      */
-    private val maxGain: Float = 6.0f,
+    private val maxGain: Float = 9.0f,
     /** Thoi gian dap ung khi CAN GIAM gain (tin hieu dang to hon muc tieu). */
     attackMs: Float = 400f,
     /** Thoi gian dap ung khi CAN TANG gain (tin hieu dang nho hon muc tieu) - co tinh cham hon attack, tranh "duoi" theo tung cau hat nho lam nghe khong tu nhien. */

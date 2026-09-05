@@ -27,6 +27,19 @@ import kotlin.math.min
  * la EchoReverb chay TRUOC no trong chuoi - 2 bo tao duoi vang noi tiep de
  * gay "vang chong vang" neu ca 2 cung bat, nen test PlateReverb RIENG
  * (tam tat EchoReverb) truoc khi quyet dinh dung ca 2).
+ *
+ * ⚠️ CANH BAO MOI (xac nhan qua test thuc te - nghe "hu" khi bat cung luc
+ * voi AGC/Compressor da tang gain): module nay CHAY TREN TIN HIEU MIC, nen
+ * neu loa va mic o gan nhau (vong lap am hoc mic-loa co san, du chua ro
+ * ret truoc do), MOI lan am thanh tu loa lot lai vao mic se di qua LAI
+ * TOAN BO chuoi VocalChannel (AutoGain -> ... -> Reverb) - he so
+ * "wet * X" cang lon, tong gain cong don qua moi vong lap cang cao, cang
+ * de dat/vuot dieu kien gay hu (tieu chuan Barkhausen: gain vong lap >= 1).
+ * Da HA he so nhan wet tu 2.2 xuong 1.3 va wet/roomSize mac dinh xuong thap
+ * hon (xem gia tri ben duoi) de giam bot phan dong gop cua module nay vao
+ * tong gain vong lap - nhung day KHONG thay the duoc giai phap vat ly
+ * (giam am luong loa / dua mic ra xa loa / dung tai nghe). Neu van con hu
+ * sau khi ha he so, TAT module nay lai va uu tien xu ly vat ly truoc.
  */
 class PlateReverb(private val sampleRate: Int = 44100) {
 
@@ -65,13 +78,13 @@ class PlateReverb(private val sampleRate: Int = 44100) {
     private val allpasses = allPassDelays.map { AllPassFilter((it * sampleRate / 44100)) }
 
     /** Kich thuoc "phong" ao - anh huong thoi gian ngan (decay), 0f..1f, gan 1f = ngan rat lau. */
-    @Volatile var roomSize: Float = 0.76f
+    @Volatile var roomSize: Float = 0.6f
 
     /** Do "tat" cao tan trong duoi ngan - 0f..1f, cao hon = duoi ngan "toi"/am hon, tu nhien hon o phong lon. */
     @Volatile var damping: Float = 0.28f
 
     /** Ty le tin hieu da xu ly (wet) tron vao tin hieu goc (dry), 0f..1f. */
-    @Volatile var wet: Float = 0.30f
+    @Volatile var wet: Float = 0.20f
 
     fun process(buffer: ShortArray, size: Int) {
         for (i in 0 until size) {
@@ -87,7 +100,11 @@ class PlateReverb(private val sampleRate: Int = 44100) {
                 outAllPass = a.process(outAllPass)
             }
 
-            val mixed = (input * (1f - wet * 0.18f)) + (outAllPass * wet * 2.2f)
+            // ✅ HA he so nhan wet tu 2.2 xuong 1.3 (xem canh bao ve vong lap
+            // am hoc o KDoc dau class) - giam bot gain cong them tu module
+            // nay, danh doi lay duoi vang mong hon 1 chut de doi lay it rui
+            // ro hu hon khi mic/loa o gan nhau.
+            val mixed = (input * (1f - wet * 0.18f)) + (outAllPass * wet * 1.3f)
             val clamped = max(Short.MIN_VALUE.toFloat(), min(Short.MAX_VALUE.toFloat(), mixed))
             buffer[i] = clamped.toInt().toShort()
         }
