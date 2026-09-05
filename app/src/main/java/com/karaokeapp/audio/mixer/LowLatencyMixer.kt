@@ -43,6 +43,15 @@ private class ShortRingBuffer(private val capacity: Int) {
     // audio chinh).
     private val overflowCount = AtomicLong(0)
 
+    // ✅ MOI (fix "hang doi kep cung o tran 200ms vinh vien" - xem giai
+    // thich day du trong KDoc TARGET_QUEUE_SAMPLES o LowLatencyMixer): dem
+    // rieng so sample bi CHU DONG bo (trimToTarget()) de dua hang doi ve
+    // muc muc tieu - KHAC voi overflowCount (chi tang khi buffer da DAY
+    // CUNG, tuc da qua muon). Dem nay tang som hon, ngay khi hang doi vuot
+    // muc tieu (con truoc khi cham tran), giup thay ro mixer co dang phai
+    // "duoi kip" backlog thuong xuyen hay khong.
+    private val trimmedForLatencyCount = AtomicLong(0)
+
     @Synchronized
     fun push(src: ShortArray, size: Int) {
         for (i in 0 until size) {
@@ -73,15 +82,43 @@ private class ShortRingBuffer(private val capacity: Int) {
         return available
     }
 
+    /**
+     * ✅ MOI: neu hang doi dang GIU NHIEU HON targetSize sample, CHU DONG
+     * bo phan du thua NHAT (tien head len, khong copy ra ngoai - khac
+     * drain()) de dua hang doi VE DUNG targetSize NGAY LAP TUC, thay vi
+     * doi den khi buffer DAY HAN (capacity) roi moi bat dau bo tung sample
+     * 1 qua push() (qua muon - luc do do tre da o muc TOI DA cua buffer).
+     *
+     * Goi TRUOC drain() moi vong lap mixer - bien hang doi tu "leaky
+     * bucket chi tran o muc capacity" thanh "hoi tu ve 1 muc do tre muc
+     * tieu on dinh", giai quyet trieu chung "hang doi leo thang roi kep
+     * cung vinh vien o tran" da quan sat duoc qua log thuc te (backlog
+     * phat sinh 1 lan luc khoi dong/gian doan CPU ngan, nhung KHONG BAO
+     * GIO tu rut ngan lai vi drain() chi rut dung 1 CHUNK_SIZE/vong lap du
+     * dang ton dong bao nhieu).
+     */
+    @Synchronized
+    fun trimToTarget(targetSize: Int) {
+        if (count <= targetSize) return
+        val excess = count - targetSize
+        head = (head + excess) % capacity
+        count -= excess
+        trimmedForLatencyCount.addAndGet(excess.toLong())
+    }
+
     @Synchronized
     fun clear() {
         head = 0
         count = 0
         overflowCount.set(0)
+        trimmedForLatencyCount.set(0)
     }
 
     /** Lay va RESET ve 0 dem overflow tich luy tu lan doc truoc - dung cho log dinh ky (giong tinh than cac bo dem windowed khac trong PlaybackCaptureService). */
     fun drainOverflowCount(): Long = overflowCount.getAndSet(0)
+
+    /** Lay va RESET ve 0 dem sample bi trimToTarget() chu dong bo tu lan doc truoc. */
+    fun drainTrimmedForLatencyCount(): Long = trimmedForLatencyCount.getAndSet(0)
 }
 
 /**
@@ -160,6 +197,29 @@ class LowLatencyMixer(
         // ✅ Giam tu SAMPLE_RATE (1000ms) xuong ~200ms - chan do tre buffer
         // phinh to qua muc chap nhan duoc neu co tut lai tam thoi.
         private const val RING_BUFFER_CAPACITY = SAMPLE_RATE / 5
+
+        // ✅ MOI (fix "hang doi kep cung o tran 200ms vinh vien" - phat hien
+        // qua log thuc te SAU KHI da sua avgLoopGap ve dung ~40ms): avgLoopGap
+        // dung khong con nghia la hang doi se TU rut ngan lai - drain() van
+        // CHI rut dung CHUNK_SIZE/vong lap DU dang ton dong bao nhieu, nen
+        // 1 lan dong dat backlog (vd luc khoi dong 3 AudioRecord/AudioTrack
+        // gan nhu cung luc, hoac 1 lan thread MicInput/MusicInput bi delay
+        // ngan khien driver dong lai roi tra ve dồn dap) se lam hang doi leo
+        // thang va KET LUON o RING_BUFFER_CAPACITY (200ms), tu do chi con co
+        // che "bo mau cu khi day" (overflowCount) giu no o muc TRAN - khong
+        // bao gio tu co lai muc thap. Da xac nhan qua log: overflowDrop xay
+        // ra DEU DAN moi cua so 3s tu giay thu ~9 tro di, khong phai hien
+        // tuong hiem gap.
+        //
+        // Sua: moi vong lap, TRUOC khi drain() de mix, chu dong
+        // trimToTarget() ve muc nay (2 chunk = ~80ms, dung bang muc quan
+        // sat duoc luc he thong dang chay "khoe" o log dau tien) - bat ky
+        // luc nao hang doi vuot muc nay, phan du duoc bo NGAY, thay vi doi
+        // den khi cham RING_BUFFER_CAPACITY. RING_BUFFER_CAPACITY (200ms)
+        // van giu nguyen lam luoi an toan cho cac cu giat CPU that su lon,
+        // TARGET_QUEUE_SAMPLES moi la muc do tre "binh thuong" ma he thong
+        // se hoi tu ve.
+        private const val TARGET_QUEUE_SAMPLES = CHUNK_SIZE * 2
 
         const val SOURCE_LOCAL_MIC = "local_mic"
 
@@ -401,6 +461,12 @@ class LowLatencyMixer(
                 sumIterationGapMsInWindow += gapExcludingWait
                 iterationCountInWindow++
 
+                // ✅ MOI (xem KDoc TARGET_QUEUE_SAMPLES o tren): chu dong bo
+                // phan ton dong VUOT muc tieu TRUOC khi rut CHUNK_SIZE de mix
+                // - neu khong lam buoc nay, hang doi se KHONG BAO GIO tu rut
+                // ngan lai du avgLoopGap dung 40ms, vi drain() ben duoi luon
+                // chi lay dung 1 CHUNK_SIZE bat ke dang ton dong bao nhieu.
+                musicBuffer.trimToTarget(TARGET_QUEUE_SAMPLES)
                 val musicLen = musicBuffer.drain(musicChunk, CHUNK_SIZE)
 
                 var musicAbs = 0L
@@ -431,6 +497,7 @@ class LowLatencyMixer(
                 vocalChunksReuse.clear()
                 vocalLensReuse.clear()
                 for ((sourceId, ringBuffer) in vocalBuffers) {
+                    ringBuffer.trimToTarget(TARGET_QUEUE_SAMPLES)
                     val scratch = getVocalScratch(sourceId)
                     val len = ringBuffer.drain(scratch, CHUNK_SIZE)
                     vocalChunksReuse.add(scratch)
@@ -472,6 +539,18 @@ class LowLatencyMixer(
                         val dropped = vocalBuffers[id]?.drainOverflowCount() ?: 0L
                         "$id=$dropped"
                     }
+                    // ✅ MOI: dem sample bi trimToTarget() chu dong bo (xem
+                    // KDoc TARGET_QUEUE_SAMPLES) - neu con so nay > 0 thuong
+                    // xuyen, nghia la backlog VAN dang phat sinh lien tuc o
+                    // phia san xuat (MicInput/MusicInput), chi la gio duoc
+                    // don dep SOM (o muc ~80ms) thay vi de leo tan RING_BUFFER_
+                    // CAPACITY (200ms) nhu truoc - can tim tiep nguyen nhan
+                    // phia san xuat neu van thay so nay cao lien tuc.
+                    val musicTrimmed = musicBuffer.drainTrimmedForLatencyCount()
+                    val vocalTrimmedSummary = sourceIds.joinToString(", ") { id ->
+                        val trimmed = vocalBuffers[id]?.drainTrimmedForLatencyCount() ?: 0L
+                        "$id=$trimmed"
+                    }
                     // ✅ MOI: avgLoopGap - xem giai thich o KDoc khai bao
                     // sumIterationGapMsInWindow/iterationCountInWindow o
                     // tren. Day la so lieu QUAN TRONG NHAT de xac nhan sua
@@ -484,7 +563,8 @@ class LowLatencyMixer(
                         "queue M=${musicMs}ms | Vocal[$vocalSummary] (waited=${waitedMs}ms lan cuoi) " +
                             "| [ChanDoan] avgLoopGap=${avgLoopGapMs}ms maxLoopGap=${maxIterationGapMsInWindow}ms " +
                             "soLanTre(>=${MIXER_LOOP_DELAY_WARN_THRESHOLD_MS}ms)=$delayedIterationCountInWindow " +
-                            "| overflowDrop: music=$musicOverflow vocal[$vocalOverflowSummary]"
+                            "| overflowDrop: music=$musicOverflow vocal[$vocalOverflowSummary] " +
+                            "| trimToTarget: music=$musicTrimmed vocal[$vocalTrimmedSummary]"
                     )
                     lastQueueLogTime = nowMs
                     maxIterationGapMsInWindow = 0L
