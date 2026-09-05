@@ -206,17 +206,38 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
     // "kinh dien" (analysis epoch va synthesis epoch la 2 thu khac nhau).
     private var analysisPhase = 0.0 // "so mau" con lai truoc khi trich 1 grain PHAN TICH moi tu history
 
+    // ✅ MOI (chan GC tren audio thread - xem KDoc obtainAnalysisGrain()): moi
+    // grain phan tich la 1 object nay, GIU 1 mang FloatArray CO SAN kich
+    // thuoc co dinh (maxPeriodSamples*2, du lon cho MOI gia tri
+    // currentPeriodSamples co the co) thay vi 1 FloatArray moi cap phat rieng
+    // moi lan trich - object nay duoc TAI SU DUNG qua [analysisGrainFreePool]
+    // thay vi bi cap phat lai moi chu ky cao do.
+    private class AnalysisGrain(maxLength: Int) {
+        val samples = FloatArray(maxLength)
+        var length = 0
+    }
+
     // Hang doi FIFO cac grain da trich (chua windowed) dang cho duoc dong ho
     // TONG HOP tieu thu - xem MAX_PENDING_ANALYSIS_GRAINS o tren (chan phinh
     // to khi ratio<1) va lastAnalysisGrain o duoi (chan can khi ratio>1).
-    private val pendingAnalysisGrains = ArrayDeque<FloatArray>()
+    private val pendingAnalysisGrains = ArrayDeque<AnalysisGrain>()
+
+    // ✅ MOI (chan GC tren audio thread): cac AnalysisGrain KHONG con can dung
+    // (da bi "bo" do hang doi qua day, hoac da bi thay the boi grain moi hon
+    // trong lastAnalysisGrain) duoc tra VE DAY thay vi bi vut cho GC don -
+    // obtainAnalysisGrain() se uu tien lay lai tu day truoc khi cap phat moi.
+    // Sau vai chu ky "khoi dong" dau tien, module nay se KHONG cap phat them
+    // FloatArray nao nua trong suot vong doi - loai bo hoan toan nguy co GC
+    // pause gay "mat tieng/ret ret" tren CPU yeu (dung moi lo ngai da ghi o
+    // phan GIOI HAN THAT SU dau file).
+    private val analysisGrainFreePool = ArrayDeque<AnalysisGrain>()
 
     // Grain PHAN TICH gan nhat da duoc tieu thu - dung de "dung lai" (tai su
     // dung) khi dong ho TONG HOP chay nhanh hon dong ho PHAN TICH (ratio>1,
     // dich cao do LEN: synthesisHop < currentPeriodSamples => can nhieu grain
     // hon so voi so grain moi duoc trich trong cung 1 khoang thoi gian) -
     // dung ban chat cua viec nang cao do bang PSOLA: phai "lap lai" 1 chu ky.
-    private var lastAnalysisGrain: FloatArray? = null
+    private var lastAnalysisGrain: AnalysisGrain? = null
 
     private var synthesisPhase = 0.0 // "so mau" con lai truoc khi dat grain tiep theo vao OLA
 
@@ -311,6 +332,7 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         currentShiftRatio = 1.0
         analysisPhase = 0.0
         pendingAnalysisGrains.clear()
+        analysisGrainFreePool.clear()
         lastAnalysisGrain = null
         synthesisPhase = 0.0
     }
@@ -475,16 +497,32 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
             pendingAnalysisGrains.addLast(extractAnalysisGrain())
             // Chan phinh to hang doi khi ratio<1 (xem MAX_PENDING_ANALYSIS_GRAINS) -
             // bo cac grain CU nhat truoc (giu grain moi nhat, sat voi "hien tai" nhat).
+            // Grain bi bo o day CHUA TUNG duoc gan vao lastAnalysisGrain (chi gan
+            // luc bi tieu thu boi dong ho TONG HOP ben duoi) nen luon an toan de
+            // tra ve pool tai su dung ngay, khong so trung voi object dang "song".
             while (pendingAnalysisGrains.size > MAX_PENDING_ANALYSIS_GRAINS) {
-                pendingAnalysisGrains.removeFirst()
+                analysisGrainFreePool.addLast(pendingAnalysisGrains.removeFirst())
             }
         }
     }
 
-    private fun extractAnalysisGrain(): FloatArray {
+    /**
+     * ✅ MOI (chan GC tren audio thread): thay vi `FloatArray(grainLength)`
+     * (cap phat moi MOI LAN goi - ham nay chay ~1 lan/chu ky cao do, tuc
+     * ~130-900 lan/giay tuy cao do giong hat), lay lai 1 [AnalysisGrain] tu
+     * [analysisGrainFreePool] neu co (con trong nay tu cac grain da dung
+     * xong o noi khac), chi cap phat moi khi pool rong (chi xay ra vai lan
+     * dau tien luc khoi dong, roi dung han).
+     */
+    private fun obtainAnalysisGrain(): AnalysisGrain {
+        return analysisGrainFreePool.removeFirstOrNull() ?: AnalysisGrain(maxPeriodSamples * 2)
+    }
+
+    private fun extractAnalysisGrain(): AnalysisGrain {
         val grainHalfLength = currentPeriodSamples.coerceIn(minPeriodSamples, maxPeriodSamples)
         val grainLength = grainHalfLength * 2
-        val grain = FloatArray(grainLength)
+        val grain = obtainAnalysisGrain()
+        grain.length = grainLength
 
         // Tam grain lay tu lich su: k=0 la phan CU nhat cua grain (samplesAgo=grainLength, con nam
         // trong qua khu), k=grainLength-1 la phan MOI nhat (samplesAgo=1, van la qua khu gan "hien
@@ -492,7 +530,7 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // toan da giai thich o dau file).
         for (k in 0 until grainLength) {
             val samplesAgo = grainLength - k
-            grain[k] = historySamplesAgo(samplesAgo)
+            grain.samples[k] = historySamplesAgo(samplesAgo)
         }
         return grain
     }
@@ -515,24 +553,32 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
             val synthesisHop = currentPeriodSamples / currentShiftRatio
             synthesisPhase += synthesisHop
 
-            val grain = if (pendingAnalysisGrains.isNotEmpty()) {
-                pendingAnalysisGrains.removeFirst()
+            val freshGrain = pendingAnalysisGrains.removeFirstOrNull()
+            val grain = if (freshGrain != null) {
+                // Grain CU (neu co) vua bi thay the boi grain moi nay - da duoc
+                // dat vao OLA xong tu lan tieu thu truoc, khong con ai can nua,
+                // tra ve pool de obtainAnalysisGrain() tai su dung (chan GC).
+                val previous = lastAnalysisGrain
+                if (previous != null && previous !== freshGrain) {
+                    analysisGrainFreePool.addLast(previous)
+                }
+                lastAnalysisGrain = freshGrain
+                freshGrain
             } else {
                 lastAnalysisGrain
             }
             if (grain != null) {
-                lastAnalysisGrain = grain
                 placeGrainInOla(grain, synthesisHop.roundToInt().coerceAtLeast(1))
             }
         }
     }
 
-    private fun placeGrainInOla(grain: FloatArray, synthesisHopSamples: Int) {
-        val grainLength = grain.size
+    private fun placeGrainInOla(grain: AnalysisGrain, synthesisHopSamples: Int) {
+        val grainLength = grain.length
         for (k in 0 until grainLength) {
             val window = hannWindow(k, grainLength)
             val outIdx = (olaWritePos + k) % olaCapacity
-            olaBuffer[outIdx] += grain[k] * window
+            olaBuffer[outIdx] += grain.samples[k] * window
             olaWeight[outIdx] += window
         }
 
