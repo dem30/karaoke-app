@@ -319,6 +319,25 @@ class PlaybackCaptureService : Service() {
 
         fun isChannelEchoEnabled(sourceId: String): Boolean = getOrCreateVocalChannel(sourceId).echoEnabled
 
+        // ✅ MOI: 2 module Phase 4 dot cuoi (Anti-Feedback dich tan +5Hz,
+        // Reverb Freeverb) - MAC DINH TAT trong VocalChannel (xem canh bao
+        // trong FeedbackSuppressor.kt/PlateReverb.kt), them getter/setter
+        // dung y het pattern 4 cong tac AutoGain/EQ/Compressor/Echo o tren
+        // de UI (MixerBoardUiBuilder) co the doc/ghi.
+        fun setChannelFeedbackSuppressorEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).feedbackSuppressorEnabled = enabled
+        }
+
+        fun isChannelFeedbackSuppressorEnabled(sourceId: String): Boolean =
+            getOrCreateVocalChannel(sourceId).feedbackSuppressorEnabled
+
+        fun setChannelReverbEnabled(sourceId: String, enabled: Boolean) {
+            getOrCreateVocalChannel(sourceId).reverbEnabled = enabled
+        }
+
+        fun isChannelReverbEnabled(sourceId: String): Boolean =
+            getOrCreateVocalChannel(sourceId).reverbEnabled
+
         /**
          * He so am luong cho rieng nhac nen (0f..2f).
          * ✅ SUA: goi thang vao LowLatencyMixer.musicVolume (companion/static),

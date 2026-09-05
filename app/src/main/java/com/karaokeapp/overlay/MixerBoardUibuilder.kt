@@ -109,7 +109,7 @@ object MixerBoardUiBuilder {
         }
     }
 
-    /** Section 1 kenh vocal (mic tai cho hoac 1 clientId remote) - Mute, Volume, 3 EQ, 4 toggle - doc gia tri HIEN TAI tu Service de khoi tao dung. */
+    /** Section 1 kenh vocal (mic tai cho hoac 1 clientId remote) - Mute, Volume, 3 EQ, 6 toggle (AutoGain/EQ/Compressor/Echo/Anti-Feedback/Reverb - 2 cai cuoi MAC DINH TAT) - doc gia tri HIEN TAI tu Service de khoi tao dung. */
     fun buildChannelSection(context: Context, sourceId: String): LinearLayout {
         return LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -181,6 +181,24 @@ object MixerBoardUiBuilder {
                 })
             }
             addView(toggleRow2)
+
+            // ✅ MOI: 2 module dot cuoi, MAC DINH TAT (xem canh bao trong
+            // FeedbackSuppressor.kt/PlateReverb.kt) - nguoi dung tu bat de
+            // nghe thu, khong bat san cho nguoi dung that.
+            val toggleRow3 = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(CheckBox(context).apply {
+                    text = "Anti-Feedback"
+                    isChecked = PlaybackCaptureService.isChannelFeedbackSuppressorEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelFeedbackSuppressorEnabled(sourceId, checked) }
+                })
+                addView(CheckBox(context).apply {
+                    text = "Reverb"
+                    isChecked = PlaybackCaptureService.isChannelReverbEnabled(sourceId)
+                    setOnCheckedChangeListener { _, checked -> PlaybackCaptureService.setChannelReverbEnabled(sourceId, checked) }
+                })
+            }
+            addView(toggleRow3)
         }
     }
 }
