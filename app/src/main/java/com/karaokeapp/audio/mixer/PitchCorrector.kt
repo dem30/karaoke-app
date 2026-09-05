@@ -81,18 +81,18 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // Do dai cua so phan tich autocorrelation (mau).
         private const val ANALYSIS_WINDOW_SAMPLES = 1024
 
-        // ✅ SUA (giam tai CPU tren audio thread - xac nhan qua chan doan
-        // thuc te tren thiet bi cua nguoi dung): truoc la 256 mau (~5.8ms @
-        // 44100Hz, ~172 lan/giay) - QUA DAY cho 1 vong autocorrelation O(cua
-        // so x so chu ky) chay TRUC TIEP tren audio thread, de lam audio
-        // thread khong kip deadline tren may CPU yeu (bieu hien: mat tieng/
-        // "ret ret" ngay khi bat enabled=true, xem log chan doan). Nang len
-        // 2048 mau (~46ms, ~21 lan/giay) - van du nhanh cho auto-tune "nhe"
-        // (giong hat khong doi cao do nhanh hon vai chuc ms), giam tai CPU
-        // manh. Neu may van yeu/con nghe "ret ret", thu nang tiep len 4096
-        // (~93ms, ~11 lan/giay) - danh doi: pitch-shift phan ung cham hon
-        // mot chut voi thay doi cao do dot ngot cua giong hat.
-        private const val PITCH_DETECT_HOP_SAMPLES = 2048
+        // ✅ SUA LAN 2 (van con "ret ret"/lag tren thiet bi thuc te nguoi dung
+        // dang dung, xac nhan sau khi da tung nang tu 256->2048): nang tiep
+        // len 4096 mau (~93ms @ 44100Hz, ~11 lan/giay vong autocorrelation
+        // O(cua_so x so_chu_ky) tren audio thread) - giam gan 1 nua tan suat
+        // so voi 2048, danh doi: pitch-shift phan ung cham hon mot chut voi
+        // thay doi cao do dot ngot cua giong hat (chap nhan duoc voi "auto-
+        // tune nhe", giong hat khong doi not nhanh hon ~100ms). Neu van con
+        // "ret ret" sau khi doi gia tri nay, nguyen nhan CHAC CHAN khong con
+        // la CPU khong kip deadline nua ma la ban chat PSOLA rut gon (xem
+        // canh bao dau file) - luc do can doi sang thu vien pitch-shift
+        // chuyen dung (SoundTouch/Rubber Band) thay vi tiep tuc nang so nay.
+        private const val PITCH_DETECT_HOP_SAMPLES = 4096
 
         // Buoc nhay khi do THO truoc khi tinh chinh +-COARSE_STEP quanh ung vien tot nhat.
         private const val COARSE_STEP = 2
@@ -157,9 +157,16 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
 
     /**
      * Muc do "ep" ve dung tone: 0f = giu nguyen giong that (khong chinh gi), 1f = ep het muc ve dung
-     * not gan nhat. Nen de o muc trung binh (0.4f-0.6f) de nghe tu nhien - 1f de test/nghe ro hieu ung.
+     * not gan nhat.
+     *
+     * ✅ SUA (giam mac dinh 0.5f -> 0.25f - xac nhan qua chan doan thuc te
+     * nguoi dung: ratio cang xa 1.0 (strength cang cao) thi re/kim loai cang
+     * ro, day la ban chat PSOLA rut gon o module nay, KHONG phai bug). Mac
+     * dinh thap de lan dau bat len nguoi dung nghe hieu ung nhe nhang, it re
+     * nhat co the, roi tu keo slider "Muc do ep tone" len neu muon ep manh
+     * hon (chap nhan doi lay re nhieu hon). 1f van de test/nghe ro het muc.
      */
-    var correctionStrength: Float = 0.5f
+    var correctionStrength: Float = 0.25f
         set(value) {
             field = value.coerceIn(0f, 1f)
         }
