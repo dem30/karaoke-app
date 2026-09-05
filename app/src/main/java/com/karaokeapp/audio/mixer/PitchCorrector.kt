@@ -47,12 +47,13 @@ import kotlin.math.sqrt
  *    triggerGrain()) de tranh doc/ghi de len nhau gay ra tieng "rac", nhung day la 1 don gian hoa,
  *    khong phai giai phap toi uu tuyet doi.
  *
- * ✅ FAIL-SAFE (sua sau khi xac nhan bug thuc te): popOlaOutput() TRUOC DAY tra ve 0f (im lang) khi
- *   olaWeight tai vi tri doc con qua thap (chua co grain PSOLA nao duoc ghi vao do - xay ra it nhat
- *   trong processingDelaySamples dau tien sau moi lan bat enabled=true/reset()) - dieu nay lam MIC BI
- *   CAU HOAN TOAN dung luc nguoi dung vua bat auto-tune, nghe nhu "mat tieng". GIO khi weight qua thap,
- *   ham BYPASS THANG ve mau mic GOC (tu [history], khong qua PSOLA) thay vi tra im lang/rac - dam bao
- *   nguoi dung LUON nghe duoc giong minh, chi la CHUA duoc chinh pitch dung khoanh khac do.
+ * ✅ FAIL-SAFE V2 (crossfade - sua sau khi xac nhan qua 2 vong test thuc te): popOlaOutput() BAN DAU
+ *   tra ve 0f (im lang) khi olaWeight tai vi tri doc con qua thap - gay MAT TIENG hoan toan luc vua
+ *   bat auto-tune. Ban V1 sua bang cach HARD-SWITCH ve mau mic goc khi weight thap - het mat tieng,
+ *   NHUNG lai sinh tieng "ret/click" MOI tai moi ranh gioi chuyen doi giua PSOLA/mic goc (2 nguon
+ *   bien do/pha khac nhau, nhay dot ngot). GIO dung CROSSFADE lien tuc (tron tuyen tinh PSOLA voi mic
+ *   goc theo chinh do tin cay cua olaWeight, xem CROSSFADE_FULL_CONFIDENCE_WEIGHT va popOlaOutput()) -
+ *   vua khong bao gio im lang/rac, vua khong con ranh gioi cung nao gay tieng ret.
  */
 class PitchCorrector(private val sampleRate: Int = 44100) {
 
@@ -90,6 +91,14 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
         // Gioi han ty le pitch-shift cho phep - tranh meo giong qua muc khi do sai/octave error.
         private const val MAX_SHIFT_RATIO = 1.5
         private const val MIN_SHIFT_RATIO = 1.0 / 1.5
+
+        // ✅ MOI (fail-safe V2 - crossfade, xem KDoc popOlaOutput()): nguong
+        // olaWeight coi nhu "PSOLA da du tin cay, khong can tron voi mic goc
+        // nua". 1 grain Hann full-overlap (2 grain ke nhau chong dung 50%)
+        // dong gop weight quanh 1.0 tai vung giua - de nguong nay = 0.5f
+        // (thap hon 1.0) de crossfade hoan tat SOM, khong keo dai qua muc
+        // can thiet (tranh nghe "mo"/pha tron qua lau o vung ranh gioi).
+        private const val CROSSFADE_FULL_CONFIDENCE_WEIGHT = 0.5f
 
         // ✅ MOI (chan doan): in log RMS/period/freq/ratio moi bao nhieu lan
         // goi updatePitchAndRatio() - 1 lan goi ~46ms @ 44100Hz (sau khi nang
@@ -407,32 +416,51 @@ class PitchCorrector(private val sampleRate: Int = 44100) {
      * chua kip tao grain hop le tai vi tri dang doc (vd ngay sau khi bat
      * enabled=true, con nam trong processingDelaySamples dau tien, hoac neu
      * co lo hong tam thoi giua 2 lan trigger grain). Khi weight qua thap,
-     * BYPASS thang ve MAU MIC GOC (khong qua PSOLA) - lay tu chinh [history]
-     * tai dung vi tri tuong ung voi mau dang duoc "xuat ra" o buoc nay, dua
-     * theo do lech co dinh processingDelaySamples giua luc ghi vao history
-     * va luc doc ra o day. Ket qua: nguoi dung LUON nghe duoc giong that cua
-     * minh (co the chua duoc chinh pitch dung luc do), KHONG BAO GIO bi cau
-     * tieng dot ngot - danh doi chap nhan duoc, vi day la tinh nang "auto-tune
-     * nhe" (tang cuong), khong phai duong dan am thanh chinh duy nhat.
+     * TRON DAN (crossfade) ve MAU MIC GOC (khong qua PSOLA) - lay tu chinh
+     * [history] tai dung vi tri tuong ung voi mau dang duoc "xuat ra" o buoc
+     * nay, dua theo do lech co dinh processingDelaySamples giua luc ghi vao
+     * history va luc doc ra o day.
+     *
+     * ⚠️ SUA TIEP (fail-safe V2 - xac nhan qua test thuc te tren thiet bi):
+     * ban V1 CHUYEN CUNG (hard switch) giua "100% PSOLA" va "100% mic goc"
+     * ngay tai nguong weight > 1e-3f - dieu nay GIAI QUYET duoc mat tieng,
+     * NHUNG lai TAO RA tieng "ret/click" MOI tai moi ranh gioi chuyen doi, vi
+     * 2 nguon tin hieu (da qua PSOLA vs mic goc chua xu ly) co bien do/pha
+     * khac nhau, nhay dot ngot giua chung nghe nhu noi bang bi dut quang.
+     * Tren may CPU yeu (weight de roi vao vung thap thuong xuyen hon do cac
+     * lan trigger grain co the bi tre/nhay coc), so lan chuyen doi cang
+     * nhieu, tieng ret cang ro.
+     *
+     * GIAI PHAP: TRON THEO TY LE (crossfade) dua tren chinh [weight] lam he
+     * so tin cay, KHONG hard-switch. weight=0 -> 100% mic goc; weight >=
+     * CROSSFADE_FULL_CONFIDENCE_WEIGHT -> 100% PSOLA; o giua -> pha tron
+     * tuyen tinh ca 2 nguon. Ket qua: van dam bao KHONG BAO GIO im lang/rac
+     * (dung tinh than fail-safe ban dau), nhung KHONG con ranh gioi cung nao
+     * de gay tieng "ret/click" nua - chuyen tiep giua PSOLA va mic goc muot
+     * dan, tai kho phan biet duoc diem chuyen doi.
      */
     private fun popOlaOutput(): Float {
         val idx = olaReadPos
         val weight = olaWeight[idx]
 
-        val sample = if (weight > 1e-3f) {
-            olaBuffer[idx] / weight
-        } else {
-            // Fallback: mau output thu totalSamplesPopped (dem tu 0) tuong
-            // ung voi mau input da duoc pushHistory() luc
-            // totalSamplesWritten == totalSamplesPopped + 1 (vi output tre
-            // sau input dung processingDelaySamples mau). historySamplesAgo(0)
-            // luon la mau MOI NHAT vua ghi (ung voi totalSamplesWritten hien
-            // tai) - nen "cach hien tai" bao nhieu mau duoc tinh bang hieu
-            // giua so mau da ghi va so thu tu mau can lay, KHONG dung
-            // olaReadPos (chi so vong, sai sau khi da vong qua olaCapacity).
-            val samplesAgo = (totalSamplesWritten - 1 - totalSamplesPopped).coerceAtLeast(0L).toInt()
-            historySamplesAgo(samplesAgo)
-        }
+        // Mau PSOLA "thuan" (chuan hoa theo weight) - chi co y nghia khi
+        // weight > 0, nhung van tinh duoc an toan (0f/0f se khong xay ra vi
+        // co kiem tra o duoi).
+        val psolaSample = if (weight > 1e-6f) olaBuffer[idx] / weight else 0f
+
+        // Mau mic goc bypass - luon tinh duoc, dung lam "nen" cho crossfade
+        // (xem giai thich offset o ban V1 phia tren, khong doi).
+        val samplesAgo = (totalSamplesWritten - 1 - totalSamplesPopped).coerceAtLeast(0L).toInt()
+        val bypassSample = historySamplesAgo(samplesAgo)
+
+        // He so tin cay [0f, 1f]: weight cang cao (nhieu grain PSOLA chong
+        // len nhau tai diem nay) cang tin PSOLA, weight thap/0 thi tin
+        // hoan toan mic goc. CROSSFADE_FULL_CONFIDENCE_WEIGHT la nguong
+        // weight coi nhu "PSOLA da chin" - thuong 1 grain Hann full-overlap
+        // dong gop weight quanh 1.0 tai tam, nen de nguong nay hoi thap hon
+        // 1.0 mot chut de crossfade khong keo dai qua muc can thiet.
+        val confidence = (weight / CROSSFADE_FULL_CONFIDENCE_WEIGHT).coerceIn(0f, 1f)
+        val sample = bypassSample * (1f - confidence) + psolaSample * confidence
 
         // Don sach o vua doc de tai su dung vong sau (day la ring buffer).
         olaBuffer[idx] = 0f
