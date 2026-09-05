@@ -65,25 +65,32 @@ class VocalProcessor(
         }
     }
 
+    private val hpfFilter = Biquad()
     private val bassFilter = Biquad()
     private val midFilter = Biquad()
     private val trebleFilter = Biquad()
 
     companion object {
-        // Tan so cat/trung tam cho tung band - lua chon pho bien cho giong
-        // hat karaoke (khong phai nhac cu dai rong, tap trung vao dai giong
-        // nguoi 80Hz-8kHz):
-        // - Bass shelf tai 200Hz: dieu chinh "day/mong" cua giong.
-        // - Mid peak tai 1000Hz (1kHz): vung "ro/duc" chinh cua giong noi/hat.
-        // - Treble shelf tai 6000Hz (6kHz): dieu chinh "sang/toi", "airy".
-        private const val BASS_FREQ = 200f
-        private const val MID_FREQ = 1000f
-        private const val TREBLE_FREQ = 6000f
+        // ✅ CAP NHAT (vocal presence - tach giong khoi nhac nen, xem
+        // giai thich day du o KDoc hpfFilter/recomputeAllFilters ben duoi):
+        // - HPF (moi) tai 90Hz: cat dut hang, tieng gio/phi hoi mic, u tram -
+        //   khong phai mot band co the boost/cut, luon o che do cat cung
+        //   (Q=0.707, Butterworth chuan) truoc khi vao 3 band EQ.
+        // - Bass shelf doi tu 200Hz -> 220Hz: chi dich nhe, van dieu chinh
+        //   "day/mong" cua giong, khop hon voi HPF 90Hz moi them vao ke ben.
+        // - Mid peak doi tu 1000Hz -> 3200Hz (vung "vocal presence" - giup
+        //   giong sang/thoat khoi nhac nen thay vi vung "ro/duc" 1kHz cu).
+        // - Treble shelf doi tu 6000Hz -> 8000Hz (tao do "xi xao"/air ro
+        //   hon, cao hon muc "sang/toi" 6kHz cu).
+        private const val HPF_FREQ = 90f
+        private const val BASS_FREQ = 220f
+        private const val MID_FREQ = 3200f
+        private const val TREBLE_FREQ = 8000f
 
-        // Q cho bo loc peak (mid band) - 1.0 la muc "vua phai", khong qua
-        // hep (de gay cong huong nghe chua) cung khong qua rong (de mat tinh
-        // chinh xac cua dai tan muon chinh).
-        private const val MID_Q = 1.0f
+        // Q cho bo loc peak (mid band) - tang tu 1.0 len 1.2 (hep hon 1
+        // chut) khi doi tam trung tam sang 3200Hz, tranh anh huong lan sang
+        // dai treble 8000Hz moi (2 dai gan nhau hon truoc).
+        private const val MID_Q = 1.2f
 
         /**
          * Tinh he so cho Low Shelf filter (RBJ Cookbook).
@@ -153,6 +160,29 @@ class VocalProcessor(
             normalizeAndAssign(target, b0, b1, b2, a0, a1, a2)
         }
 
+        /**
+         * Tinh he so cho High-Pass filter (RBJ Cookbook), Q=0.707
+         * (Butterworth - phang nhat trong dai thong qua, khong cong huong
+         * gan tan so cat). CAT DUT (khong phai boost/cut nhu 3 band tren)
+         * moi thu duoi freq - dung de loai bo rumble/gio/phi hoi mic va u
+         * tram khong mong muon TRUOC khi vao chuoi EQ 3-band.
+         */
+        private fun highPass(target: Biquad, freq: Float, sampleRate: Int) {
+            val w0 = 2f * PI.toFloat() * freq / sampleRate
+            val cosW0 = cos(w0)
+            val sinW0 = sin(w0)
+            val alpha = sinW0 / (2f * 0.707f)
+
+            val b0 = (1f + cosW0) / 2f
+            val b1 = -(1f + cosW0)
+            val b2 = (1f + cosW0) / 2f
+            val a0 = 1f + alpha
+            val a1 = -2f * cosW0
+            val a2 = 1f - alpha
+
+            normalizeAndAssign(target, b0, b1, b2, a0, a1, a2)
+        }
+
         private fun normalizeAndAssign(
             target: Biquad,
             b0: Float, b1: Float, b2: Float,
@@ -188,6 +218,9 @@ class VocalProcessor(
     private fun clampGain(db: Float): Float = max(-12f, min(12f, db))
 
     private fun recomputeAllFilters() {
+        // HPF khong phu thuoc gain nguoi dung (luon cat cung tai HPF_FREQ),
+        // khac voi 3 ham duoi day nhan tham so gainDb rieng cho tung band.
+        highPass(hpfFilter, HPF_FREQ, currentSampleRate)
         lowShelf(bassFilter, BASS_FREQ, currentSampleRate, bassGainDb)
         peaking(midFilter, MID_FREQ, currentSampleRate, MID_Q, midGainDb)
         highShelf(trebleFilter, TREBLE_FREQ, currentSampleRate, trebleGainDb)
@@ -226,6 +259,7 @@ class VocalProcessor(
             // tron lien tuc qua nhieu tang Int), roi clamp lai ve Short o
             // cuoi chuoi 3 tang.
             var sample = buffer[i].toFloat()
+            sample = hpfFilter.process(sample)
             sample = bassFilter.process(sample)
             sample = midFilter.process(sample)
             sample = trebleFilter.process(sample)
@@ -241,6 +275,7 @@ class VocalProcessor(
 
     /** Reset toan bo state noi bo cua ca 3 tang - goi khi bat dau 1 session moi de tranh "tan du" tu session truoc. */
     fun reset() {
+        hpfFilter.reset()
         bassFilter.reset()
         midFilter.reset()
         trebleFilter.reset()
