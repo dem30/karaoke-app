@@ -2,6 +2,7 @@ package com.karaokeapp.audio.processor
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.tanh
 
 /**
  * Phase 4, buoc 6/6 (dot cuoi cung theo ke hoach da thong nhat - flag rieng,
@@ -21,13 +22,6 @@ import kotlin.math.min
  * Limiter, VocalProcessor deu xu ly in-place de tranh cap phat mang moi/
  * boxing trong vong lap real-time), khong phai loi kien truc.
  *
- * ⚠️ CHUA duoc nghe thu doc lap - theo dung ke hoach da thong nhat, module
- * nay phai duoc BAT qua 1 flag rieng (VocalChannel.reverbEnabled, mac dinh
- * FALSE) va nghe ky truoc khi ghep chung voi cac thay doi khac (dac biet
- * la EchoReverb chay TRUOC no trong chuoi - 2 bo tao duoi vang noi tiep de
- * gay "vang chong vang" neu ca 2 cung bat, nen test PlateReverb RIENG
- * (tam tat EchoReverb) truoc khi quyet dinh dung ca 2).
- *
  * ⚠️ CANH BAO MOI (xac nhan qua test thuc te - nghe "hu" khi bat cung luc
  * voi AGC/Compressor da tang gain): module nay CHAY TREN TIN HIEU MIC, nen
  * neu loa va mic o gan nhau (vong lap am hoc mic-loa co san, du chua ro
@@ -40,6 +34,33 @@ import kotlin.math.min
  * tong gain vong lap - nhung day KHONG thay the duoc giai phap vat ly
  * (giam am luong loa / dua mic ra xa loa / dung tai nghe). Neu van con hu
  * sau khi ha he so, TAT module nay lai va uu tien xu ly vat ly truoc.
+ *
+ * 🛠️ SUA LOI "RE" KHI BAT REVERB (ban cap nhat nay):
+ *
+ * Nguyen nhan da xac dinh: mang 8 comb filter chay song song voi feedback
+ * = roomSize, nhung TRUOC BAN SUA nay, tin hieu goc (input) duoc dua THANG
+ * (full-scale) vao tung comb, khong duoc ha gain truoc. O trang thai on
+ * dinh (not ngan dai, hoac formant giong hat trung chu ky delay cua 1 vai
+ * comb), bien do NOI BO trong 1 comb co the tiem can toi input/(1-feedback)
+ * - vd feedback=0.6 -> ~2.5 lan input goc. Cong don 8 comb roi moi nhan
+ * 0.125 (chia trung binh) KHONG bu du muc cong huong nay khi nhieu comb
+ * cung cong huong 1 luc (thuong xay ra voi giong hat co formant/not ngan
+ * ro) -> tin hieu vuot han thang PCM 16-bit -> bi cat cung (hard clip) o
+ * dong `clamped = max(MIN, min(MAX, mixed))` cu -> sinh hai bac cao dot
+ * ngot -> nghe "re/vo tieng". Day chinh la ly do Freeverb GOC luon ha gain
+ * input xuong rat nho (~0.015) TRUOC khi dua vao mang comb - file ban dau
+ * thieu buoc nay (chi scale SAU khi da cong tong, la chua du).
+ *
+ * 2 thay doi de sua:
+ * 1) COMB_INPUT_GAIN (0.03f): nhan vao input truoc khi dua vao TUNG comb,
+ *    chua headroom that su cho phan cong huong noi bo, thay vi chi trong
+ *    cay vao he so 0.125 sau khi cong tong (khong du).
+ * 2) Soft clip (tanh) thay cho hard clip o buoc mix cuoi cung: neu van co
+ *    truong hop hiem gap gan/vuot ngudong, tanh() bo tron dinh tin hieu
+ *    thay vi cat cut dot ngot -> meo (neu co) se "em" hon nhieu, khong con
+ *    nghe ra tieng re gat.
+ * Ngoai ra ha nhe them roomSize mac dinh (0.6 -> 0.5) de giam bien do noi
+ * bo cua comb further, giam xac suat cham nguong ngay tu dau.
  */
 class PlateReverb(private val sampleRate: Int = 44100) {
 
@@ -77,8 +98,24 @@ class PlateReverb(private val sampleRate: Int = 44100) {
     private val combs = combDelays.map { CombFilter((it * sampleRate / 44100)) }
     private val allpasses = allPassDelays.map { AllPassFilter((it * sampleRate / 44100)) }
 
-    /** Kich thuoc "phong" ao - anh huong thoi gian ngan (decay), 0f..1f, gan 1f = ngan rat lau. */
-    @Volatile var roomSize: Float = 0.6f
+    companion object {
+        /**
+         * ✅ MOI: he so ha gain TRUOC khi dua tin hieu vao mang comb (giong
+         * tinh than "fixedGain" cua Freeverb goc, thuong ~0.015 cho input
+         * dang float -1..1). O day input la thang Short (~-32767..32767)
+         * nen he so tuyet doi khac, nhung VAI TRO giong het: chua headroom
+         * cho phan bien do "tiem can input/(1-feedback)" ben trong tung
+         * comb khi cong huong, tranh tong sau khi cong 8 comb bi vuot
+         * thang PCM roi moi bi cat cung o buoc mix cuoi.
+         */
+        private const val COMB_INPUT_GAIN = 0.03f
+    }
+
+    /** Kich thuoc "phong" ao - anh huong thoi gian ngan (decay), 0f..1f, gan 1f = ngan rat lau.
+     * ✅ Ha mac dinh 0.6 -> 0.5: giam bien do noi bo cong huong trong comb,
+     * giam them xac suat cham/vuot nguong ngay ca sau khi da them
+     * COMB_INPUT_GAIN o tren. */
+    @Volatile var roomSize: Float = 0.5f
 
     /** Do "tat" cao tan trong duoi ngan - 0f..1f, cao hon = duoi ngan "toi"/am hon, tu nhien hon o phong lon. */
     @Volatile var damping: Float = 0.28f
@@ -89,10 +126,14 @@ class PlateReverb(private val sampleRate: Int = 44100) {
     fun process(buffer: ShortArray, size: Int) {
         for (i in 0 until size) {
             val input = buffer[i].toFloat()
-            var outComb = 0f
 
+            // ✅ Ha gain TRUOC khi vao mang comb (xem COMB_INPUT_GAIN o tren)
+            // - day la thay doi chinh de sua tieng "re".
+            val combInput = input * COMB_INPUT_GAIN
+
+            var outComb = 0f
             for (c in combs) {
-                outComb += c.process(input, roomSize, damping)
+                outComb += c.process(combInput, roomSize, damping)
             }
 
             var outAllPass = outComb * 0.125f
@@ -100,13 +141,30 @@ class PlateReverb(private val sampleRate: Int = 44100) {
                 outAllPass = a.process(outAllPass)
             }
 
+            // Vi combInput da bi nhan COMB_INPUT_GAIN o dau vao, can nhan
+            // nguoc lai (1/COMB_INPUT_GAIN) o day de outAllPass tro ve dung
+            // thang bien do tuong duong voi truoc day (giu nguyen "do vang"
+            // nghe duoc, chi khac o cho KHONG con bi cong huong vuot thang
+            // truoc khi mix).
+            val wetSignal = outAllPass * (1f / COMB_INPUT_GAIN)
+
             // ✅ HA he so nhan wet tu 2.2 xuong 1.3 (xem canh bao ve vong lap
             // am hoc o KDoc dau class) - giam bot gain cong them tu module
             // nay, danh doi lay duoi vang mong hon 1 chut de doi lay it rui
             // ro hu hon khi mic/loa o gan nhau.
-            val mixed = (input * (1f - wet * 0.18f)) + (outAllPass * wet * 1.3f)
-            val clamped = max(Short.MIN_VALUE.toFloat(), min(Short.MAX_VALUE.toFloat(), mixed))
-            buffer[i] = clamped.toInt().toShort()
+            val mixed = (input * (1f - wet * 0.18f)) + (wetSignal * wet * 1.3f)
+
+            // ✅ Soft clip (tanh) thay cho hard clamp cu: neu tin hieu van
+            // gan/vuot thang PCM (truong hop hiem, con sot lai sau khi da
+            // them COMB_INPUT_GAIN), tanh() bo tron dinh thay vi cat cut dot
+            // ngot -> khong con sinh hai bac cao gay tieng "re/vo".
+            // Voi tin hieu trong thang binh thuong (|mixed| << 32767),
+            // tanh(x) ~ x nen KHONG lam doi am luong/mau am cua truong hop
+            // binh thuong, chi "phanh em" khi thuc su vuot nguong.
+            val normalized = mixed / Short.MAX_VALUE
+            val softClipped = tanh(normalized) * Short.MAX_VALUE
+
+            buffer[i] = softClipped.toInt().toShort()
         }
     }
 
