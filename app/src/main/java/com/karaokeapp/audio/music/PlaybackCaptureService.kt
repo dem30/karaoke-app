@@ -530,23 +530,53 @@ class PlaybackCaptureService : Service() {
     }
 
     /**
-     * ✅ MOI (xem giai thich day du o khai bao field wifiLock phia tren):
-     * WIFI_MODE_FULL_LOW_LATENCY (API 29+) uu tien do tre thap hon ca
-     * WIFI_MODE_FULL_HIGH_PERF - fallback ve HIGH_PERF cho may cu hon.
+     * ⚠️ SUA LOI MOI (phat hien khi doi chieu voi tai lieu Android chinh thuc -
+     * source.android.com/docs/core/connect/wifi-low-latency): TRUOC DAY uu
+     * tien WIFI_MODE_FULL_LOW_LATENCY (API 29+), tuong la "tot hon"
+     * HIGH_PERF. NHUNG tai lieu Android noi RO low-latency mode CHI thuc su
+     * kich hoat khi CA 3 dieu kien sau dung THOI:
+     *   1. Wi-Fi bat + co internet.
+     *   2. App DA acquire WifiLock VA app dang chay O FOREGROUND (man hinh
+     *      hien app nay, khong phai app khac).
+     *   3. Man hinh dang BAT.
+     * May A (vai tro Mixer) theo dung kien truc cua chinh app nay LUON chay
+     * o BACKGROUND trong luc dang hat - MainActivity chu dong nhuong
+     * foreground lai cho YouTube/Chrome (xem returnToSourceApp()/Reactivation
+     * o tren) de lay am thanh nhac qua MediaProjection. Nghia la dieu kien
+     * (2) HAU NHU KHONG BAO GIO dung tren May A khi dang hat that su - giu
+     * WifiLock LOW_LATENCY trong truong hop nay CO THE hoan toan KHONG co
+     * tac dung gi (Wi-Fi van vao power-save binh thuong), vo hieu hoa dung
+     * cai fix goc (chong "im lang roi don cuc" do power-save) ma khong bao
+     * loi/canh bao gi ca - day rat co the la ly do hien tuong giat/rot van
+     * con xay ra du code "da co WifiLock".
+     *
+     * WIFI_MODE_FULL_HIGH_PERF (API 12, tai lieu tach rieng khoi
+     * low-latency) KHONG co dieu kien "app phai o foreground" nay - day
+     * chinh la mode duoc AOSP dung cho vi du "giu Wi-Fi thuc trong lúc goi
+     * SIP/VoIP khi man hinh tat do cam bien khoang cach" (SipAudioCallImpl),
+     * tuc la thiet ke rieng cho dung tinh huong "app chay ngam, man hinh co
+     * the tat" - dung voi hoan canh thuc te cua May A hon LOW_LATENCY.
+     *
+     * Sua: doi uu tien sang HIGH_PERF (moi API level) cho May A. Van giu
+     * nhanh LOW_LATENCY lam lua chon PHU tren API 29+ (khong hai gi khi giu
+     * ca 2 dong thoi khong cung luc duoc - WifiLock chi nhan 1 mode/instance
+     * - nen o day chon HANG DAU la HIGH_PERF vi no dam bao hoat dong ke ca
+     * khi dieu kien foreground/man hinh khong dung).
      */
     private fun acquireWifiLock() {
         try {
             if (wifiLock == null) {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
+                @Suppress("DEPRECATION")
+                val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MixerWifiLock").apply {
                     setReferenceCounted(false)
                 }
+                logBoth(
+                    "ℹ️ WifiLock May A dung mode HIGH_PERF (khong dung LOW_LATENCY) vi May A " +
+                        "chay ngam (YouTube o foreground) trong luc hat - LOW_LATENCY se KHONG " +
+                        "kich hoat trong dieu kien do theo tai lieu Android."
+                )
             }
             wifiLock?.let {
                 if (!it.isHeld) {

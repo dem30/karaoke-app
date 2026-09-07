@@ -1114,16 +1114,24 @@ class MainActivity : AppCompatActivity() {
      * trong suot phien gui Mic khong day, tranh chip Wi-Fi tu dong vao
      * power-save mode gay tre goi PCM giua chung.
      */
+    // ⚠️ SUA LOI MOI (dong bo voi fix WifiLock ben PlaybackCaptureService.kt -
+    // xem giai thich day du o do): tai lieu Android (wifi-low-latency) neu ro
+    // WIFI_MODE_FULL_LOW_LATENCY chi kich hoat khi app dang o FOREGROUND VA
+    // MAN HINH DANG BAT. May B (vai tro Mic) THUONG o foreground trong luc
+    // hat nen ve co ban dieu kien "foreground" hay dung hon May A - NHUNG
+    // dieu kien "man hinh dang bat" van la 1 rui ro that: 1 phien hat dai (vd
+    // ha may xuong ban, doi tay cam) rat de vo tinh de man hinh tu khoa (tat
+    // man hinh) giua chung - ngay luc do LOW_LATENCY se NGUNG hoat dong
+    // (khong loi/canh bao gi), quay lai dung bug goc "power-save gay giat
+    // 150-400ms" ma WifiLock nay duoc tao ra de chan. HIGH_PERF khong co dieu
+    // kien man hinh/foreground nay nen an toan hon cho ca truong hop man
+    // hinh tat giua phien.
     private fun acquireMicWifiLock() {
         try {
             if (wifiLock == null) {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
+                @Suppress("DEPRECATION")
+                val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MicWifiLock").apply {
                     setReferenceCounted(false)
                 }

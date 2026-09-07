@@ -88,6 +88,14 @@ class WebRtcManager(private val context: Context) {
     // khong xay ra dua, nhung sua san de an toan neu mo rong len 3+ may.
     private val pcmScratchBuffers = ConcurrentHashMap<String, ShortArray>()
 
+    // ⚠️ MOI (xem giai thich day du o unpackAndDeliverPcm()): seq CUOI CUNG
+    // da PHAT cho tung clientId (May A, vai tro Host, co the co nhieu Mic
+    // con nen can rieng theo clientId - giong tinh than pcmScratchBuffers).
+    // Dung Int? (boxed) trong ConcurrentHashMap thay vi AtomicInteger vi chi
+    // doc/ghi 1 lan/goi, khong can them phep toan atomic rieng.
+    private val lastDeliveredSeq = ConcurrentHashMap<String, Int>()
+    private var outOfOrderDropCount = 0
+
     // Callback nhan PCM tu mic remote tren May A
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
 
@@ -103,6 +111,16 @@ class WebRtcManager(private val context: Context) {
     private var sendMaxGapMsInWindow = 0L
     private var sendWindowStartNanoTime = 0L
     private var sendChannelNotOpenSkipCount = 0
+
+    // ⚠️ MOI (fix loi phat hien khi phan tich maxRetransmits=1 + ordered=false
+    // - xem giai thich day du o unpackAndDeliverPcm()): DataChannel voi
+    // ordered=false KHONG dam bao thu tu den. Khi 1 goi bi mat va duoc gui
+    // lai (retransmit), goi KE TIEP (gui sau nhung khong bi mat) rat co the
+    // den TRUOC goi vua duoc gui lai - neu khong co gi danh dau thu tu, phia
+    // nhan se PHAT SAI THU TU 2 chunk PCM lien tiep (nghe nhu giat/dao am
+    // thanh), te hon ca 1 khoang trong don thuan. Dem tang don dieu moi lan
+    // gui (May B, 1 chieu duy nhat -> khong can AtomicInteger/lock).
+    private var outgoingSeq: Int = 0
 
     init {
         initializeFactory()
@@ -271,7 +289,15 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
-        val byteBuffer = ByteBuffer.allocateDirect(size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        // ⚠️ SUA: them 4 byte seq (Int) o DAU buffer, TRUOC phan PCM - xem
+        // giai thich day du o khai bao outgoingSeq/unpackAndDeliverPcm().
+        val seq = outgoingSeq
+        outgoingSeq++ // tran (overflow) ve Int.MIN_VALUE sau ~2.7 ty goi la
+        // BINH THUONG va AN TOAN - phia nhan so sanh bang phep tru co dau
+        // (wraparound-safe), khong so sanh truc tiep seq1 > seq2.
+
+        val byteBuffer = ByteBuffer.allocateDirect(4 + size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        byteBuffer.putInt(seq)
         for (i in 0 until size) {
             byteBuffer.putShort(buffer[i])
         }
@@ -343,9 +369,49 @@ class WebRtcManager(private val context: Context) {
         }, remoteDesc)
     }
 
+    /**
+     * ⚠️ SUA LOI MOI (phat hien khi ra soat lai maxRetransmits=1 +
+     * ordered=false o getRtcConfig()/startClientPeer()): DataChannel
+     * ordered=false KHONG dam bao chunk den DUNG thu tu da GUI. Neu 1 chunk
+     * (goi N) bi mat tren mang, WebRTC se GUI LAI no (maxRetransmits=1) -
+     * nhung viec gui lai can 1 khoang thoi gian (phat hien mat + round-trip),
+     * trong luc do chunk N+1 (gui SAU nhung KHONG bi mat) hoan toan co the
+     * DEN TRUOC ban gui-lai cua chunk N. TRUOC BAN SUA NAY, ham nay chi don
+     * gian PHAT BAT KY chunk nao vua den - nghia la thu tu am thanh THAT SU
+     * phat ra la N+1 roi moi den N (dao nguoc 2 doan PCM ~40ms lien tiep) -
+     * nghe nhu tieng giat/dao, con TE HON ca 1 khoang trong don thuan ma
+     * chinh maxRetransmits=1 dang co gang sua.
+     *
+     * Sua: doc 4 byte dau lam seq (Int, ghi boi sendPcmChunkFromMic). So
+     * sanh voi seq CUOI CUNG da phat cho DUNG clientId nay (wraparound-safe
+     * bang phep tru co dau, khong dung so sanh > truc tiep - an toan khi
+     * outgoingSeq tran ve am sau ~2.7 ty goi). Neu seq moi <= seq da phat
+     * (chunk nay la ban gui-lai cua 1 goi da bi "vuot mat" boi 1 goi den
+     * sau no), CHU DONG BO chunk nay - chap nhan 1 khoang trong ngan (giong
+     * hanh vi truoc khi co maxRetransmits) thay vi phat sai thu tu.
+     */
     private fun unpackAndDeliverPcm(clientId: String, byteBuffer: ByteBuffer) {
         byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        if (byteBuffer.remaining() < 4) {
+            CaptureLogBus.log("[WebRTC-Host] ⚠️ Chunk PCM tu $clientId qua ngan (thieu header seq) - bo qua.")
+            return
+        }
+        val seq = byteBuffer.int
         val shortCount = byteBuffer.remaining() / 2
+
+        val lastSeq = lastDeliveredSeq[clientId]
+        if (lastSeq != null && (seq - lastSeq) <= 0) {
+            outOfOrderDropCount++
+            if (outOfOrderDropCount % 25 == 0) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-OrderGuard] ⚠️ Da bo $outOfOrderDropCount chunk PCM den " +
+                        "TRE/SAI THU TU tu $clientId (seq=$seq, seq cuoi da phat=$lastSeq) - " +
+                        "day la ban gui-lai (retransmit) den sau chunk moi hon, bo de tranh dao thu tu am thanh."
+                )
+            }
+            return
+        }
+        lastDeliveredSeq[clientId] = seq
 
         // ✅ SUA: lay/tao scratch buffer RIENG cho clientId nay - xem giai
         // thich day du o khai bao pcmScratchBuffers phia tren.
@@ -373,6 +439,12 @@ class WebRtcManager(private val context: Context) {
         // ✅ MOI: don luon scratch buffer cua client vua roi phong, tranh ro
         // ri nho neu co nhieu client noi/roi lien tuc trong 1 phien dai.
         pcmScratchBuffers.remove(clientId)
+        // ⚠️ MOI (dong bo voi fix seq-order o unpackAndDeliverPcm()): don
+        // luon seq cuoi da phat cua client vua roi - neu client nay ket noi
+        // lai voi 1 outgoingSeq MOI bat dau tu 0 (WebRtcManager moi ben May
+        // B), seq cu con luu lai se khien MOI chunk dau tien cua phien moi
+        // bi coi la "tre/sai thu tu" va bi bo oan.
+        lastDeliveredSeq.remove(clientId)
     }
 
     fun closeAll() {
@@ -384,6 +456,7 @@ class WebRtcManager(private val context: Context) {
         }
         peerConnections.clear()
         pcmScratchBuffers.clear()
+        lastDeliveredSeq.clear()
 
         // ✅ FIX (xem giai thich o khai bao truong `factory`/`audioDeviceModule`
         // phia tren): TRUOC DAY closeAll() chi don PeerConnection/DataChannel,
