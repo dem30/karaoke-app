@@ -24,81 +24,46 @@ import kotlin.math.max
  * ⚠️ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
  * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN.
  *
- * ⚠️ [DA LOI THOI - GIU LAI DE THAM KHAO LICH SU] CAP NHAT CU (fix "tieng
- * ret ret cua Mic B qua mang"): ban dau DataChannel.Init() dat ordered=false,
- * maxRetransmits=0, sau do doi thanh maxRetransmits=1 (van giu ordered=false).
- * CA HAI phuong an nay deu KHONG giai quyet duoc goc re that su: du co
- * retransmit hay khong, khi ordered=false thi cac FRAGMENT IP cua 1 goi PCM
- * (vuot MTU Wi-Fi ~1500 bytes nen bi chia nho) hoac cac goi PCM ke tiep nhau
- * VAN CO THE den May A SAI THU TU moi khi mang Wi-Fi jitter nhe - gay buoc
- * nhay bien do dot ngot trong dang song (nghe nhu tieng ret/xe), HOAN TOAN
- * DOC LAP voi viec co retry hay khong.
- *
- * ✅ FIX THUC SU (xem hang so DATA_CHANNEL trong startClientPeer() ben duoi):
+ * ✅ FIX THUC SU (xem startClientPeer() ben duoi):
  * doi sang ordered=true, maxRetransmits=0. ordered=true buoc WebRTC/SCTP
- * giao dung thu tu da gui, loai bo hoan toan nguyen nhan dao lon dang song.
- * maxRetransmits=0 (KHONG retry) de bu lai - vi da bat ordered, cho phep
- * retry se khien 1 goi mat lam TICH LUY do tre cho ca hang doi phia sau (moi
- * goi den sau phai cho goi mat duoc gui lai/het han). Voi audio realtime,
- * mat 1 chunk ~40ms roi bo qua va tiep tuc bang chunk moi nhat luon tot hon
- * la cho retry gay tre day chuyen.
+ * giao dung thu tu da gui, loai bo hoan toan nguyen nhan dao lon dang song do
+ * goi bi chia manh qua MTU Wi-Fi. maxRetransmits=0 (KHONG retry) de bu lai -
+ * voi audio realtime, mat 1 chunk ~40ms roi bo qua (drop) va tiep tuc bang
+ * chunk moi nhat luon tot hon la cho retry gay tre day chuyen.
  *
  * ⚠️ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
  * nhu PLAN.md muc 7 mo ta - moi client co 1 scratch buffer PCM RIENG
  * (ConcurrentHashMap theo clientId) de tranh dua du lieu (race) NEU sau nay
  * mo rong len 3+ may gui PCM dong thoi; nhung cac phan khac (vi du
  * WebRtcManager dung 1 `localDataChannel` DUY NHAT o phia May B) van gia
- * dinh 1-mic-1-peer, chua ho tro 1 may B gui toi NHIEU May A cung luc (khong
- * nam trong pham vi Phase 5 theo PLAN).
+ * dinh 1-mic-1-peer, chua ho tro 1 may B gui toi NHIEU May A cung luc.
  */
 class WebRtcManager(private val context: Context) {
 
     companion object {
         private const val TAG = "WebRtcManager"
         private const val CHANNEL_LABEL = "karaoke_pcm_stream"
-
     }
 
     private var factory: PeerConnectionFactory? = null
 
-    // ✅ FIX ("dễ rớt và không kết nối lại được" sau vài lần reconnect): giữ
-    // tham chiếu ADM để closeAll() có thể release() nó - trước đây ADM được
-    // tạo local trong initializeFactory() rồi bỏ luôn, không ai giữ để dọn.
+    // Giữ tham chiếu ADM để closeAll() có thể release() nó
     private var audioDeviceModule: JavaAudioDeviceModule? = null
     // May A luu danh sach PeerConnection cua cac Mic con: clientId -> PeerConnection
     private val peerConnections = ConcurrentHashMap<String, PeerConnection>()
     // May B luu DataChannel gui audio ve A
     private var localDataChannel: DataChannel? = null
 
-    // ✅ MOI (fix "cap phat Native lien tuc gay GC/malloc pause 25 lan/giay"):
-    // 1 DirectByteBuffer DUY NHAT duoc tai su dung cho MOI lan gui PCM, thay
-    // vi ByteBuffer.allocateDirect() moi trong sendPcmChunkFromMic() (truoc
-    // day goi malloc() native moi ~40ms, gay ap luc GC/memory fragmentation
-    // dinh ky - 1 trong cac nguyen nhan gay micro-freeze/lag ben phia gui).
-    // Chi cap phat lai NEU kich thuoc chunk PCM thuc te lon hon buffer hien
-    // co (truong hop binh thuong hau nhu khong xay ra vi kich thuoc chunk
-    // on dinh ~40ms/lan). An toan vi sendPcmChunkFromMic() chi duoc goi tren
-    // 1 thread (luong doc PCM tu Mic), khong co goi dong thoi.
+    // ✅ Tái sử dụng 1 DirectByteBuffer duy nhất, tránh malloc/GC pause liên tục
     private var sendByteBuffer: ByteBuffer? = null
 
-    // ✅ SUA (khac code mau goc): MOI clientId co 1 scratch buffer RIENG,
-    // KHONG dung chung 1 buffer cho moi client - buffer dung chung se bi
-    // GHI DE/DUA DU LIEU neu 2 client gui PCM gan nhu dong thoi (callback
-    // onMessage cua WebRTC co the chay tren cac thread khac nhau tuy
-    // PeerConnection). Voi dung 2 may (1 mic tu xa) nhu Phase 5 mo ta thi
-    // khong xay ra dua, nhung sua san de an toan neu mo rong len 3+ may.
+    // MOI clientId co 1 scratch buffer RIENG de tranh dua du lieu
     private val pcmScratchBuffers = ConcurrentHashMap<String, ShortArray>()
 
     // Callback nhan PCM tu mic remote tren May A
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
 
-    // ✅ MOI (CHAN DOAN TAM THOI - do nhip GUI PCM thuc te tu chinh May B,
-    // TRUOC khi bat cu qua DataChannel): so sanh voi log nhan o
-    // PlaybackCaptureService.logRemoteChunkTiming() de biet giat dut quang
-    // la do MAY B GUI KHONG DEU (vi du chinh MicInput cua May B bi nghen)
-    // hay do MANG/DataChannel lam tre/rot giua duong (May B gui deu nhung
-    // May A nhan khong deu). Du kien go bo sau khi xac dinh xong nguyen
-    // nhan, KHONG phai code san xuat lau dai.
+    // Theo dõi nhịp gửi PCM từ máy B
     private var lastSendNanoTime = 0L
     private var sendCountInWindow = 0
     private var sendMaxGapMsInWindow = 0L
@@ -115,21 +80,6 @@ class WebRtcManager(private val context: Context) {
             .createInitializationOptions()
         PeerConnectionFactory.initialize(options)
 
-        // ✅ FIX ("May A bi nho tieng khi May B ket noi"): TRUOC DAY khong
-        // truyen AudioDeviceModule (ADM) tuong minh -> WebRTC tu dung ADM
-        // mac dinh (JavaAudioDeviceModule). Du ca app CHI dung DataChannel
-        // de truyen PCM tho (KHONG he tao AudioTrack/MediaStreamTrack audio
-        // nao), ADM mac dinh van co the tu xin AudioFocus va/hoac doi
-        // AudioManager.mode sang MODE_IN_COMMUNICATION ngay khi PeerConnection
-        // that su thiet lap (dung luc May B connect) - day la hanh vi NOI BO
-        // cua thu vien WebRTC, KHONG phai code cua app chu dong lam. Hau qua:
-        // giong het kieu "duck HAL/OEM" da ghi chu trong PlaybackCaptureService
-        // - lam STREAM_MUSIC (MusicInput dang capture) hoac STREAM_SYSTEM
-        // (Mixer dang phat) bi nho tieng.
-        //
-        // Sua: tu tao ADM tuong minh, tat het xu ly hardware AEC/NS (khong
-        // can thiet vi app khong dung duong audio chuan cua WebRTC) - giam
-        // toi da kha nang ADM dung cham vao AudioManager.
         val audioDeviceModule = JavaAudioDeviceModule.builder(context)
             .setUseHardwareAcousticEchoCanceler(false)
             .setUseHardwareNoiseSuppressor(false)
@@ -142,12 +92,6 @@ class WebRtcManager(private val context: Context) {
             .createPeerConnectionFactory()
     }
 
-    // ✅ MOI (lop phong thu thu 2 - phong truong hop set ADM tuong minh o
-    // tren van chua chan het): mot so ban WebRTC van co the doi
-    // AudioManager.mode ngay khi PeerConnection dat trang thai ICE CONNECTED,
-    // bat ke ADM duoc cau hinh the nao. Ep tra ve MODE_NORMAL ngay khi phat
-    // hien bi doi - giong tinh than [AutoReassert] da co san trong
-    // PlaybackCaptureService cho vu "duck HAL/OEM" cua Honor.
     private fun reassertNormalAudioModeIfNeeded(tag: String) {
         try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -200,27 +144,8 @@ class WebRtcManager(private val context: Context) {
 
         peerConnections[signalingClient.clientId] = pc
 
-        // ✅ SUA LAI (fix goc re nguyen nhan tieng "ret xe rach" cua Mic B -
-        // xem phan tich ky thuat day du: ban ordered=false/maxRetransmits=1
-        // TRUOC DAY van cho phep cac FRAGMENT IP cua 1 goi PCM (~3528 bytes,
-        // vuot MTU Wi-Fi ~1500 bytes nen luon bi chia lam nhieu manh) hoac
-        // cac goi ke tiep nhau DEN SAI THU TU khi mang Wi-Fi bi jitter nhe -
-        // May A ghep lai PCM theo dung thu tu NHAN DUOC (khong phai thu tu
-        // GUI), tao buoc nhay bien do dot ngot trong dang song -> nghe nhu
-        // tieng ret/xe.
-        //
-        // ordered = true: BAT BUOC voi du lieu PCM lien tuc theo thoi gian -
-        // WebRTC/SCTP se tu dam bao cac manh/goi duoc GIAO DUNG THU TU da
-        // GUI, loai bo hoan toan nguyen nhan dao lon dang song noi tren.
-        //
-        // maxRetransmits = 0: KHONG retry khi mat goi - vi da bat ordered,
-        // neu con cho phep retransmit thi 1 goi bi mat se khien WebRTC GIU
-        // LAI moi goi PCM ĐẾN SAU no (de dam bao thu tu) cho đen khi goi mat
-        // đuoc gui lai thanh cong hoac het han - gay tich luy do tre lien
-        // tuc, hoan toan sai voi yeu cau do tre thap cua karaoke realtime.
-        // Voi audio lien tuc, mat 1 chunk ~40ms roi BO QUA (drop) va tiep
-        // tuc voi chunk moi nhat luon tot hon la cho retry lam tre ca hang
-        // doi phia sau.
+        // ordered = true để không bị đảo lộn thứ tự mảnh sóng âm
+        // maxRetransmits = 0 để tránh tích lũy độ trễ khi mất gói
         val init = DataChannel.Init().apply {
             ordered = true
             maxRetransmits = 0
@@ -241,9 +166,7 @@ class WebRtcManager(private val context: Context) {
     /**
      * May B gui truc tiep tung chunk PCM thu duoc tu Mic sang May A qua WebRTC.
      */
-    
-  
-  fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
+    fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
         val channel = localDataChannel ?: return
         if (channel.state() != DataChannel.State.OPEN) {
             sendChannelNotOpenSkipCount++
@@ -284,7 +207,7 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
-        // Tái sử dụng buffer an toàn, val bBuf luôn là ByteBuffer non-null
+        // Tái sử dụng buffer an toàn, dùng val với if-else để đảm bảo kiểu non-null
         val bytesNeeded = size * 2
         val currentBuf = sendByteBuffer
         val bBuf = if (currentBuf == null || currentBuf.capacity() < bytesNeeded) {
@@ -303,10 +226,12 @@ class WebRtcManager(private val context: Context) {
         channel.send(DataChannel.Buffer(bBuf, true))
     }
 
+    fun handleRemoteAnswer(clientId: String, sdp: String) {
+        val pc = peerConnections[clientId] ?: return
+        val sessionDescription = SessionDescription(SessionDescription.Type.ANSWER, sdp)
+        pc.setRemoteDescription(SimpleSdpObserver(), sessionDescription)
+    }
 
-
-
-    
     // =========================================================================
     // PHIA MAY A (MIXER CHINH)
     // =========================================================================
@@ -369,8 +294,6 @@ class WebRtcManager(private val context: Context) {
         byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
         val shortCount = byteBuffer.remaining() / 2
 
-        // ✅ SUA: lay/tao scratch buffer RIENG cho clientId nay - xem giai
-        // thich day du o khai bao pcmScratchBuffers phia tren.
         var scratch = pcmScratchBuffers[clientId]
         if (scratch == null || scratch.size < shortCount) {
             scratch = ShortArray(shortCount)
@@ -392,8 +315,6 @@ class WebRtcManager(private val context: Context) {
             close()
             dispose()
         }
-        // ✅ MOI: don luon scratch buffer cua client vua roi phong, tranh ro
-        // ri nho neu co nhieu client noi/roi lien tuc trong 1 phien dai.
         pcmScratchBuffers.remove(clientId)
     }
 
@@ -407,16 +328,6 @@ class WebRtcManager(private val context: Context) {
         peerConnections.clear()
         pcmScratchBuffers.clear()
 
-        // ✅ FIX (xem giai thich o khai bao truong `factory`/`audioDeviceModule`
-        // phia tren): TRUOC DAY closeAll() chi don PeerConnection/DataChannel,
-        // KHONG BAO GIO giai phong chinh PeerConnectionFactory hay ADM da tao
-        // trong initializeFactory() - moi lan connectToRoomAsMic() tao 1
-        // WebRtcManager MOI (xem MainActivity), nghia la moi lan "Ket noi lai"
-        // hoac quet QR lai la 1 factory+ADM native MOI bi "mo cong" trong khi
-        // ban CU khong bao gio duoc dong - tich luy dan qua nhieu lan roi/ket
-        // noi lai, cuoi cung gay ket noi that bai/khong on dinh. dispose()
-        // factory TRUOC, roi release() ADM SAU (dung thu tu WebRTC yeu cau -
-        // factory co the con giu tham chieu toi ADM ben trong).
         try {
             factory?.dispose()
         } catch (e: Exception) {
