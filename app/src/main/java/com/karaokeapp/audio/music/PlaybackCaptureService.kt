@@ -37,6 +37,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -280,6 +282,19 @@ class PlaybackCaptureService : Service() {
         fun getActiveRoomQrData(): QrJoinData? = activeRoomQrData
 
         private val vocalPushLock = Any()
+
+        // ✅ MOI (cung fix voi ACTION_START_HOST_ROOM/ACTION_STOP_HOST_ROOM -
+        // xem giai thich day du o onStartCommand()): startHostRoomInternal()/
+        // stopHostRoomInternal() gio chay tren serviceScope (Dispatchers.
+        // Default, THREAD POOL RIENG) thay vi tuan tu tren main thread nhu
+        // truoc - neu nguoi dung bam Start/Stop/Start don dap, 2 lan goi co
+        // THE chay DAN XEN THAT SU tren cac thread khac nhau, doc/ghi
+        // hostSignalingServer/hostWebRtcManager (KHONG @Volatile, KHONG dong
+        // bo hoa) khong an toan nua - truoc day an toan "tinh co" vi moi thu
+        // chay tuan tu tren CUNG 1 main thread. Mutex nay dam bao CHI 1 thao
+        // tac mo/dong phong duoc chay tai 1 thoi diem, giu dung thu tu FIFO
+        // nguoi dung bam.
+        private val hostRoomLock = Mutex()
 
         @Volatile
         private var localMicMutedForMixer = false
@@ -1142,11 +1157,44 @@ class PlaybackCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START_HOST_ROOM -> {
-                startHostRoomInternal()
+                // ✅ FIX ("May A tu thoat/ANR khi mo phong moi luc dang co
+                // phong cu" - xac nhan qua log thuc te: log dung dot ngot
+                // ngay sau dong "Dang co phong cu chay - tu dong dong truoc
+                // khi tao phong moi" + "Address already in use", KHONG co
+                // exception nao duoc CaptureLogBus ghi them sau do): giong
+                // HET tinh than fix cu da co san cho mic.startCapture() trong
+                // startMixerTestInternal() (xem giai thich day du o do) -
+                // startHostRoomInternal() TRUOC DAY chay DONG BO tren MAIN
+                // THREAD (onStartCommand KHONG tu tao thread rieng). Ham nay
+                // goi stopHostRoomInternal() -> SignalingServer.stopServer()
+                // -> WebSocketServer.stop() cua thu vien Java-WebSocket -
+                // ham stop() nay BLOCKING, join() cac thread ket noi/selector
+                // NOI BO cua thu vien, co the mat toi hang tram ms-vai giay
+                // (dac biet neu dang co 1 client/May B vua join). Chan MAIN
+                // THREAD lau nhu vay trong 1 Service dang chay cac tac vu
+                // audio khac (AudioRecord/MediaProjection) VUOT QUA watchdog
+                // ANR cua he thong (~5s) -> OS AM THAM KILL tien trinh, KHONG
+                // phai crash Java nen KHONG CO exception/dialog nao ca -
+                // dung khop voi trieu chung "app tu thoat, khong dialog".
+                // Sua: chuyen toan bo startHostRoomInternal() (bao gom buoc
+                // dong phong cu ben trong) sang serviceScope (Dispatchers.
+                // Default, thread pool rieng) - giai phong main thread ngay
+                // lap tuc. AN TOAN: moi callback ve MainActivity
+                // (onRoomReadyCallback/onRoomErrorCallback/
+                // onRoomMicStatusCallback) da tu boc rieng runOnUiThread{}
+                // ngay tai noi dang ky trong MainActivity.kt, nen goi tu
+                // thread nao cung khong sao.
+                serviceScope.launch { hostRoomLock.withLock { startHostRoomInternal() } }
                 return START_NOT_STICKY
             }
             ACTION_STOP_HOST_ROOM -> {
-                stopHostRoomInternal()
+                // ✅ FIX (cung nguyen nhan voi ACTION_START_HOST_ROOM o tren):
+                // stopHostRoomInternal() cung goi SignalingServer.stopServer()
+                // (blocking) - chuyen sang serviceScope de tranh chan main
+                // thread/ANR tuong tu. Dung CHUNG hostRoomLock voi nhanh Start
+                // o tren de 2 thao tac khong bao gio chay dan xen (xem giai
+                // thich day du o khai bao hostRoomLock).
+                serviceScope.launch { hostRoomLock.withLock { stopHostRoomInternal() } }
                 return START_NOT_STICKY
             }
             ACTION_STOP_ALL -> {
