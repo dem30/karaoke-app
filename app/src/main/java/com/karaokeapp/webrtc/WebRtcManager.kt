@@ -241,13 +241,11 @@ class WebRtcManager(private val context: Context) {
     /**
      * May B gui truc tiep tung chunk PCM thu duoc tu Mic sang May A qua WebRTC.
      */
-    fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
+    
+  
+  fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
         val channel = localDataChannel ?: return
         if (channel.state() != DataChannel.State.OPEN) {
-            // ✅ MOI (chan doan): dem so lan bi bo qua do channel CHUA/KHONG
-            // con o trang thai OPEN - neu con so nay lon bat thuong trong 1
-            // phien dang chay binh thuong, nghia la chinh DataChannel bi
-            // rot/dong lai giua chung (khac voi mat goi UDP don le).
             sendChannelNotOpenSkipCount++
             if (sendChannelNotOpenSkipCount % 25 == 0) {
                 CaptureLogBus.log(
@@ -258,9 +256,6 @@ class WebRtcManager(private val context: Context) {
             return
         }
 
-        // ✅ MOI (chan doan - xem giai thich day du o khai bao cac bien
-        // lastSendNanoTime/sendCountInWindow phia tren): do nhip GUI thuc te
-        // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang.
         val now = System.nanoTime()
         if (lastSendNanoTime != 0L) {
             val gapMs = (now - lastSendNanoTime) / 1_000_000L
@@ -289,32 +284,29 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
-        // ✅ SUA (xem giai thich day du o khai bao truong sendByteBuffer
-        // phia tren): tai su dung 1 DirectByteBuffer duy nhat, chi cap phat
-        // lai NEU kich thuoc can thiet vuot qua dung luong buffer hien co.
+        // Tái sử dụng buffer an toàn, val bBuf luôn là ByteBuffer non-null
         val bytesNeeded = size * 2
-        var bBuf = sendByteBuffer
-        if (bBuf == null || bBuf.capacity() < bytesNeeded) {
-            bBuf = ByteBuffer.allocateDirect(bytesNeeded).order(ByteOrder.LITTLE_ENDIAN)
-            sendByteBuffer = bBuf
+        val currentBuf = sendByteBuffer
+        val bBuf = if (currentBuf == null || currentBuf.capacity() < bytesNeeded) {
+            val newBuf = ByteBuffer.allocateDirect(bytesNeeded).order(ByteOrder.LITTLE_ENDIAN)
+            sendByteBuffer = newBuf
+            newBuf
+        } else {
+            currentBuf
         }
+
         bBuf.clear()
         for (i in 0 until size) {
             bBuf.putShort(buffer[i])
         }
-        // flip(): dat limit = position hien tai (= bytesNeeded, DUNG ke ca
-        // khi capacity buffer lon hon bytesNeeded do lan truoc chunk to
-        // hon), roi dua position ve 0 de channel.send() doc dung tu dau.
         bBuf.flip()
         channel.send(DataChannel.Buffer(bBuf, true))
     }
 
-    fun handleRemoteAnswer(clientId: String, sdp: String) {
-        val pc = peerConnections[clientId] ?: return
-        val sessionDescription = SessionDescription(SessionDescription.Type.ANSWER, sdp)
-        pc.setRemoteDescription(SimpleSdpObserver(), sessionDescription)
-    }
 
+
+
+    
     // =========================================================================
     // PHIA MAY A (MIXER CHINH)
     // =========================================================================
