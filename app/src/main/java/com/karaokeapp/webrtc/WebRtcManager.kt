@@ -113,6 +113,46 @@ class WebRtcManager(private val context: Context) {
         private const val PLC_MAX_CONCEALED_CHUNKS = 3
         // He so nhan bien do moi lan PLC lap lai (0.6 = giam ~4dB/lan).
         private const val PLC_ATTENUATION_FACTOR = 0.6
+
+        // ✅ MOI (fix "giu lai loi roi phat don dap sau 5-10 giay khi mang
+        // nghen" - day la loi NGHIEM TRONG hon ca jitter, xay ra o TANG GUI
+        // chu khong phai tang nhan): DataChannel.send() la NON-BLOCKING - no
+        // KHONG BAO GIO tu choi hay bao loi khi mang cham/nghen, ma AM THAM
+        // xep chunk vao 1 hang doi noi bo cua chinh thu vien WebRTC (SCTP
+        // send buffer, doc duoc qua channel.bufferedAmount()). Neu May B cu
+        // tiep tuc goi send() moi 40ms bat ke mang co theo kip hay khong,
+        // hang doi noi bo nay CU LON DAN LEN (hang tram chunk neu nghen keo
+        // dai vai giay) - roi khi mang thong tro lai, TOAN BO so do duoc xa
+        // ra CUNG LUC, khien May A nhan duoc 1 chuoi dai am thanh CU dong
+        // dap - dung la hien tuong "giu loi roi phat lai sau 5-10s" nguoi
+        // dung phan anh. Day KHONG lien quan gi den JitterQueue/PLC o Host -
+        // loi nay xay ra TRUOC do, ngay tai diem gui.
+        //
+        // Voi audio REAL-TIME (karaoke), du lieu tre qua muc nay coi nhu VO
+        // GIA TRI - phat no ra sau vai giay con TE HON la bo han (nghe lech
+        // nhip voi nguoi dang hat truc tiep). Nguyen tac dung: neu hang doi
+        // gui noi bo (bufferedAmount, tinh bang byte) da tuong duong nhieu
+        // hon SEND_BUFFER_DROP_THRESHOLD_MS mili-giay audio, CHU DONG BO
+        // chunk MOI NAY, KHONG goi send() - de hang doi tu rut xuong thay vi
+        // phinh to them. Nguong tinh DONG (dua tren size*2 byte/chunk thuc
+        // te, xem sendPcmChunkFromMic()) thay vi hang so byte cung, vi
+        // KHONG the biet truoc chinh xac sample rate/chunk size cua
+        // MicInput tu file nay.
+        private const val SEND_BUFFER_DROP_THRESHOLD_MS = 200L
+
+        // ✅ MOI (phong thu 2 cho cung 1 loai loi "giu roi phat don dap" -
+        // lan nay o PHIA NHAN thay vi phia gui): JitterQueue.pendingChunks
+        // VE LY THUYET van co the phinh to neu playoutExecutor bi tre tam
+        // thoi (vi du GC pause, thread bi block) hoac neu nhieu chunk DEN
+        // DON DAP cung luc (vi du sau khi May B tu phuc hoi tu 1 dot nghen
+        // gui rieng). Neu KHONG gioi han, hang doi nay co the tich luy hang
+        // chuc/hang tram chunk CU roi ticker se phat het chung LIEN TUC
+        // (khong dung nhac) de "duoi kip" - nghe cung giong y het trieu
+        // chung "giu loi roi phat don dap" nguoi dung mo ta, chi khac vi tri
+        // xay ra (Nhan thay vi Gui). Gioi han: neu pendingChunks vuot qua
+        // muc nay, XOA CHUNK CU NHAT (seq nho nhat) truoc khi them chunk
+        // moi - uu tien du lieu MOI hon cho karaoke real-time.
+        private const val JITTER_QUEUE_MAX_CHUNKS = JITTER_BUFFER_TARGET_CHUNKS + (SEND_BUFFER_DROP_THRESHOLD_MS / PLAYOUT_TICK_MS).toInt() + 2
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -129,6 +169,9 @@ class WebRtcManager(private val context: Context) {
     // ⚠️ Bo dem so goi bi loai do den QUA TRE (retransmit den sau khi da
     // phat qua jitter buffer) - xem chi tiet trong unpackAndDeliverPcm().
     private var outOfOrderDropCount = 0
+    // ✅ MOI: dem so chunk bi xoa o phia NHAN do JitterQueue vuot gioi han
+    // kich thuoc - xem JITTER_QUEUE_MAX_CHUNKS.
+    private var jitterQueueOverflowDropCount = 0
 
     // Callback nhan PCM tu mic remote tren May A
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
@@ -145,6 +188,9 @@ class WebRtcManager(private val context: Context) {
     private var sendMaxGapMsInWindow = 0L
     private var sendWindowStartNanoTime = 0L
     private var sendChannelNotOpenSkipCount = 0
+    // ✅ MOI: dem so chunk bi CHU DONG BO o phia GUI (May B) do hang doi gui
+    // noi bo cua WebRTC da qua day - xem SEND_BUFFER_DROP_THRESHOLD_MS.
+    private var sendBufferOverflowDropCount = 0
 
     // ⚠️ MOI (fix loi phat hien khi phan tich maxRetransmits=1 + ordered=false
     // - xem giai thich day du o unpackAndDeliverPcm()): DataChannel voi
@@ -327,6 +373,39 @@ class WebRtcManager(private val context: Context) {
             return
         }
 
+        // ✅ MOI (fix "giu lai loi roi phat don dap sau 5-10 giay" - xem giai
+        // thich day du o SEND_BUFFER_DROP_THRESHOLD_MS): TRUOC KHI gui chunk
+        // MOI, kiem tra hang doi gui NOI BO cua chinh thu vien WebRTC
+        // (channel.bufferedAmount(), don vi byte) da tich luy bao nhieu du
+        // lieu CHUA kip gui di qua mang. Neu con so nay da tuong duong
+        // nhieu hon SEND_BUFFER_DROP_THRESHOLD_MS mili-giay audio (suy ra tu
+        // kich thuoc 1 chunk hien tai: size sample * 2 byte/sample, gia
+        // dinh nhip gui ~40ms/chunk - xem PLAYOUT_TICK_MS), nghia la mang da
+        // NGHEN THUC SU (khong phai roi 1 goi don le nua) - CHU DONG BO
+        // CHUNK MOI NAY, KHONG goi channel.send(), thay vi de WebRTC tiep
+        // tuc xep chong len hang doi. Day chinh la diem khac biet quyet
+        // dinh: bo NGAY LUC NAY (mat 1 khoang am thanh ngan, giong nhu tin
+        // hieu yeu) thay vi de no bi "giu lai" roi xa ra tre hang giay sau.
+        val bufferedBytes = try {
+            channel.bufferedAmount()
+        } catch (e: Exception) {
+            0L
+        }
+        val bytesPerChunk = (size * 2).coerceAtLeast(1)
+        val approxMsBuffered = (bufferedBytes * PLAYOUT_TICK_MS) / bytesPerChunk
+        if (approxMsBuffered >= SEND_BUFFER_DROP_THRESHOLD_MS) {
+            sendBufferOverflowDropCount++
+            if (sendBufferOverflowDropCount % 10 == 0) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-SendSide] 🚨 May B: hang doi gui noi bo dang tich " +
+                        "~${approxMsBuffered}ms du lieu (nguong=${SEND_BUFFER_DROP_THRESHOLD_MS}ms) - " +
+                        "MANG DANG NGHEN THUC SU. Da CHU DONG BO $sendBufferOverflowDropCount chunk MOI " +
+                        "(khong gui) de tranh hien tuong 'giu loi phat lai tre hang giay'."
+                )
+            }
+            return
+        }
+
         // ✅ MOI (chan doan - xem giai thich day du o khai bao cac bien
         // lastSendNanoTime/sendCountInWindow phia tren): do nhip GUI thuc te
         // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang.
@@ -496,6 +575,30 @@ class WebRtcManager(private val context: Context) {
                 return
             }
             queue.pendingChunks[seq] = chunk
+
+            // ✅ MOI (xem giai thich day du o JITTER_QUEUE_MAX_CHUNKS): neu
+            // hang doi vuot qua gioi han, XOA CAC CHUNK CU NHAT (seq nho
+            // nhat) cho toi khi ve lai duoi gioi han - dam bao ticker
+            // KHONG BAO GIO phai "chay dua" phat hang chuc chunk ton dong,
+            // uu tien giu du lieu MOI (gan voi thoi diem hien tai) hon.
+            while (queue.pendingChunks.size > JITTER_QUEUE_MAX_CHUNKS) {
+                val oldestSeq = queue.pendingChunks.firstKey()
+                queue.pendingChunks.remove(oldestSeq)
+                jitterQueueOverflowDropCount++
+                // Nhay nextSeqToPlay toi ngay sau chunk vua bi xoa, tranh
+                // ticker con co gang "cho" 1 seq da khong con trong hang doi.
+                val currentBoundary = queue.nextSeqToPlay
+                if (currentBoundary == null || (oldestSeq - currentBoundary) >= 0) {
+                    queue.nextSeqToPlay = oldestSeq + 1
+                }
+            }
+            if (jitterQueueOverflowDropCount > 0 && jitterQueueOverflowDropCount % 10 == 0) {
+                CaptureLogBus.log(
+                    "[JitterBuffer-Overflow] 🚨 $clientId: hang doi nhan vuot gioi han " +
+                        "($JITTER_QUEUE_MAX_CHUNKS chunk) $jitterQueueOverflowDropCount lan - " +
+                        "da xoa chunk CU de tranh phat don dap khi ticker duoi kip."
+                )
+            }
         }
         ensurePlayoutTicker(clientId)
     }
