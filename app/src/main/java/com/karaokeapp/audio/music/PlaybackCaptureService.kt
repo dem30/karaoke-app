@@ -37,8 +37,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -114,30 +112,6 @@ class PlaybackCaptureService : Service() {
     // cho, tao dung kieu "im lang roi don cuc" da quan sat duoc. Giu WifiLock
     // trong suot phien Mixer Test (May A dang nhan PCM tu May B qua Wi-Fi) -
     // song song voi WakeLock da co san o tren.
-    //
-    // ⚠️ SUA LOI MOI (ban fix o tren VAN CHUA DU - da xac nhan qua log THUC
-    // TE: hien tuong "giat cum" o May A KHONG doi ngay ca sau khi WifiLock
-    // nay da chay dung, khong loi): theo tai lieu chinh thuc cua Android
-    // (source.android.com/docs/core/connect/wifi-low-latency),
-    // WIFI_MODE_FULL_LOW_LATENCY CHI thuc su kich hoat khi DONG THOI (1)
-    // app dang giu lock VA (2) app do dang o FOREGROUND (tuc la app TREN
-    // CUNG nguoi dung dang nhin thay, KHONG chi la "foreground service").
-    // Voi dung mo hinh su dung cua app nay - May A chay PlaybackCaptureService
-    // (foreground SERVICE) trong khi NGUOI DUNG dang xem YouTube TOAN MAN
-    // HINH (YouTube moi la app foreground THAT) - dieu kien (2) KHONG BAO
-    // GIO duoc thoa man. Ket qua: wifiLock.acquire() van chay khong loi,
-    // log van bao "Da kich hoat", nhung che do low-latency THUC RA khong
-    // bao gio duoc kich hoat that su tren May A - Wi-Fi am tham roi ve
-    // power-save binh thuong nhu chua co WifiLock gi ca. Day la ly do ban
-    // fix truoc do "dung nhung khong an" - va cung giai thich vi sao May B
-    // (nguoi cam mic, thuong mo DUNG app karaoke o foreground that, khong
-    // xem YouTube song song) lai KHONG bi hien tuong nay (log SendSide sach).
-    //
-    // Sua: WIFI_MODE_FULL_HIGH_PERF (theo dung tai lieu WifiManager) KHONG
-    // co rang buoc "phai foreground app" - hoat dong "even when the device
-    // screen is off". Doi uu tien: LUON dung HIGH_PERF cho May A (noi luon
-    // chay nen sau YouTube), thay vi uu tien LOW_LATENCY nhu truoc (xem
-    // acquireWifiLock() ben duoi).
     private var wifiLock: WifiManager.WifiLock? = null
 
     private var micInput: MicInput? = null
@@ -282,19 +256,6 @@ class PlaybackCaptureService : Service() {
         fun getActiveRoomQrData(): QrJoinData? = activeRoomQrData
 
         private val vocalPushLock = Any()
-
-        // ✅ MOI (cung fix voi ACTION_START_HOST_ROOM/ACTION_STOP_HOST_ROOM -
-        // xem giai thich day du o onStartCommand()): startHostRoomInternal()/
-        // stopHostRoomInternal() gio chay tren serviceScope (Dispatchers.
-        // Default, THREAD POOL RIENG) thay vi tuan tu tren main thread nhu
-        // truoc - neu nguoi dung bam Start/Stop/Start don dap, 2 lan goi co
-        // THE chay DAN XEN THAT SU tren cac thread khac nhau, doc/ghi
-        // hostSignalingServer/hostWebRtcManager (KHONG @Volatile, KHONG dong
-        // bo hoa) khong an toan nua - truoc day an toan "tinh co" vi moi thu
-        // chay tuan tu tren CUNG 1 main thread. Mutex nay dam bao CHI 1 thao
-        // tac mo/dong phong duoc chay tai 1 thoi diem, giu dung thu tu FIFO
-        // nguoi dung bam.
-        private val hostRoomLock = Mutex()
 
         @Volatile
         private var localMicMutedForMixer = false
@@ -569,30 +530,20 @@ class PlaybackCaptureService : Service() {
     }
 
     /**
-     * ⚠️ SUA LOI (mau thuan giua COMMENT va CODE - da xac nhan qua doc lai
-     * chinh file nay): comment o khai bao field wifiLock phia tren (dong
-     * "Sua: WIFI_MODE_FULL_HIGH_PERF ... Doi uu tien: LUON dung HIGH_PERF
-     * cho May A") da ghi RO rang HIGH_PERF phai la lua chon UU TIEN cho May A
-     * (chay nen duoi 1 app khac dang foreground THAT, vd YouTube toan man
-     * hinh) - vi LOW_LATENCY chi thuc su kich hoat khi CHINH app giu lock
-     * dang o foreground THAT, dieu kien khong bao gio dung voi May A. NHUNG
-     * code thuc te ben duoi (TRUOC BAN SUA nay) van uu tien LOW_LATENCY tren
-     * API 29+ - dung NGUOC lai voi chinh ket luan da rut ra, khien ban "fix"
-     * truoc do khong co tac dung that su du wifiLock.acquire() van chay
-     * khong loi va log van bao "Da kich hoat" (day chinh la ly do hien
-     * tuong "giat cum" duoc bao la KHONG doi ngay ca sau ban vi de fix nay).
-     *
-     * Sua: LUON dung WIFI_MODE_FULL_HIGH_PERF cho May A, khong con nhanh
-     * kiem tra SDK_INT/uu tien LOW_LATENCY nua - HIGH_PERF co tu API 1, hoat
-     * dong "even when the device screen is off" theo tai lieu WifiManager,
-     * KHONG co rang buoc phai la app foreground that.
+     * ✅ MOI (xem giai thich day du o khai bao field wifiLock phia tren):
+     * WIFI_MODE_FULL_LOW_LATENCY (API 29+) uu tien do tre thap hon ca
+     * WIFI_MODE_FULL_HIGH_PERF - fallback ve HIGH_PERF cho may cu hon.
      */
     private fun acquireWifiLock() {
         try {
             if (wifiLock == null) {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                @Suppress("DEPRECATION")
-                val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
                 wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MixerWifiLock").apply {
                     setReferenceCounted(false)
                 }
@@ -928,27 +879,7 @@ class PlaybackCaptureService : Service() {
         mixer = mix
         micInput = mic
         finalMixLimiter = finalLimiterInstance
-        // ✅ FIX ("May A tu thoat/crash gan nhu tuc thi ngay khi ICE bao
-        // CONNECTED va khung audio dau tien tu May B chuan bi toi" - xac
-        // nhan qua log thuc te: log dung dot ngot NGAY TAI dong "Trang thai
-        // ket noi ICE: CONNECTED", dung luc Mixer Test dang chay song):
-        // pushRemoteVocalChunk() (goi tu LUONG WEBRTC NATIVE, khac han main
-        // thread) doc activeMixerInstance BEN TRONG synchronized(
-        // vocalPushLock) - nhung dong gan gia tri o day TRUOC DAY lai gan
-        // TRUC TIEP, KHONG nam trong cung khoi synchronized do. synchronized
-        // chi tao duoc "memory barrier" (dam bao thread khac THAY duoc gia
-        // tri moi + trang thai noi bo day du cua object) khi CA HAI phia
-        // (ghi va doc) cung dung CHUNG 1 lock - o day chi 1 phia khoa, phia
-        // kia ghi tu do, nen luong WebRTC co the doc phai activeMixerInstance
-        // CU (null) hoac te hon - tham chieu toi object LowLatencyMixer o
-        // trang thai CHUA "publish" xong (thieu happens-before sau .apply {
-        // start() }) -> hanh vi khong xac dinh ngay khi goi mix.pushVocal()
-        // dong ke tiep trong pushRemoteVocalChunk(). Sua: bao dong gan nay
-        // trong CUNG mot khoi synchronized(vocalPushLock) voi noi doc, dam
-        // bao luong WebRTC luon thay dung trang thai moi nhat.
-        synchronized(vocalPushLock) {
-            activeMixerInstance = mix
-        }
+        activeMixerInstance = mix
 
         // ✅ SUA (Phase 6 - bo HowlGuard): khong con reset bien howl* (da go
         // bo hoan toan). Thay vao do, reset state DSP NOI BO (filter/
@@ -1089,23 +1020,13 @@ class PlaybackCaptureService : Service() {
 
         micInput?.stopCapture()
         micInput = null
-        // ✅ FIX (cung nguyen nhan/giai thich voi noi gan activeMixerInstance
-        // = mix o startMixerTestInternal() phia tren, xem giai thich day du
-        // o do): dat activeMixerInstance = null TRUOC khi goi mixer?.stop()
-        // (thay vi SAU nhu ban cu) - dong het "cua so" race: neu luong WebRTC
-        // (dang co the dung goi pushRemoteVocalChunk()) doc activeMixerInstance
-        // dung vao khoang giua luc code o day dang stop() mixer, no se thay
-        // NULL ngay va return som (dong 491) thay vi van con giu tham chieu
-        // toi 1 LowLatencyMixer dang/da bi dung giua chung.
-        synchronized(vocalPushLock) {
-            activeMixerInstance = null
-        }
         mixer?.stop()
         mixer = null
         mixerOutputRouter?.stop()
         mixerOutputRouter = null
         finalMixLimiter?.reset()
         finalMixLimiter = null
+        activeMixerInstance = null
 
         // ✅ SUA (Phase 6): KHONG con xoa vocalChannels o day - lam vay se
         // mat het volume/EQ nguoi dung da chinh moi lan Tat/Bat Mixer Test
@@ -1187,44 +1108,11 @@ class PlaybackCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START_HOST_ROOM -> {
-                // ✅ FIX ("May A tu thoat/ANR khi mo phong moi luc dang co
-                // phong cu" - xac nhan qua log thuc te: log dung dot ngot
-                // ngay sau dong "Dang co phong cu chay - tu dong dong truoc
-                // khi tao phong moi" + "Address already in use", KHONG co
-                // exception nao duoc CaptureLogBus ghi them sau do): giong
-                // HET tinh than fix cu da co san cho mic.startCapture() trong
-                // startMixerTestInternal() (xem giai thich day du o do) -
-                // startHostRoomInternal() TRUOC DAY chay DONG BO tren MAIN
-                // THREAD (onStartCommand KHONG tu tao thread rieng). Ham nay
-                // goi stopHostRoomInternal() -> SignalingServer.stopServer()
-                // -> WebSocketServer.stop() cua thu vien Java-WebSocket -
-                // ham stop() nay BLOCKING, join() cac thread ket noi/selector
-                // NOI BO cua thu vien, co the mat toi hang tram ms-vai giay
-                // (dac biet neu dang co 1 client/May B vua join). Chan MAIN
-                // THREAD lau nhu vay trong 1 Service dang chay cac tac vu
-                // audio khac (AudioRecord/MediaProjection) VUOT QUA watchdog
-                // ANR cua he thong (~5s) -> OS AM THAM KILL tien trinh, KHONG
-                // phai crash Java nen KHONG CO exception/dialog nao ca -
-                // dung khop voi trieu chung "app tu thoat, khong dialog".
-                // Sua: chuyen toan bo startHostRoomInternal() (bao gom buoc
-                // dong phong cu ben trong) sang serviceScope (Dispatchers.
-                // Default, thread pool rieng) - giai phong main thread ngay
-                // lap tuc. AN TOAN: moi callback ve MainActivity
-                // (onRoomReadyCallback/onRoomErrorCallback/
-                // onRoomMicStatusCallback) da tu boc rieng runOnUiThread{}
-                // ngay tai noi dang ky trong MainActivity.kt, nen goi tu
-                // thread nao cung khong sao.
-                serviceScope.launch { hostRoomLock.withLock { startHostRoomInternal() } }
+                startHostRoomInternal()
                 return START_NOT_STICKY
             }
             ACTION_STOP_HOST_ROOM -> {
-                // ✅ FIX (cung nguyen nhan voi ACTION_START_HOST_ROOM o tren):
-                // stopHostRoomInternal() cung goi SignalingServer.stopServer()
-                // (blocking) - chuyen sang serviceScope de tranh chan main
-                // thread/ANR tuong tu. Dung CHUNG hostRoomLock voi nhanh Start
-                // o tren de 2 thao tac khong bao gio chay dan xen (xem giai
-                // thich day du o khai bao hostRoomLock).
-                serviceScope.launch { hostRoomLock.withLock { stopHostRoomInternal() } }
+                stopHostRoomInternal()
                 return START_NOT_STICKY
             }
             ACTION_STOP_ALL -> {

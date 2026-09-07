@@ -2,7 +2,6 @@ package com.karaokeapp.webrtc
 
 import android.content.Context
 import android.media.AudioManager
-import android.media.MediaRecorder
 import android.util.Log
 import com.karaokeapp.audio.music.CaptureLogBus
 import org.webrtc.*
@@ -10,93 +9,64 @@ import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 /**
- * Phase 5 (BAN VIET LAI - bo DataChannel) - Quan tri ket noi WebRTC LAN cho
- * karaoke.
+ * Phase 5 - Quan tri ket noi WebRTC LAN cho karaoke.
  *
- * ⚠️ THAY DOI KIEN TRUC LON (thay the toan bo cach lam cu): BAN CU dung
- * DataChannel de tu tay dong goi/gui ShortArray PCM tho, tu gom chunk
- * (SEND_BATCH_SAMPLES) de "nuong chieu" SCTP, tu code logic retransmit
- * (maxRetransmits=1). Van de: sau nhieu vong sua (retransmit, gom chunk,
- * WifiLock...), hien tuong "giat cum 150-400ms" van khong het - vi goc re
- * that su la PCM tho qua DataChannel hoan toan KHONG co bat ky co che nao
- * de xu ly mat goi/jitter mang THAT (khong giong RTP/Opus): 1 goi PCM ~80ms
- * bi mat/tre la 1 "lo hong" cung trong am thanh, cho du co retransmit 1 lan
- * thi cung chi giup voi mat goi DON LE ngau nhien, khong giup duoc khi
- * mang dao dong lien tuc (jitter tich luy).
+ * ⚠️ LUA CHON KIEN TRUC: dung DataChannel (khong dung AudioTrack/MediaStreamTrack
+ * chuan cua WebRTC) de truyen PCM THO (ShortArray) truc tiep. Ly do: toan bo
+ * pipeline hien tai (Mixer, Limiter, EQ...) deu thao tac truc tiep tren
+ * ShortArray PCM tho - dung AudioTrack chuan cua WebRTC se bat buoc phai
+ * giai ma Opus roi tu tay lay lai PCM qua 1 lop API rieng (AudioDeviceModule
+ * tuy bien), phuc tap hon nhieu so voi loi ich mang lai o quy mo 2-3 may LAN.
  *
- * ✅ CACH LAM MOI: dung dung AudioTrack/MediaStreamTrack CHUAN cua WebRTC -
- * de chinh libwebrtc lo:
- * - Ma hoa Opus (nen ~24-40kbps thay vi ~688kbps PCM tho, on dinh hon
- *   nhieu tren Wi-Fi dong nguoi dung/hotspot).
- * - Jitter buffer thich ung (NetEQ) - tu dong gian/nen phat lai theo dieu
- *   kien mang THAT thoi, khong phai gia tri gom-chunk co dinh (80ms) dat
- *   tay nhu ban cu.
- * - PLC (Packet Loss Concealment) - khi mat goi, NetEQ "doan" va lap day
- *   khoang trong bang noi suy tin hieu am thanh THAT, nghe muot hon han 1
- *   khoang PCM = 0 hoan toan (im lang cung) nhu cach cu khi mat 1 batch.
- * - FEC/RTX o tang RTP - co san, khong phai tu code retransmit logic tay
- *   nhu DATA_CHANNEL_MAX_RETRANSMITS truoc day.
+ * ⚠️ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
+ * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN.
  *
- * ⚠️ DANH DOI CAN BIET (so voi ban PCM tho cu):
- * 1) Do tre ma hoa/giai ma Opus (~20-60ms tuy cau hinh) cong them vao pipeline -
- *    BU LAI boi jitter buffer on dinh hon nhieu, nen do tre THUC TE nghe
- *    duoc (bao gom ca thoi gian "cho bu goi mat") thuong THAP HON ban PCM
- *    tho khi mang khong hoan hao 100%.
- * 2) Audio bi nen mat mat (lossy) qua Opus - giong hat co the mat 1 chut
- *    "sac net" cuc cao so voi PCM tho 44.1kHz/16-bit, nhung o bitrate thoai
- *    (~32kbps+) cho giong nguoi la khong dang ke, va Opus duoc thiet ke
- *    rieng cho tin hieu thoai/nhac chat luong cao.
- * 3) ⚠️ QUAN TRONG NHAT can xu ly: AudioTrackSink cua WebRTC tra PCM da
- *    giai ma o SAMPLE RATE THUC TE cua duong truyen (thuong 48000Hz vi Opus
- *    hoat dong noi bo o 48kHz), trong khi TOAN BO pipeline Mixer/VocalChannel/
- *    AutoGain/EQ/Compressor hien co deu gia dinh CUNG 44100Hz (xem
- *    SAMPLE_RATE trong LowLatencyMixer.kt). PHAI resample ve 44100Hz truoc
- *    khi day vao pushRemoteVocalChunk(), neu khong giong hat se bi sai toc
- *    do/cao do (nhanh hon ~8.8% neu khong resample voi nguon 48kHz). Xem
- *    resampleLinear() ben duoi - dung linear interpolation don gian (du
- *    dung cho thoai o do tre thap, KHONG phai bo resample "chuan studio" -
- *    neu nghe ra aliasing/mat chat luong ro ret, can thay bang 1 thu vien
- *    resample chuyen dung, vd Speex resampler qua JNI).
+ * ✅ CAP NHAT (fix "tieng ret ret cua Mic B qua mang, trong khi Mic A tai
+ * cho luon muot" - phat hien qua so sanh thuc te 2 nguon): truoc day
+ * DataChannel.Init() dat ordered=false, maxRetransmits=0 - nghia la UDP
+ * THUAN TUYET DOI: BAT KY goi PCM ~40ms nao bi rot tren Wi-Fi (rat thuong
+ * xay ra tren mang thuc te, dac biet qua Hotspot hoac Wi-Fi dong nguoi dung)
+ * se KHONG BAO GIO duoc gui lai - tao thanh 1 khoang trong PCM dot ngot
+ * (thay vi noi tiep lien tuc) o dung diem do, nghe nhu tieng "ret/tach" ro
+ * rang. Day chinh la nguyen nhan khien Mic B (qua mang) co tieng ret ret
+ * con Mic A (tai cho, khong qua mang) thi luon on dinh - vi Mic A khong he
+ * di qua DataChannel/mang, khong co co hoi mat goi.
  *
- * ⚠️ MAY B (MIC) - FILE NGOAI PHAM VI SUA O DAY: sau thay doi nay, viec
- * "capture PCM tu mic" KHONG con do MicInput/AudioRecord tu code cua app
- * dam nhiem nua o phia gui - chinh AudioDeviceModule cua WebRTC (ben trong
- * factory) se TU mo AudioRecord rieng cua no de "nuoi" AudioSource/AudioTrack
- * duoc tao trong startClientPeer() ben duoi. Bat ky noi nao (Activity/Service
- * khac, KHONG nam trong danh sach file da xem lai) dang goi
- * `mic.startCapture(onPcmChunk = { ... webRtcManager.sendPcmChunkFromMic(...) ... })`
- * o phia May B PHAI DUOC SUA: xoa hoan toan mic.startCapture()/
- * sendPcmChunkFromMic() (ham nay da bi xoa khoi class nay), CHI con goi
- * startClientPeer() la du - WebRTC tu lo phan con lai.
+ * Sua: doi maxRetransmits=0 -> maxRetransmits=1 (giu ordered=false) - cho
+ * phep gui lai TOI DA 1 LAN neu goi dau bi mat, ma KHONG bat "ordered" (vi
+ * ordered=true se bat WebRTC PHAI cho goi truoc den du, gay tich luy do tre
+ * neu co goi bi mat lien tuc - hoan toan sai voi muc tieu do tre thap cua
+ * karaoke). 1 lan retransmit la muc can bang: du tang do tre trung binh
+ * len 1 chieu round-trip (thuong chi vai ms tren LAN cung Wi-Fi), nhung du
+ * de "cuu" phan lon cac goi bi rot ngau nhien don le - loai bo nay khong
+ * loai het duoc tieng ret (neu mang thuc su te lien tuc, van se con mat
+ * goi sau ca lan retry), nhung giam dang ke tan suat so voi khong retry gi
+ * ca. Neu sau nay van con nghe ret ret ro sau khi test, co the thu tang
+ * len maxRetransmits=2 (danh doi them chut do tre de on dinh hon nua).
  *
- * ⚠️ GIOI HAN HIEN TAI (giu nguyen tu ban cu): chi thiet ke cho DUNG 2 MAY
- * (1 Mixer + 1 Mic tu xa) nhu PLAN.md muc 7 mo ta.
+ * ⚠️ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
+ * nhu PLAN.md muc 7 mo ta - moi client co 1 scratch buffer PCM RIENG
+ * (ConcurrentHashMap theo clientId) de tranh dua du lieu (race) NEU sau nay
+ * mo rong len 3+ may gui PCM dong thoi; nhung cac phan khac (vi du
+ * WebRtcManager dung 1 `localDataChannel` DUY NHAT o phia May B) van gia
+ * dinh 1-mic-1-peer, chua ho tro 1 may B gui toi NHIEU May A cung luc (khong
+ * nam trong pham vi Phase 5 theo PLAN).
  */
 class WebRtcManager(private val context: Context) {
 
     companion object {
         private const val TAG = "WebRtcManager"
+        private const val CHANNEL_LABEL = "karaoke_pcm_stream"
 
-        // Sample rate CHUNG cua toan bo pipeline DSP hien co (Mixer/VocalChannel/
-        // AutoGain/EQ/Compressor...) - xem SAMPLE_RATE trong LowLatencyMixer.kt.
-        // AudioTrackSink co the giao PCM o sample rate KHAC (thuong 48000Hz) -
-        // moi truong hop nhu vay PHAI duoc resample ve dung gia tri nay truoc
-        // khi goi onRemotePcmChunk (xem deliverDecodedAudio()/resampleLinear()).
-        private const val TARGET_SAMPLE_RATE = 44100
-
-        private const val LOCAL_AUDIO_TRACK_ID = "karaoke_mic_audio"
-        private const val LOCAL_STREAM_ID = "karaoke_stream"
-
-        // ✅ MOI: gioi han bitrate Opus tren moi RtpSender (phia May B gui di) -
-        // Wi-Fi LAN thua suc bang thong cao hon nhieu, nhung KHONG can thiet:
-        // gioi han o muc "thoai chat luong cao" (~40kbps) giup on dinh nhip
-        // goi tin hon la de WebRTC tu do len muc toi da mac dinh (co the toi
-        // ~510kbps cho Opus stereo full bandwidth) - muc cao khong can thiet
-        // cho karaoke mono, ma con lam tang rui ro dot bien bang thong tren
-        // Wi-Fi dong nguoi dung/hotspot re tien.
-        private const val OPUS_MAX_BITRATE_BPS = 40_000
+        // ✅ MOI (xem giai thich chi tiet o dau file): cho phep gui lai TOI
+        // DA 1 lan neu goi PCM dau bi rot tren mang - can bang giua do tre
+        // thap (khong dung ordered=true) va giam tieng ret do mat goi don
+        // le. Dat thanh hang so o day de de dang chinh lai (vi du thu 2)
+        // neu test thuc te van con nghe ret sau ban sua nay.
+        private const val DATA_CHANNEL_MAX_RETRANSMITS = 1
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -105,36 +75,34 @@ class WebRtcManager(private val context: Context) {
     // tham chiếu ADM để closeAll() có thể release() nó - trước đây ADM được
     // tạo local trong initializeFactory() rồi bỏ luôn, không ai giữ để dọn.
     private var audioDeviceModule: JavaAudioDeviceModule? = null
-
     // May A luu danh sach PeerConnection cua cac Mic con: clientId -> PeerConnection
     private val peerConnections = ConcurrentHashMap<String, PeerConnection>()
+    // May B luu DataChannel gui audio ve A
+    private var localDataChannel: DataChannel? = null
 
-    // ✅ MOI (thay the localDataChannel cu): May B giu tham chieu AudioSource/
-    // AudioTrack CUC BO cua chinh no - can giu de dispose() dung cach trong
-    // closeAll(), tranh ro ri native object cua WebRTC.
-    private var localAudioSource: AudioSource? = null
-    private var localAudioTrack: org.webrtc.AudioTrack? = null
+    // ✅ SUA (khac code mau goc): MOI clientId co 1 scratch buffer RIENG,
+    // KHONG dung chung 1 buffer cho moi client - buffer dung chung se bi
+    // GHI DE/DUA DU LIEU neu 2 client gui PCM gan nhu dong thoi (callback
+    // onMessage cua WebRTC co the chay tren cac thread khac nhau tuy
+    // PeerConnection). Voi dung 2 may (1 mic tu xa) nhu Phase 5 mo ta thi
+    // khong xay ra dua, nhung sua san de an toan neu mo rong len 3+ may.
+    private val pcmScratchBuffers = ConcurrentHashMap<String, ShortArray>()
 
-    // Callback nhan PCM (DA GIAI MA, DA RESAMPLE ve TARGET_SAMPLE_RATE) tu
-    // mic remote tren May A - CHU KY KHONG DOI so voi ban DataChannel cu, nen
-    // PlaybackCaptureService.kt KHONG can sua gi o phia goi callback nay.
+    // Callback nhan PCM tu mic remote tren May A
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
 
-    // ✅ MOI (thay the pcmScratchBuffers cu): scratch buffer PCM MONO sau khi
-    // da downmix+resample, RIENG cho tung clientId (tranh dua du lieu neu mo
-    // rong len nhieu May B/C gui dong thoi - AudioTrackSink.onData() co the
-    // duoc goi tu cac thread noi bo khac nhau cua WebRTC tuy peer).
-    private val outputScratchBuffers = ConcurrentHashMap<String, ShortArray>()
-
-    // ✅ MOI: state resample RIENG cho tung clientId - giu vi tri phan-so
-    // (fractional position) giua 2 lan goi onData() lien tiep de resample
-    // KHONG bi "giat/click" o ranh gioi buffer (xem resampleLinear()).
-    private val resampleStates = ConcurrentHashMap<String, ResampleState>()
-
-    private class ResampleState {
-        var fracPos: Double = 0.0
-        var lastSample: Short = 0
-    }
+    // ✅ MOI (CHAN DOAN TAM THOI - do nhip GUI PCM thuc te tu chinh May B,
+    // TRUOC khi bat cu qua DataChannel): so sanh voi log nhan o
+    // PlaybackCaptureService.logRemoteChunkTiming() de biet giat dut quang
+    // la do MAY B GUI KHONG DEU (vi du chinh MicInput cua May B bi nghen)
+    // hay do MANG/DataChannel lam tre/rot giua duong (May B gui deu nhung
+    // May A nhan khong deu). Du kien go bo sau khi xac dinh xong nguyen
+    // nhan, KHONG phai code san xuat lau dai.
+    private var lastSendNanoTime = 0L
+    private var sendCountInWindow = 0
+    private var sendMaxGapMsInWindow = 0L
+    private var sendWindowStartNanoTime = 0L
+    private var sendChannelNotOpenSkipCount = 0
 
     init {
         initializeFactory()
@@ -146,38 +114,24 @@ class WebRtcManager(private val context: Context) {
             .createInitializationOptions()
         PeerConnectionFactory.initialize(options)
 
-        // ✅ GIU NGUYEN tu ban cu: tu tao ADM tuong minh, tat xu ly hardware
-        // AEC/NS (van dung duoc du gio DA dung duong audio chuan cua WebRTC -
-        // pipeline DSP rieng cua app (VocalChannel: AutoGain/EQ/Compressor/
-        // Echo) van la noi xu ly "chat am", KHONG muon WebRTC tu y AEC/NS o
-        // tang native/hardware truoc khi PCM toi duoc tay app).
+        // ✅ FIX ("May A bi nho tieng khi May B ket noi"): TRUOC DAY khong
+        // truyen AudioDeviceModule (ADM) tuong minh -> WebRTC tu dung ADM
+        // mac dinh (JavaAudioDeviceModule). Du ca app CHI dung DataChannel
+        // de truyen PCM tho (KHONG he tao AudioTrack/MediaStreamTrack audio
+        // nao), ADM mac dinh van co the tu xin AudioFocus va/hoac doi
+        // AudioManager.mode sang MODE_IN_COMMUNICATION ngay khi PeerConnection
+        // that su thiet lap (dung luc May B connect) - day la hanh vi NOI BO
+        // cua thu vien WebRTC, KHONG phai code cua app chu dong lam. Hau qua:
+        // giong het kieu "duck HAL/OEM" da ghi chu trong PlaybackCaptureService
+        // - lam STREAM_MUSIC (MusicInput dang capture) hoac STREAM_SYSTEM
+        // (Mixer dang phat) bi nho tieng.
         //
-        // ✅ FIX (phat hien sau khi doc lai MicInput.kt): setUseHardware*(false)
-        // o tren CHI tat AEC/NS o tang xu ly cua WebRTC (webrtc::AudioProcessing),
-        // KHONG doi AudioSource ma AudioRecord noi bo cua ADM mo. Neu khong tu
-        // set, JavaAudioDeviceModule mac dinh dung
-        // MediaRecorder.AudioSource.VOICE_COMMUNICATION - nguon nay tren nhieu
-        // may van bi HAL/audio driver ap AEC/NS/AGC PHAN CUNG truoc khi WebRTC
-        // kip nhan duoc PCM, bat ke cac co setUseHardware*(false) da tat gi o
-        // tang tren. Dieu nay khien Mic B (qua WebRTC) khong con "cung 1 tin
-        // hieu tho" nhu Mic A (MicInput.kt, dung UNPROCESSED/fallback MIC) -
-        // sai voi gia dinh kien truc ghi trong comment lop class. Dong bo bang
-        // cach uu tien UNPROCESSED, fallback MIC neu thiet bi khong ho tro -
-        // giong het logic tryBuildAudioRecord() trong MicInput.kt.
-        val preferredAudioSource = if (
-            context.getSystemService(Context.AUDIO_SERVICE) is AudioManager &&
-            (context.getSystemService(Context.AUDIO_SERVICE) as AudioManager)
-                .getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
-        ) {
-            MediaRecorder.AudioSource.UNPROCESSED
-        } else {
-            MediaRecorder.AudioSource.MIC
-        }
-
+        // Sua: tu tao ADM tuong minh, tat het xu ly hardware AEC/NS (khong
+        // can thiet vi app khong dung duong audio chuan cua WebRTC) - giam
+        // toi da kha nang ADM dung cham vao AudioManager.
         val audioDeviceModule = JavaAudioDeviceModule.builder(context)
             .setUseHardwareAcousticEchoCanceler(false)
             .setUseHardwareNoiseSuppressor(false)
-            .setAudioSource(preferredAudioSource)
             .createAudioDeviceModule()
         this.audioDeviceModule = audioDeviceModule
 
@@ -193,17 +147,6 @@ class WebRtcManager(private val context: Context) {
     // bat ke ADM duoc cau hinh the nao. Ep tra ve MODE_NORMAL ngay khi phat
     // hien bi doi - giong tinh than [AutoReassert] da co san trong
     // PlaybackCaptureService cho vu "duck HAL/OEM" cua Honor.
-    //
-    // ⚠️ LUU Y KHAC VOI BAN CU: gio May B THAT SU dung duong audio chuan cua
-    // WebRTC (AudioSource/AudioTrack that, khong chi PeerConnection "rong"
-    // nhu khi con DataChannel) - kha nang ADM tu doi AudioManager.mode sang
-    // MODE_IN_COMMUNICATION cao hon truoc (day la hanh vi binh thuong/mong
-    // doi cua 1 audio call that qua WebRTC). Neu app can giu MODE_NORMAL
-    // xuyen suot (vi ly do tuong thich voi OutputRouter/AudioTrack rieng cua
-    // Mixer ben May A), ham nay van can thiet; nhung CAN NGHE THU rieng xem
-    // co gay tac dung phu gi voi chat luong capture mic cua May B khong (vi
-    // MODE_IN_COMMUNICATION thuong di kem 1 so xu ly hardware co the co ich
-    // cho cuoc goi thoai that).
     private fun reassertNormalAudioModeIfNeeded(tag: String) {
         try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -256,59 +199,17 @@ class WebRtcManager(private val context: Context) {
 
         peerConnections[signalingClient.clientId] = pc
 
-        // ✅ MOI (thay the toan bo DataChannel.Init/createDataChannel cu):
-        // tao AudioSource/AudioTrack THAT - day la thay doi cot loi cua ban
-        // viet lai nay. Tat CA xu ly am thanh noi bo (APM) cua WebRTC qua
-        // constraints "goog*" - van muon giu tin hieu mic THO nhat co the
-        // truoc khi Opus encode, vi Host van tu lam AutoGain/EQ/Compressor/
-        // Echo rieng qua VocalChannel (giu dung tinh than "1 pipeline DSP
-        // duy nhat, khong chong cheo" da co tu Phase 6).
-        val audioConstraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("googTypingNoiseDetection", "false"))
+        // ✅ SUA (fix tieng ret ret - xem giai thich chi tiet o dau file):
+        // doi maxRetransmits tu 0 (UDP thuan, khong retry) -> 1 (cho phep
+        // gui lai 1 lan) - giu nguyen ordered=false (KHONG doi thanh true,
+        // tranh gay tich luy do tre neu goi bi mat lien tuc).
+        val init = DataChannel.Init().apply {
+            ordered = false
+            maxRetransmits = DATA_CHANNEL_MAX_RETRANSMITS
         }
-        val source = factory?.createAudioSource(audioConstraints)
-        localAudioSource = source
-        val track = factory?.createAudioTrack(LOCAL_AUDIO_TRACK_ID, source)
-        localAudioTrack = track
+        localDataChannel = pc.createDataChannel(CHANNEL_LABEL, init)
 
-        if (track != null) {
-            val sender = pc.addTrack(track, listOf(LOCAL_STREAM_ID))
-
-            // ✅ MOI: gioi han bitrate Opus - xem giai thich o khai bao
-            // OPUS_MAX_BITRATE_BPS phia tren. Sua RtpParameters SAU khi
-            // addTrack() (RtpSender chi ton tai tu diem nay).
-            try {
-                // ⚠️ SUA LOI BIEN DICH: RtpSender.setParameters() tra ve Boolean
-                // (khong phai Unit), nen Kotlin KHONG tu sinh synthetic property
-                // "var parameters" cho cap getParameters()/setParameters() nay -
-                // viet "sender.parameters = params" se bi loi "Val cannot be
-                // reassigned" (Kotlin chi coi day la 1 "val" doc duoc tu
-                // getParameters()). PHAI goi thang setParameters() nhu ham binh
-                // thuong. Da xac nhan qua API doc chinh thuc cua dung ban thu
-                // vien dang dung (io.getstream:stream-webrtc-android:1.3.10).
-                val params = sender.parameters
-                if (params.encodings.isNotEmpty()) {
-                    params.encodings[0].maxBitrateBps = OPUS_MAX_BITRATE_BPS
-                    val applied = sender.setParameters(params)
-                    if (!applied) {
-                        CaptureLogBus.log("[WebRTC-Client] ⚠️ setParameters() tra ve false - gioi han bitrate Opus co the chua duoc ap dung.")
-                    }
-                }
-            } catch (e: Exception) {
-                CaptureLogBus.log("[WebRTC-Client] ⚠️ Khong the gioi han bitrate Opus: ${e.message}")
-            }
-        } else {
-            CaptureLogBus.log("[WebRTC-Client] ❌ Khong tao duoc AudioTrack - factory co the chua san sang.")
-        }
-
-        val offerConstraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-        }
+        val constraints = MediaConstraints()
         pc.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 desc?.let {
@@ -316,23 +217,66 @@ class WebRtcManager(private val context: Context) {
                     signalingClient.sendOffer(it.description)
                 }
             }
-        }, offerConstraints)
+        }, constraints)
     }
 
     /**
-     * ✅ MOI (thay the cach kiem tra "isLocalMicMutedForMixer()" NGAY TRONG
-     * callback onPcmChunk cua MicInput - cach do KHONG con dung duoc vi
-     * MicInput/onPcmChunk khong con ton tai o duong gui nay nua, xem KDoc
-     * dau file): tat/bat mic dang GUI DI qua WebRTC bang chinh API chuan
-     * cua MediaStreamTrack - setEnabled(false) khien track ngung gui am
-     * thanh THAT (WebRTC se gui "silence"/khong gui goi RTP audio, tuy
-     * trien khai), KHONG can tu code logic "return som, khong gui" nhu
-     * truoc. Goi ham nay TRUC TIEP tu noi xu ly click nut "Khoa mic may
-     * nay" (MainActivity) - KHONG con phu thuoc vao 1 vong lap PCM dinh ky
-     * de "phat hien" thay doi flag nhu cach cu.
+     * May B gui truc tiep tung chunk PCM thu duoc tu Mic sang May A qua WebRTC.
      */
-    fun setLocalMicEnabled(enabled: Boolean) {
-        localAudioTrack?.setEnabled(enabled)
+    fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
+        val channel = localDataChannel ?: return
+        if (channel.state() != DataChannel.State.OPEN) {
+            // ✅ MOI (chan doan): dem so lan bi bo qua do channel CHUA/KHONG
+            // con o trang thai OPEN - neu con so nay lon bat thuong trong 1
+            // phien dang chay binh thuong, nghia la chinh DataChannel bi
+            // rot/dong lai giua chung (khac voi mat goi UDP don le).
+            sendChannelNotOpenSkipCount++
+            if (sendChannelNotOpenSkipCount % 25 == 0) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-SendSide] ⚠️ DataChannel KHONG o trang thai OPEN " +
+                        "(state=${channel.state()}) - da bo qua $sendChannelNotOpenSkipCount lan gui."
+                )
+            }
+            return
+        }
+
+        // ✅ MOI (chan doan - xem giai thich day du o khai bao cac bien
+        // lastSendNanoTime/sendCountInWindow phia tren): do nhip GUI thuc te
+        // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang.
+        val now = System.nanoTime()
+        if (lastSendNanoTime != 0L) {
+            val gapMs = (now - lastSendNanoTime) / 1_000_000L
+            if (gapMs >= 150L) {
+                CaptureLogBus.log(
+                    "[RemoteTiming-SendSide] ⚠️ May B: khoang trong giua 2 lan GUI PCM = ${gapMs}ms " +
+                        "(binh thuong ~40ms/lan) - neu thay dong nay, nghia la CHINH MicInput/thread " +
+                        "cua May B bi nghen, KHONG phai loi mang/DataChannel."
+                )
+            }
+            sendMaxGapMsInWindow = max(sendMaxGapMsInWindow, gapMs)
+        }
+        lastSendNanoTime = now
+        sendCountInWindow++
+        if (sendWindowStartNanoTime == 0L) sendWindowStartNanoTime = now
+        val windowElapsedMs = (now - sendWindowStartNanoTime) / 1_000_000L
+        if (windowElapsedMs >= 3000L) {
+            val expectedCount = (windowElapsedMs / 40L).toInt()
+            CaptureLogBus.log(
+                "[RemoteTiming-SendSide] 📊 May B trong ${windowElapsedMs}ms qua: " +
+                    "da GUI $sendCountInWindow chunk (ky vong ~$expectedCount), " +
+                    "gap lon nhat=${sendMaxGapMsInWindow}ms."
+            )
+            sendCountInWindow = 0
+            sendMaxGapMsInWindow = 0L
+            sendWindowStartNanoTime = now
+        }
+
+        val byteBuffer = ByteBuffer.allocateDirect(size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        for (i in 0 until size) {
+            byteBuffer.putShort(buffer[i])
+        }
+        byteBuffer.flip()
+        channel.send(DataChannel.Buffer(byteBuffer, true))
     }
 
     fun handleRemoteAnswer(clientId: String, sdp: String) {
@@ -365,43 +309,20 @@ class WebRtcManager(private val context: Context) {
                 }
             }
 
-            // ✅ MOI (thay the onDataChannel() cu hoan toan): Unified Plan bao
-            // ve track moi (audio) qua onTrack(transceiver), KHONG con qua
-            // onDataChannel() nua vi khong con DataChannel nao duoc tao.
-            override fun onTrack(transceiver: RtpTransceiver?) {
-                val remoteTrack = transceiver?.receiver?.track()
-                if (remoteTrack is org.webrtc.AudioTrack) {
-                    CaptureLogBus.log("[WebRTC-Host] Nhan Audio Track tu Mic: $clientId")
+            override fun onDataChannel(dataChannel: DataChannel?) {
+                CaptureLogBus.log("[WebRTC-Host] Nhan DataChannel tu Mic: $clientId")
+                dataChannel?.registerObserver(object : DataChannel.Observer {
+                    override fun onBufferedAmountChange(previousAmount: Long) {}
+                    override fun onStateChange() {
+                        Log.d(TAG, "Host DataChannel state: ${dataChannel.state()}")
+                    }
 
-                    // ✅ QUAN TRONG: tat phat qua loa CUA CHINH WebRTC (ADM
-                    // dung chung cho ca factory) - Host KHONG dung duong phat
-                    // mac dinh cua WebRTC de nghe, vi da co OutputRouter/
-                    // LowLatencyMixer rieng de tron nhac+vocal roi phat qua 1
-                    // AudioTrack khac do CHINH app quan ly. Neu KHONG tat,
-                    // tieng se bi PHAT 2 LAN (1 lan qua WebRTC truc tiep ra
-                    // loa, 1 lan qua Mixer sau khi xu ly DSP) - nghe "vang
-                    // doi/echo" ro ret. setVolume(0.0) chi tat DUONG PHAT
-                    // PHAN CUNG, KHONG anh huong du lieu PCM ma sink ben
-                    // duoi nhan duoc (sink lay tin hieu truoc buoc phat ra
-                    // loa trong pipeline noi bo cua WebRTC).
-                    remoteTrack.setVolume(0.0)
-
-                    remoteTrack.addSink(object : AudioTrackSink {
-                        override fun onData(
-                            audioData: ByteBuffer,
-                            bitsPerSample: Int,
-                            sampleRate: Int,
-                            numberOfChannels: Int,
-                            numberOfFrames: Int,
-                            absoluteCaptureTimestampMs: Long
-                        ) {
-                            deliverDecodedAudio(
-                                clientId, audioData, bitsPerSample, sampleRate,
-                                numberOfChannels, numberOfFrames
-                            )
+                    override fun onMessage(buffer: DataChannel.Buffer?) {
+                        buffer?.let {
+                            unpackAndDeliverPcm(clientId, it.data)
                         }
-                    })
-                }
+                    }
+                })
             }
         }) ?: return
 
@@ -410,10 +331,6 @@ class WebRtcManager(private val context: Context) {
         val remoteDesc = SessionDescription(SessionDescription.Type.OFFER, sdp)
         pc.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
-                val answerConstraints = MediaConstraints().apply {
-                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
-                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-                }
                 pc.createAnswer(object : SimpleSdpObserver() {
                     override fun onCreateSuccess(desc: SessionDescription?) {
                         desc?.let {
@@ -421,107 +338,26 @@ class WebRtcManager(private val context: Context) {
                             onAnswerCreated(it.description)
                         }
                     }
-                }, answerConstraints)
+                }, MediaConstraints())
             }
         }, remoteDesc)
     }
 
-    /**
-     * ✅ MOI (thay the unpackAndDeliverPcm() cu): nhan PCM DA GIAI MA truc
-     * tiep tu AudioTrackSink cua WebRTC (sau NetEQ/jitter buffer/PLC - khac
-     * hoan toan ve ban chat so voi PCM tho nhan qua DataChannel truoc day).
-     *
-     * Lam 2 viec bat buoc truoc khi giao cho pipeline DSP hien co:
-     * 1) Downmix ve MONO (toan bo VocalChannel/Mixer la mono) - remote track
-     *    co the la mono hoac stereo tuy cau hinh AudioSource ben May B.
-     * 2) Resample ve TARGET_SAMPLE_RATE (44100) neu khac - xem canh bao chi
-     *    tiet ve ly do bat buoc o KDoc dau file.
-     */
-    private fun deliverDecodedAudio(
-        clientId: String,
-        audioData: ByteBuffer,
-        bitsPerSample: Int,
-        sampleRate: Int,
-        numberOfChannels: Int,
-        numberOfFrames: Int
-    ) {
-        if (bitsPerSample != 16) {
-            // Chua gap truong hop nay trong thuc te (WebRTC Android luon giao
-            // 16-bit PCM qua AudioTrackSink), nhung phong thu de tranh doc sai
-            // ByteBuffer neu 1 ban WebRTC sau nay doi mac dinh.
-            CaptureLogBus.log(
-                "[WebRTC-Host] ⚠️ Bo qua 1 frame audio tu '$clientId' - bitsPerSample=$bitsPerSample " +
-                    "khong duoc ho tro (chi ho tro 16-bit)."
-            )
-            return
+    private fun unpackAndDeliverPcm(clientId: String, byteBuffer: ByteBuffer) {
+        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+        val shortCount = byteBuffer.remaining() / 2
+
+        // ✅ SUA: lay/tao scratch buffer RIENG cho clientId nay - xem giai
+        // thich day du o khai bao pcmScratchBuffers phia tren.
+        var scratch = pcmScratchBuffers[clientId]
+        if (scratch == null || scratch.size < shortCount) {
+            scratch = ShortArray(shortCount)
+            pcmScratchBuffers[clientId] = scratch
         }
-        if (numberOfFrames <= 0) return
-
-        audioData.order(ByteOrder.LITTLE_ENDIAN)
-        val shortBuffer = audioData.asShortBuffer()
-
-        val monoFrames = ShortArray(numberOfFrames)
-        if (numberOfChannels <= 1) {
-            for (i in 0 until numberOfFrames) monoFrames[i] = shortBuffer.get(i)
-        } else {
-            for (i in 0 until numberOfFrames) {
-                var sum = 0
-                for (c in 0 until numberOfChannels) sum += shortBuffer.get(i * numberOfChannels + c)
-                monoFrames[i] = (sum / numberOfChannels).toShort()
-            }
+        for (i in 0 until shortCount) {
+            scratch[i] = byteBuffer.short
         }
-
-        val resampled = if (sampleRate == TARGET_SAMPLE_RATE) {
-            monoFrames
-        } else {
-            resampleLinear(clientId, monoFrames, sampleRate, TARGET_SAMPLE_RATE)
-        }
-        if (resampled.isEmpty()) return
-
-        var scratch = outputScratchBuffers[clientId]
-        if (scratch == null || scratch.size < resampled.size) {
-            scratch = ShortArray(resampled.size)
-            outputScratchBuffers[clientId] = scratch
-        }
-        System.arraycopy(resampled, 0, scratch, 0, resampled.size)
-        onRemotePcmChunk?.invoke(clientId, scratch, resampled.size)
-    }
-
-    /**
-     * ✅ MOI: resample linear-interpolation don gian, GIU state (fracPos/
-     * lastSample) RIENG cho tung clientId de lien tuc muot giua 2 lan goi
-     * onData() lien tiep (khong bi "click" tai ranh gioi buffer).
-     *
-     * ⚠️ CHAT LUONG: day la resample "co ban" (khong loc chong-alias truoc
-     * khi noi suy) - CHAP NHAN DUOC cho tin hieu thoai o bitrate nay (Opus
-     * da gioi han bang thong ~40kbps/tan so <~8kHz hieu qua, it rui ro
-     * alias ro ret khi ha tu 48kHz -> 44.1kHz, ty le doi rat gan 1:1.088).
-     * Neu sau nay nghe ra ro/aliasing ro ret, thay the bang 1 bo resample
-     * co loc (vd Speex resampler qua JNI) thay vi tu viet them loc FIR o
-     * day.
-     */
-    private fun resampleLinear(clientId: String, input: ShortArray, srcRate: Int, dstRate: Int): ShortArray {
-        if (input.isEmpty()) return input
-        val state = resampleStates.getOrPut(clientId) { ResampleState() }
-        val ratio = srcRate.toDouble() / dstRate.toDouble()
-        val outCount = (input.size / ratio).toInt()
-        if (outCount <= 0) return ShortArray(0)
-
-        val output = ShortArray(outCount)
-        var pos = state.fracPos
-        for (i in 0 until outCount) {
-            val idx = pos.toInt()
-            val frac = pos - idx
-            val s0 = if (idx < input.size) input[idx] else state.lastSample
-            val s1 = if (idx + 1 < input.size) input[idx + 1] else s0
-            output[i] = (s0 + (s1 - s0) * frac).toInt().toShort()
-            pos += ratio
-        }
-        // Giu lai phan du (fractional position) cho lan goi sau - tranh
-        // "giat"/trôi pha dan qua nhieu buffer lien tiep.
-        state.fracPos = pos - input.size
-        state.lastSample = input.last()
-        return output
+        onRemotePcmChunk?.invoke(clientId, scratch, shortCount)
     }
 
     fun addRemoteIceCandidate(clientId: String, sdpMid: String, sdpMLineIndex: Int, candidate: String) {
@@ -534,35 +370,20 @@ class WebRtcManager(private val context: Context) {
             close()
             dispose()
         }
-        // ✅ SUA (thay the pcmScratchBuffers.remove() cu): don ca scratch
-        // buffer VA state resample cua client vua roi phong.
-        outputScratchBuffers.remove(clientId)
-        resampleStates.remove(clientId)
+        // ✅ MOI: don luon scratch buffer cua client vua roi phong, tranh ro
+        // ri nho neu co nhieu client noi/roi lien tuc trong 1 phien dai.
+        pcmScratchBuffers.remove(clientId)
     }
 
     fun closeAll() {
-        // ✅ MOI (thay the localDataChannel?.close() cu): dispose track/source
-        // CUC BO cua May B (neu co) - tranh ro ri native object cua WebRTC.
-        try {
-            localAudioTrack?.dispose()
-        } catch (e: Exception) {
-            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi dispose localAudioTrack: ${e.message}")
-        }
-        localAudioTrack = null
-        try {
-            localAudioSource?.dispose()
-        } catch (e: Exception) {
-            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi dispose localAudioSource: ${e.message}")
-        }
-        localAudioSource = null
-
+        localDataChannel?.close()
+        localDataChannel = null
         peerConnections.forEach { (_, pc) ->
             pc.close()
             pc.dispose()
         }
         peerConnections.clear()
-        outputScratchBuffers.clear()
-        resampleStates.clear()
+        pcmScratchBuffers.clear()
 
         // ✅ FIX (xem giai thich o khai bao truong `factory`/`audioDeviceModule`
         // phia tren): TRUOC DAY closeAll() chi don PeerConnection/DataChannel,
@@ -603,8 +424,6 @@ open class PeerConnectionAdapter(private val tag: String) : PeerConnection.Obser
     override fun onDataChannel(dataChannel: DataChannel?) {}
     override fun onRenegotiationNeeded() {}
     override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {}
-    // onTrack(transceiver) da co default no-op tu interface PeerConnection.Observer -
-    // cac noi can xu ly (vd Host trong handleRemoteOffer) tu override rieng.
 }
 
 open class SimpleSdpObserver : SdpObserver {
