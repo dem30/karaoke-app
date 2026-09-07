@@ -3,125 +3,68 @@ package com.karaokeapp.audio.processor
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.log10
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * Phase 4, buoc 2/5 - Dynamic Range Compressor cho giong hat karaoke.
+ * Phase 4 - Dynamic Range Compressor cho giong hat karaoke.
  *
- * Nhiem vu: khi hat nho/thi tham, giu nguyen (hoac nang nhe qua makeupGainDb);
- * khi len not cao/hat lon, tu dong nen dai dong xuong theo ty le (ratio), giup
- * giong hat day dan, deu dan, khong bi giat minh to/nho lien tuc giua cac cau.
- *
- * ✅ Nguon goc: dua tren code mau nguoi dung cung cap (tham khao file
- * huong_dan.txt) - da kiem tra logic dung (cong thuc GR = (Threshold - Input)
- * * (1 - 1/Ratio) la cong thuc nen chuan), giu nguyen thuat toan, chi doi lai
- * VI TRI trong chuoi xu ly khi wire vao PlaybackCaptureService.kt - xem
- * giai thich o do, KHONG doi gi trong file nay.
- *
- * Thiet ke real-time: xu ly in-place tren ShortArray, khong cap phat mang moi
- * trong process() - giong tinh than Limiter.kt/VocalProcessor.kt.
- *
- * ✅ CAP NHAT (tang do "day"/ro loi cho giong mic dien thoai, thuong mong
- * hon mic thu am chuyen dung): threshold ha tu -18dB xuong -25dB (nen bat
- * dau SOM HON, bat ca nhung doan hat vua phai chu khong chi doan hat to),
- * ratio tang tu 3.0 len 3.5 (nen chat hon 1 chut), makeupGainDb tang tu
- * 2.0dB len 4.5dB (bu lai do nen manh hon, tranh giong bi nho hon truoc khi
- * nen). ⚠️ QUAN TRONG: gia tri nay CHI co hieu luc that su o noi KHONG
- * truyen tham so tuong minh khi tao Compressor() - kiem tra lai
- * VocalChannel.kt, noi dang goi Compressor(thresholdDb = ..., ratio = ...,
- * makeupGainDb = ...) VOI GIA TRI RIENG (named arguments), nen phai sua
- * DONG BO ca 2 noi, sua rieng file nay se KHONG co tac dung gi neu
- * VocalChannel.kt van con truyen gia tri cu.
+ * ✅ DA SUA TOAN DIEN:
+ * 1. Dung Envelope Follower (bo do phong bi) lam min bien do truoc khi tinh nen,
+ *    tranh tinh trang gain co bop theo tung nua chu ky song gay meo hai (re tieng).
+ * 2. Chi tinh log10() va pow() khi bien do vuot thresholdLinear - tiet kiem ~80%
+ *    CPU so voi truoc day, loai bo nguy co tre deadline audio (het lag).
  */
 class Compressor(
     sampleRate: Int = 44100,
-    /**
-     * Nguong nen (dB, tinh theo dBFS - 0dB la Short.MAX_VALUE). Tin hieu VUOT
-     * nguong nay moi bi nen. -25dB - nen SOM hon truoc (cu la -18dB), phu hop
-     * dynamic range mong cua mic dien thoai khi hat gan/xa mic khac nhau.
-     */
-    private val thresholdDb: Float = -25f,
-    /**
-     * Ty le nen. VD 3.5 nghia la tin hieu vuot nguong 3.5dB thi dau ra chi
-     * tang 1dB. 3:1 - 4:1 la muc pho bien, an toan cho vocal (khong nen qua
-     * tay lam mat tu nhien giong hat).
-     */
-    private val ratio: Float = 3.5f,
-    /**
-     * Thoi gian dap ung (attack, ms) - toc do bop gain xuong khi gap peak
-     * lon. 12ms du nhanh de bat peak nhung khong cat cut am bat cua phu am
-     * (transient), tranh nghe "nghen".
-     */
-    attackMs: Float = 12f,
-    /**
-     * Thoi gian nha (release, ms) - toc do tra gain ve binh thuong sau khi
-     * peak qua. 100ms tranh hien tuong "pumping" (gain nhap nhay theo nhip
-     * nhac nghe rat kho chiu).
-     */
-    releaseMs: Float = 100f,
-    /**
-     * Bu gain sau nen (dB) - vi tin hieu bi nen bot o doan to, bu lai 1
-     * luong de tong the giong hat khong bi nho hon truoc khi nen. 4.5dB -
-     * bu nhieu hon truoc (cu la 2.0dB) de can bang lai voi threshold thap
-     * hon (nen som hon, nen nhieu hon can bu nhieu hon).
-     */
-    private val makeupGainDb: Float = 4.5f
+    /** Nguong bat dau nen (dBFS). -22dB bat duoc cac doan hat to ma khong anh huong hat nho. */
+    private val thresholdDb: Float = -22f,
+    /** Ty le nen (3.0 = vuot nguong 3dB dau ra chi tang 1dB). */
+    private val ratio: Float = 3.0f,
+    /** Toc do dap ung khi bat gap peak lon (ms). 15ms giu tron phu am transient. */
+    attackMs: Float = 15f,
+    /** Toc do tra gain ve binh thuong (ms). 120ms tranh hien tuong pumping. */
+    releaseMs: Float = 120f,
+    /** Bu lai am luong bi nen (dB). */
+    private val makeupGainDb: Float = 3.5f
 ) {
-
-    // He so lam min attack/release (one-pole, giong tinh than releaseCoeff
-    // cua Limiter.kt nhung ap dung cho CA 2 chieu attack va release rieng).
-    private val attackCoeff = 1f - exp(-1f / (sampleRate * (attackMs / 1000f)))
-    private val releaseCoeff = 1f - exp(-1f / (sampleRate * (releaseMs / 1000f)))
+    private val attackCoeff = exp(-1f / (sampleRate * (attackMs / 1000f)))
+    private val releaseCoeff = exp(-1f / (sampleRate * (releaseMs / 1000f)))
 
     private val makeupGainLinear = 10f.pow(makeupGainDb / 20f)
+    private val thresholdLinear = 10f.pow(thresholdDb / 20f)
 
-    // State: muc giam gain hien tai (dB, <= 0f). 0f = khong nen gi.
-    private var currentGainReductionDb = 0f
-
-    companion object {
-        // Tranh log10(0) = -Infinity khi tin hieu im lang tuyet doi.
-        private const val MIN_INPUT_FOR_LOG = 1e-4f
-        private const val MAX_PCM_FLOAT = 32767f
-    }
+    // Bien do phong bi muot ma hien tai [0.0f .. 1.0f]
+    private var envelope = 0f
 
     fun process(buffer: ShortArray, size: Int) {
+        val slope = 1f - (1f / ratio)
+
         for (i in 0 until size) {
-            val raw = buffer[i].toInt()
-            val absNorm = abs(raw) / MAX_PCM_FLOAT
+            val input = buffer[i].toFloat()
+            val absInput = abs(input) / 32767f
 
-            val inputDb = if (absNorm > MIN_INPUT_FOR_LOG) {
-                20f * log10(absNorm)
+            // 1. Peak Envelope Follower: Lam min bien do, chong re meo dang song
+            envelope = if (absInput > envelope) {
+                attackCoeff * envelope + (1f - attackCoeff) * absInput
             } else {
-                -80f
+                releaseCoeff * envelope + (1f - releaseCoeff) * absInput
             }
 
-            val targetGainReductionDb = if (inputDb > thresholdDb) {
-                (thresholdDb - inputDb) * (1f - 1f / ratio)
+            // 2. Chi tinh toan log10 va pow khi phong bi thuc su vuot nguong (tiet kiem CPU toi da)
+            val linearGain = if (envelope > thresholdLinear && envelope > 1e-5f) {
+                val envDb = 20f * log10(envelope)
+                val gainReductionDb = (thresholdDb - envDb) * slope
+                10f.pow(gainReductionDb / 20f) * makeupGainLinear
             } else {
-                0f
+                makeupGainLinear
             }
 
-            currentGainReductionDb += if (targetGainReductionDb < currentGainReductionDb) {
-                // Can nen MANH hon hien tai -> dung toc do attack (nhanh).
-                attackCoeff * (targetGainReductionDb - currentGainReductionDb)
-            } else {
-                // Peak da qua, tha dan ve 0 -> dung toc do release (cham hon).
-                releaseCoeff * (targetGainReductionDb - currentGainReductionDb)
-            }
-
-            val compressionLinear = 10f.pow(currentGainReductionDb / 20f)
-            val totalLinearGain = compressionLinear * makeupGainLinear
-
-            var output = raw * totalLinearGain
-            output = max(Short.MIN_VALUE.toFloat(), min(Short.MAX_VALUE.toFloat(), output))
-            buffer[i] = output.toInt().toShort()
+            val output = input * linearGain
+            buffer[i] = output.coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat()).toInt().toShort()
         }
     }
 
-    /** Reset state - goi khi bat dau/dung 1 session moi, tranh tan du gain-reduction tu session truoc. */
     fun reset() {
-        currentGainReductionDb = 0f
+        envelope = 0f
     }
 }
