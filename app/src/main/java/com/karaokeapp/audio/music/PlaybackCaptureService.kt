@@ -112,6 +112,30 @@ class PlaybackCaptureService : Service() {
     // cho, tao dung kieu "im lang roi don cuc" da quan sat duoc. Giu WifiLock
     // trong suot phien Mixer Test (May A dang nhan PCM tu May B qua Wi-Fi) -
     // song song voi WakeLock da co san o tren.
+    //
+    // ⚠️ SUA LOI MOI (ban fix o tren VAN CHUA DU - da xac nhan qua log THUC
+    // TE: hien tuong "giat cum" o May A KHONG doi ngay ca sau khi WifiLock
+    // nay da chay dung, khong loi): theo tai lieu chinh thuc cua Android
+    // (source.android.com/docs/core/connect/wifi-low-latency),
+    // WIFI_MODE_FULL_LOW_LATENCY CHI thuc su kich hoat khi DONG THOI (1)
+    // app dang giu lock VA (2) app do dang o FOREGROUND (tuc la app TREN
+    // CUNG nguoi dung dang nhin thay, KHONG chi la "foreground service").
+    // Voi dung mo hinh su dung cua app nay - May A chay PlaybackCaptureService
+    // (foreground SERVICE) trong khi NGUOI DUNG dang xem YouTube TOAN MAN
+    // HINH (YouTube moi la app foreground THAT) - dieu kien (2) KHONG BAO
+    // GIO duoc thoa man. Ket qua: wifiLock.acquire() van chay khong loi,
+    // log van bao "Da kich hoat", nhung che do low-latency THUC RA khong
+    // bao gio duoc kich hoat that su tren May A - Wi-Fi am tham roi ve
+    // power-save binh thuong nhu chua co WifiLock gi ca. Day la ly do ban
+    // fix truoc do "dung nhung khong an" - va cung giai thich vi sao May B
+    // (nguoi cam mic, thuong mo DUNG app karaoke o foreground that, khong
+    // xem YouTube song song) lai KHONG bi hien tuong nay (log SendSide sach).
+    //
+    // Sua: WIFI_MODE_FULL_HIGH_PERF (theo dung tai lieu WifiManager) KHONG
+    // co rang buoc "phai foreground app" - hoat dong "even when the device
+    // screen is off". Doi uu tien: LUON dung HIGH_PERF cho May A (noi luon
+    // chay nen sau YouTube), thay vi uu tien LOW_LATENCY nhu truoc (xem
+    // acquireWifiLock() ben duoi).
     private var wifiLock: WifiManager.WifiLock? = null
 
     private var micInput: MicInput? = null
