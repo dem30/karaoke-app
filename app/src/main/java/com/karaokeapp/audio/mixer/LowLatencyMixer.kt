@@ -53,21 +53,24 @@ private class ShortRingBuffer(private val capacity: Int) {
     }
 
     /**
-     * Cat giam do tre ve targetSize. Voi buffer Stereo, fadeSamples luon la so chan
-     * de kenh Trai blend voi Trai, kenh Phai blend voi Phai.
+     * ✅ CO CHE HYSTERESIS (VUNG DEM THO):
+     * Chi cat bo khi dung luong thuc su vuot nguong tran (threshold).
+     * Khi khong vuot nguong, KHONG CAT BAT KY MAU NAO, giup am nhac chay muot ma 100%,
+     * khong bi nhay coc hay giat nhip dinh ky.
      */
     @Synchronized
-    fun trimToTarget(targetSize: Int, fadeSamples: Int = 128) {
-        if (count <= targetSize) return
+    fun trimIfExceeds(threshold: Int, targetSize: Int, fadeSamples: Int = 128) {
+        if (count <= threshold) return
         var excess = count - targetSize
-        // Neu buffer chua so chan sample (Stereo), dam bao excess chan de khong lech kenh L/R
+        if (excess <= 0) return
+
+        // Voi du lieu Stereo, dam bao excess luon chan de khong bi dao lon kenh L va R
         if (targetSize % 2 == 0 && excess % 2 != 0) {
             excess++
             if (count < targetSize + excess) return
         }
 
         val actualFade = minOf(fadeSamples, excess, targetSize)
-
         if (actualFade > 0) {
             for (i in 0 until actualFade) {
                 val discardedIdx = (head + excess - actualFade + i) % capacity
@@ -97,12 +100,6 @@ private class ShortRingBuffer(private val capacity: Int) {
 
 /**
  * Phase 3 - Tron Nhac Stereo + N nguon Vocal Mono thanh 1 output Stereo.
- *
- * ✅ NANG CAP CHAT LUONG AM THANH:
- * 1. Nhac nen giu nguyen Stereo 2 kenh L/R doc lap.
- * 2. Vocal Mono duoc cong deu vao ca 2 kenh L va R (tao center phantom image vung chac).
- * 3. Nang nguong soft-knee len 31500f (sat tran 32767), khong con nen ep som tieng nhac,
- *    giu nguyen do nay cua tieng trong (kick/snare) va bass, am thanh trong veo.
  */
 class LowLatencyMixer(
     private val outputRouter: OutputRouter,
@@ -114,35 +111,31 @@ class LowLatencyMixer(
         private const val SAMPLE_RATE = 44100
         private const val CHUNK_MS = 40L
 
-        // So frame trong 40ms: 1764 frame
+        // 40ms o 44.1kHz = 1764 frames
         private const val FRAMES_PER_CHUNK = (SAMPLE_RATE * CHUNK_MS / 1000L).toInt()
-        // Nhac Stereo: 1764 frame * 2 = 3528 sample
+        // Nhac Stereo: 1764 frames * 2 = 3528 samples
         private const val STEREO_CHUNK_SIZE = FRAMES_PER_CHUNK * 2
-        // Vocal Mono: 1764 sample
+        // Vocal Mono: 1764 samples
         private const val MONO_CHUNK_SIZE = FRAMES_PER_CHUNK
 
         private const val POLL_INTERVAL_MS = 3L
         private const val MAX_WAIT_MS = 200L
         private const val QUEUE_LOG_INTERVAL_MS = 3000L
 
-        // Dung luong buffer rong rai (~330ms) de khong bi hard-overflow
+        // Buffer rong rai (~330ms) de khong bi overflow cung
         private const val MUSIC_RING_BUFFER_CAPACITY = (SAMPLE_RATE / 3) * 2 // Stereo
         private const val VOCAL_RING_BUFFER_CAPACITY = SAMPLE_RATE / 3       // Mono
 
-        // Nguong buffer toi uu
-        private const val LOCAL_TARGET_QUEUE_FRAMES = FRAMES_PER_CHUNK * 2  // ~80ms cho nguon local
-        private const val REMOTE_TARGET_QUEUE_FRAMES = FRAMES_PER_CHUNK * 4 // ~160ms cho mic qua Wi-Fi
-
         const val SOURCE_LOCAL_MIC = "local_mic"
 
-        // Nang nguong soft-knee len 31500f de giai phong headroom dong luc hoc (Punchy & Clear)
+        // Nang nguong soft-knee len 31500f de giu nguyen tieng bass/trong trong treo, khong bi nen dep
         private const val SOFT_KNEE_THRESHOLD_ABS = 31500f
         private const val SOFT_KNEE_CEILING_ABS = 32767f
         private const val MIXER_LOOP_DELAY_WARN_THRESHOLD_MS = 60L
 
         @JvmStatic
         @Volatile
-        var musicVolume: Float = 0.7f // Tang mac dinh len 0.7 cho tieng nhac day dan hon
+        var musicVolume: Float = 0.7f
             set(value) { field = value.coerceIn(0f, 2f) }
 
         @JvmStatic
@@ -160,12 +153,8 @@ class LowLatencyMixer(
         return if (x < 0f) -compressed else compressed
     }
 
-    // Buffer Stereo dau ra tai su dung (3528 samples = 1764 frames L/R)
     private val mixedOutBuffer = ShortArray(STEREO_CHUNK_SIZE)
 
-    /**
-     * Hoa tron: Nhac Stereo (L/R) + Cac nguon Vocal Mono (cong vao ca 2 tai).
-     */
     private fun mixMultiSource(
         music: ShortArray, musicLen: Int, musicVolumeSnapshot: Float,
         vocalChunks: List<ShortArray>, vocalLens: List<Int>,
@@ -177,7 +166,6 @@ class LowLatencyMixer(
             val mLeft = if (stereoIdx < musicLen) music[stereoIdx] * musicVolumeSnapshot else 0f
             val mRight = if (stereoIdx + 1 < musicLen) music[stereoIdx + 1] * musicVolumeSnapshot else 0f
 
-            // Cong don tat ca cac giong hat Mono vao vocalSum
             var vocalSum = 0f
             for (srcIdx in vocalChunks.indices) {
                 val len = vocalLens[srcIdx]
@@ -186,7 +174,6 @@ class LowLatencyMixer(
                 }
             }
 
-            // Giong hat duoc phan bo deu ca 2 kenh Trai va Phai
             var leftSum = (mLeft + vocalSum) * masterVolumeSnapshot
             var rightSum = (mRight + vocalSum) * masterVolumeSnapshot
 
@@ -259,7 +246,7 @@ class LowLatencyMixer(
         vocalScratchBuffers.clear()
 
         mixerJob = scope.launch {
-            logBoth("✅ Bat dau Mixer Loop (STEREO MUSIC + MONO VOCAL), chunk=$STEREO_CHUNK_SIZE samples ($FRAMES_PER_CHUNK frames L/R)")
+            logBoth("✅ Bat dau Mixer Loop (HYSTERESIS BUFFER - STEREO MUSIC), chunk=$STEREO_CHUNK_SIZE samples")
             val musicChunk = ShortArray(STEREO_CHUNK_SIZE)
 
             var lastQueueLogTime = System.currentTimeMillis()
@@ -273,7 +260,6 @@ class LowLatencyMixer(
             while (running) {
                 var waitedMs = 0L
 
-                // Cho den khi du 1 chunk Stereo
                 while (running && musicBuffer.size() < STEREO_CHUNK_SIZE && waitedMs < MAX_WAIT_MS) {
                     delay(POLL_INTERVAL_MS)
                     waitedMs += POLL_INTERVAL_MS
@@ -291,8 +277,14 @@ class LowLatencyMixer(
                 sumIterationGapMsInWindow += gapExcludingWait
                 iterationCountInWindow++
 
-                // Trim nhac Stereo ve target (80ms = LOCAL_TARGET_QUEUE_FRAMES * 2 samples)
-                musicBuffer.trimToTarget(LOCAL_TARGET_QUEUE_FRAMES * 2, fadeSamples = 256)
+                // ✅ AP DUNG HYSTERESIS CHO NHAC:
+                // Nguong tran = 160ms (4 chunks = 14112 samples). Neu khong vuot 160ms, KHONG CAT BO MAU NAO!
+                // Neu vuot qua 160ms (do lag/freeze that su), dua em ve 120ms (10584 samples).
+                musicBuffer.trimIfExceeds(
+                    threshold = STEREO_CHUNK_SIZE * 4,
+                    targetSize = STEREO_CHUNK_SIZE * 3,
+                    fadeSamples = 256
+                )
                 val musicLen = musicBuffer.drain(musicChunk, STEREO_CHUNK_SIZE)
 
                 var musicAbs = 0L
@@ -308,16 +300,25 @@ class LowLatencyMixer(
                 }
                 wasMusicSilentAtMixer = musicSilentNow
 
-                // Drain tung kenh vocal Mono
+                // ✅ AP DUNG HYSTERESIS CHO VOCAL:
                 vocalChunksReuse.clear()
                 vocalLensReuse.clear()
                 for ((sourceId, ringBuffer) in vocalBuffers) {
-                    val targetFrames = if (sourceId == SOURCE_LOCAL_MIC) {
-                        LOCAL_TARGET_QUEUE_FRAMES
+                    if (sourceId == SOURCE_LOCAL_MIC) {
+                        // Mic local: nguong tran 160ms (4 chunks = 7056 samples), target 120ms
+                        ringBuffer.trimIfExceeds(
+                            threshold = MONO_CHUNK_SIZE * 4,
+                            targetSize = MONO_CHUNK_SIZE * 3,
+                            fadeSamples = 128
+                        )
                     } else {
-                        REMOTE_TARGET_QUEUE_FRAMES
+                        // Mic remote (qua Wi-Fi): nguong tran 240ms (6 chunks = 10584 samples), target 200ms
+                        ringBuffer.trimIfExceeds(
+                            threshold = MONO_CHUNK_SIZE * 6,
+                            targetSize = MONO_CHUNK_SIZE * 5,
+                            fadeSamples = 128
+                        )
                     }
-                    ringBuffer.trimToTarget(targetFrames, fadeSamples = 128)
                     val scratch = getVocalScratch(sourceId)
                     val len = ringBuffer.drain(scratch, MONO_CHUNK_SIZE)
                     vocalChunksReuse.add(scratch)
@@ -327,7 +328,6 @@ class LowLatencyMixer(
                 val musicVolumeSnapshot = musicVolume
                 val masterVolumeSnapshot = masterVolume
 
-                // Hoa tron thanh Stereo
                 val mixed = mixMultiSource(
                     musicChunk, musicLen, musicVolumeSnapshot,
                     vocalChunksReuse, vocalLensReuse,
@@ -336,13 +336,11 @@ class LowLatencyMixer(
                 )
 
                 finalLimiter?.process(mixed, STEREO_CHUNK_SIZE)
-                // Ghi truc tiep mang Stereo ra AudioTrack
                 outputRouter.write(mixed, STEREO_CHUNK_SIZE)
 
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastQueueLogTime >= QUEUE_LOG_INTERVAL_MS) {
                     val sourceIds = vocalBuffers.keys.toList()
-                    // Nhac Stereo: chia 2 de ra so frame tuong ung
                     val musicMs = (musicBuffer.size() / 2) * 1000L / SAMPLE_RATE
                     val vocalSummary = sourceIds.joinToString(", ") { id ->
                         val ms = (vocalBuffers[id]?.size() ?: 0) * 1000L / SAMPLE_RATE
