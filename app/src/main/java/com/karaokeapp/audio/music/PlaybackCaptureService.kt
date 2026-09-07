@@ -554,20 +554,30 @@ class PlaybackCaptureService : Service() {
     }
 
     /**
-     * ✅ MOI (xem giai thich day du o khai bao field wifiLock phia tren):
-     * WIFI_MODE_FULL_LOW_LATENCY (API 29+) uu tien do tre thap hon ca
-     * WIFI_MODE_FULL_HIGH_PERF - fallback ve HIGH_PERF cho may cu hon.
+     * ⚠️ SUA LOI (mau thuan giua COMMENT va CODE - da xac nhan qua doc lai
+     * chinh file nay): comment o khai bao field wifiLock phia tren (dong
+     * "Sua: WIFI_MODE_FULL_HIGH_PERF ... Doi uu tien: LUON dung HIGH_PERF
+     * cho May A") da ghi RO rang HIGH_PERF phai la lua chon UU TIEN cho May A
+     * (chay nen duoi 1 app khac dang foreground THAT, vd YouTube toan man
+     * hinh) - vi LOW_LATENCY chi thuc su kich hoat khi CHINH app giu lock
+     * dang o foreground THAT, dieu kien khong bao gio dung voi May A. NHUNG
+     * code thuc te ben duoi (TRUOC BAN SUA nay) van uu tien LOW_LATENCY tren
+     * API 29+ - dung NGUOC lai voi chinh ket luan da rut ra, khien ban "fix"
+     * truoc do khong co tac dung that su du wifiLock.acquire() van chay
+     * khong loi va log van bao "Da kich hoat" (day chinh la ly do hien
+     * tuong "giat cum" duoc bao la KHONG doi ngay ca sau ban vi de fix nay).
+     *
+     * Sua: LUON dung WIFI_MODE_FULL_HIGH_PERF cho May A, khong con nhanh
+     * kiem tra SDK_INT/uu tien LOW_LATENCY nua - HIGH_PERF co tu API 1, hoat
+     * dong "even when the device screen is off" theo tai lieu WifiManager,
+     * KHONG co rang buoc phai la app foreground that.
      */
     private fun acquireWifiLock() {
         try {
             if (wifiLock == null) {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
+                @Suppress("DEPRECATION")
+                val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MixerWifiLock").apply {
                     setReferenceCounted(false)
                 }

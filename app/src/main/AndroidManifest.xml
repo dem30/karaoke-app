@@ -19,6 +19,18 @@
        Play loc nham nhung thiet bi khong co camera. -->
 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
 <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+<!-- ✅ MOI (fix loi thieu quyen): CA HAI WifiLock trong app (May A trong
+     PlaybackCaptureService.acquireWifiLock() VA May B trong
+     MainActivity.acquireMicWifiLock()) deu goi wifiManager.createWifiLock()
+     roi lock.acquire() - theo tai lieu chinh thuc cua WifiManager.WifiLock,
+     thao tac nay BAT BUOC quyen CHANGE_WIFI_STATE (khac voi
+     ACCESS_WIFI_STATE o tren, von CHI cho phep DOC trang thai Wi-Fi, khong
+     cho phep THAY DOI/giu lock). TRUOC DAY thieu dong nay - acquire() rat
+     co the nem SecurityException, bi try/catch trong ca 2 noi "nuot" am
+     tham thanh 1 dong log loi (khong crash ro rang), khien WifiLock
+     KHONG BAO GIO thuc su co hieu luc du log co the van bao "Da kich hoat"
+     truoc doan catch (tuy thu tu goi). -->
+<uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
 <uses-permission android:name="android.permission.CAMERA"/>
 <uses-feature android:name="android.hardware.camera" android:required="false"/>
 

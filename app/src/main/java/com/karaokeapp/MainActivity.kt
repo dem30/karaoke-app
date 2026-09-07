@@ -134,8 +134,13 @@ class MainActivity : AppCompatActivity() {
         @Volatile
         private var webRtcManager: WebRtcManager? = null
 
-        @Volatile
-        private var wirelessMicInput: MicInput? = null
+        // ✅ DA GO BO (chuyen sang audio track chuan cua WebRTC - xem KDoc dau
+        // WebRtcManager.kt): TRUOC DAY field nay giu 1 MicInput RIENG de tu
+        // capture PCM tho roi goi webRtcManager.sendPcmChunkFromMic() gui qua
+        // DataChannel. GIO chinh AudioDeviceModule ben trong WebRtcManager tu
+        // mo mic va gui di (qua AudioTrack/Opus that), nen KHONG con MicInput
+        // rieng nao o duong gui cua vai tro Mic B nua - xoa han field nay
+        // (thay vi de "chet", tranh nham lan sau nay tuong con dung duoc).
 
         // ✅ MOI (fix "Mic B qua WebRTC bi giat/re thanh cum 150-400ms" - xem
         // giai thich day du o WifiLock ben PlaybackCaptureService.kt, vai
@@ -484,6 +489,12 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 val newState = !PlaybackCaptureService.isLocalMicMutedForMixer()
                 PlaybackCaptureService.setLocalMicMutedForMixer(newState)
+                // ✅ MOI (thay the cach kiem tra flag TRONG callback PCM cu -
+                // xem KDoc setLocalMicEnabled() trong WebRtcManager.kt): neu
+                // dang o vai tro Mic B (webRtcManager != null, dang gui audio
+                // that qua WebRTC), tat/bat NGAY track dang gui - khong con
+                // phu thuoc vao 1 vong lap PCM dinh ky de "phat hien" thay doi.
+                webRtcManager?.setLocalMicEnabled(!newState)
                 text = if (newState) "🔊 Bat lai mic may nay" else "🔇 Khoa mic may nay"
                 Toast.makeText(
                     this@MainActivity,
@@ -1058,33 +1069,29 @@ class MainActivity : AppCompatActivity() {
             signalingClient = client,
             onIceCandidateGenerated = { mid, idx, cand -> client.sendIce(mid, idx, cand) },
             onConnected = onConnected@{
-                CaptureLogBus.log("[Mic] WebRTC da thong mang! Bat dau thu am gui di...")
-                // ✅ Kiem tra lai LAN NUA ngay truoc khi gan wirelessMicInput -
+                CaptureLogBus.log("[Mic] WebRTC da thong mang! Am thanh dang duoc chinh WebRTC tu dong gui di (Opus)...")
+                // ✅ Kiem tra lai LAN NUA truoc khi dong bo trang thai mic -
                 // ICE co the mat vai giay de CONNECTED, du nguoi dung da bam
                 // Ket noi lai them lan nua trong luc cho.
                 if (expectedGeneration != null && expectedGeneration != micSessionGeneration) {
                     CaptureLogBus.log(
-                        "[Mic] Bo qua khoi tao MicInput tu phien ket noi CU " +
+                        "[Mic] Bo qua dong bo trang thai mic tu phien ket noi CU " +
                             "(gen=$expectedGeneration, hien tai=$micSessionGeneration)."
                     )
                     return@onConnected
                 }
                 acquireMicWifiLock()
-                val mic = MicInput(this)
-                wirelessMicInput = mic
-                mic.startCapture(onPcmChunk = { buffer, size ->
-                    // ✅ FIX ("May B: nut Khoa mic khong hoat dung"): TRUOC DAY
-                    // nut "Khoa mic may nay" chi duoc kiem tra (localMicMutedForMixer)
-                    // trong callback cua Mixer Test (vai tro May A) - callback GUI
-                    // PCM qua WebRTC nay (vai tro May B, Mic tu xa) KHONG he doc
-                    // co flag do, nen bam nut tren May B khong co tac dung gi -
-                    // Mic van tiep tuc gui am thanh qua mang binh thuong. Them
-                    // dieu kien return SOM o day de dung chung 1 flag/1 nut cho
-                    // ca 2 vai tro (May A: khoa mic Mixer local; May B: khoa mic
-                    // dang gui qua mang).
-                    if (PlaybackCaptureService.isLocalMicMutedForMixer()) return@startCapture
-                    webRtcManager?.sendPcmChunkFromMic(buffer, size)
-                })
+                // ✅ DA GO BO (thay the toan bo khoi MicInput.startCapture() +
+                // sendPcmChunkFromMic() cu - xem KDoc dau WebRtcManager.kt):
+                // KHONG con tu capture PCM/tu gui qua DataChannel nua. Local
+                // AudioTrack that (tao san trong webRtcManager.startClientPeer())
+                // da duoc them vao PeerConnection TRUOC ca buoc createOffer() -
+                // ngay khi ICE CONNECTED nhu tai day, chinh AudioDeviceModule
+                // cua WebRTC DA VA DANG tu mo mic + ma hoa Opus + gui di ROI,
+                // khong can lam gi them o day ngoai dong bo trang thai
+                // mute/unmute hien tai (xem setLocalMicEnabled() ben duoi -
+                // thay the cho cach kiem tra flag TRONG callback PCM cu).
+                webRtcManager?.setLocalMicEnabled(!PlaybackCaptureService.isLocalMicMutedForMixer())
             }
         )
     }
@@ -1098,8 +1105,10 @@ class MainActivity : AppCompatActivity() {
             )
             return
         }
-        wirelessMicInput?.stopCapture()
-        wirelessMicInput = null
+        // ✅ DA GO BO wirelessMicInput?.stopCapture() (khong con MicInput rieng
+        // o duong gui nay - xem giai thich o startWirelessMicStream() phia
+        // tren). webRtcManager?.closeAll() ben duoi da tu dispose() ca
+        // AudioTrack/AudioSource cuc bo (xem WebRtcManager.closeAll()).
         signalingClient?.close()
         signalingClient = null
         webRtcManager?.closeAll()
@@ -1187,8 +1196,10 @@ class MainActivity : AppCompatActivity() {
         // that su bi dong (nguoi dung roi app/bam Back, OS thu hoi tien
         // trinh...) - luc do moi thuc su dong ket noi Mic khong day.
         if (!isChangingConfigurations()) {
-            wirelessMicInput?.stopCapture()
-            wirelessMicInput = null
+            // ✅ DA GO BO wirelessMicInput?.stopCapture()/=null (field khong
+            // con ton tai - xem giai thich o dau file/startWirelessMicStream()).
+            // webRtcManager?.closeAll() ben duoi tu dispose() ca AudioTrack/
+            // AudioSource cuc bo cua vai tro Mic B.
             signalingClient?.close()
             signalingClient = null
             webRtcManager?.closeAll()
@@ -1196,7 +1207,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             CaptureLogBus.log(
                 "[Activity] Xoay man hinh (doi cau hinh) - GIU NGUYEN ket noi Mic khong day, " +
-                    "khong dong signalingClient/webRtcManager/wirelessMicInput."
+                    "khong dong signalingClient/webRtcManager."
             )
         }
     }
