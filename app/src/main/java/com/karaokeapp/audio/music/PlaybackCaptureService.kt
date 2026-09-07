@@ -463,10 +463,27 @@ class PlaybackCaptureService : Service() {
          */
         fun pushRemoteVocalChunk(clientId: String, buffer: ShortArray, size: Int) {
             logRemoteChunkTiming(clientId)
+
+            // ✅ SUA (fix "khoa luong tren duong nhan WebRTC" - TRUOC DAY toan
+            // bo chuoi DSP nang (channel.process(): PitchCorrector, EQ,
+            // Compressor, Reverb...) chay BEN TRONG synchronized(vocalPushLock),
+            // tren chinh luong callback onMessage() cua WebRTC (xem
+            // WebRtcManager.unpackAndDeliverPcm()). Vi PitchCorrector dung
+            // thuat toan PSOLA co vong lap do cao do khong ré, giu lock trong
+            // luc chay no lam TRE VIEC NHAN goi PCM tiep theo cua WebRTC -
+            // cong don voi cac nguyen nhan khac gay giat/lag.
+            //
+            // Sua: xu ly DSP TRUOC (ngoai lock, van tren luong nhan WebRTC
+            // nhung khong con giu khoa chia se voi cac luong khac), CHI khoa
+            // dung doan ngan day mau vao mixer - giong het tinh than da ap
+            // dung cho mic local (xem serviceScope.launch { mic.startCapture
+            // ... } ben duoi, noi channel.process() cung da o NGOAI
+            // synchronized(vocalPushLock)).
+            val channel = getOrCreateVocalChannel(clientId)
+            channel.process(buffer, size)
+
             synchronized(vocalPushLock) {
                 val mix = activeMixerInstance ?: return
-                val channel = getOrCreateVocalChannel(clientId)
-                channel.process(buffer, size)
                 mix.pushVocal(clientId, buffer, size)
             }
         }

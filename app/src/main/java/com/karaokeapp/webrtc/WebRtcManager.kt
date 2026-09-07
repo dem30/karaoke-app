@@ -24,28 +24,24 @@ import kotlin.math.max
  * ⚠️ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
  * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN.
  *
- * ✅ CAP NHAT (fix "tieng ret ret cua Mic B qua mang, trong khi Mic A tai
- * cho luon muot" - phat hien qua so sanh thuc te 2 nguon): truoc day
- * DataChannel.Init() dat ordered=false, maxRetransmits=0 - nghia la UDP
- * THUAN TUYET DOI: BAT KY goi PCM ~40ms nao bi rot tren Wi-Fi (rat thuong
- * xay ra tren mang thuc te, dac biet qua Hotspot hoac Wi-Fi dong nguoi dung)
- * se KHONG BAO GIO duoc gui lai - tao thanh 1 khoang trong PCM dot ngot
- * (thay vi noi tiep lien tuc) o dung diem do, nghe nhu tieng "ret/tach" ro
- * rang. Day chinh la nguyen nhan khien Mic B (qua mang) co tieng ret ret
- * con Mic A (tai cho, khong qua mang) thi luon on dinh - vi Mic A khong he
- * di qua DataChannel/mang, khong co co hoi mat goi.
+ * ⚠️ [DA LOI THOI - GIU LAI DE THAM KHAO LICH SU] CAP NHAT CU (fix "tieng
+ * ret ret cua Mic B qua mang"): ban dau DataChannel.Init() dat ordered=false,
+ * maxRetransmits=0, sau do doi thanh maxRetransmits=1 (van giu ordered=false).
+ * CA HAI phuong an nay deu KHONG giai quyet duoc goc re that su: du co
+ * retransmit hay khong, khi ordered=false thi cac FRAGMENT IP cua 1 goi PCM
+ * (vuot MTU Wi-Fi ~1500 bytes nen bi chia nho) hoac cac goi PCM ke tiep nhau
+ * VAN CO THE den May A SAI THU TU moi khi mang Wi-Fi jitter nhe - gay buoc
+ * nhay bien do dot ngot trong dang song (nghe nhu tieng ret/xe), HOAN TOAN
+ * DOC LAP voi viec co retry hay khong.
  *
- * Sua: doi maxRetransmits=0 -> maxRetransmits=1 (giu ordered=false) - cho
- * phep gui lai TOI DA 1 LAN neu goi dau bi mat, ma KHONG bat "ordered" (vi
- * ordered=true se bat WebRTC PHAI cho goi truoc den du, gay tich luy do tre
- * neu co goi bi mat lien tuc - hoan toan sai voi muc tieu do tre thap cua
- * karaoke). 1 lan retransmit la muc can bang: du tang do tre trung binh
- * len 1 chieu round-trip (thuong chi vai ms tren LAN cung Wi-Fi), nhung du
- * de "cuu" phan lon cac goi bi rot ngau nhien don le - loai bo nay khong
- * loai het duoc tieng ret (neu mang thuc su te lien tuc, van se con mat
- * goi sau ca lan retry), nhung giam dang ke tan suat so voi khong retry gi
- * ca. Neu sau nay van con nghe ret ret ro sau khi test, co the thu tang
- * len maxRetransmits=2 (danh doi them chut do tre de on dinh hon nua).
+ * ✅ FIX THUC SU (xem hang so DATA_CHANNEL trong startClientPeer() ben duoi):
+ * doi sang ordered=true, maxRetransmits=0. ordered=true buoc WebRTC/SCTP
+ * giao dung thu tu da gui, loai bo hoan toan nguyen nhan dao lon dang song.
+ * maxRetransmits=0 (KHONG retry) de bu lai - vi da bat ordered, cho phep
+ * retry se khien 1 goi mat lam TICH LUY do tre cho ca hang doi phia sau (moi
+ * goi den sau phai cho goi mat duoc gui lai/het han). Voi audio realtime,
+ * mat 1 chunk ~40ms roi bo qua va tiep tuc bang chunk moi nhat luon tot hon
+ * la cho retry gay tre day chuyen.
  *
  * ⚠️ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
  * nhu PLAN.md muc 7 mo ta - moi client co 1 scratch buffer PCM RIENG
@@ -61,12 +57,6 @@ class WebRtcManager(private val context: Context) {
         private const val TAG = "WebRtcManager"
         private const val CHANNEL_LABEL = "karaoke_pcm_stream"
 
-        // ✅ MOI (xem giai thich chi tiet o dau file): cho phep gui lai TOI
-        // DA 1 lan neu goi PCM dau bi rot tren mang - can bang giua do tre
-        // thap (khong dung ordered=true) va giam tieng ret do mat goi don
-        // le. Dat thanh hang so o day de de dang chinh lai (vi du thu 2)
-        // neu test thuc te van con nghe ret sau ban sua nay.
-        private const val DATA_CHANNEL_MAX_RETRANSMITS = 1
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -79,6 +69,17 @@ class WebRtcManager(private val context: Context) {
     private val peerConnections = ConcurrentHashMap<String, PeerConnection>()
     // May B luu DataChannel gui audio ve A
     private var localDataChannel: DataChannel? = null
+
+    // ✅ MOI (fix "cap phat Native lien tuc gay GC/malloc pause 25 lan/giay"):
+    // 1 DirectByteBuffer DUY NHAT duoc tai su dung cho MOI lan gui PCM, thay
+    // vi ByteBuffer.allocateDirect() moi trong sendPcmChunkFromMic() (truoc
+    // day goi malloc() native moi ~40ms, gay ap luc GC/memory fragmentation
+    // dinh ky - 1 trong cac nguyen nhan gay micro-freeze/lag ben phia gui).
+    // Chi cap phat lai NEU kich thuoc chunk PCM thuc te lon hon buffer hien
+    // co (truong hop binh thuong hau nhu khong xay ra vi kich thuoc chunk
+    // on dinh ~40ms/lan). An toan vi sendPcmChunkFromMic() chi duoc goi tren
+    // 1 thread (luong doc PCM tu Mic), khong co goi dong thoi.
+    private var sendByteBuffer: ByteBuffer? = null
 
     // ✅ SUA (khac code mau goc): MOI clientId co 1 scratch buffer RIENG,
     // KHONG dung chung 1 buffer cho moi client - buffer dung chung se bi
@@ -199,13 +200,30 @@ class WebRtcManager(private val context: Context) {
 
         peerConnections[signalingClient.clientId] = pc
 
-        // ✅ SUA (fix tieng ret ret - xem giai thich chi tiet o dau file):
-        // doi maxRetransmits tu 0 (UDP thuan, khong retry) -> 1 (cho phep
-        // gui lai 1 lan) - giu nguyen ordered=false (KHONG doi thanh true,
-        // tranh gay tich luy do tre neu goi bi mat lien tuc).
+        // ✅ SUA LAI (fix goc re nguyen nhan tieng "ret xe rach" cua Mic B -
+        // xem phan tich ky thuat day du: ban ordered=false/maxRetransmits=1
+        // TRUOC DAY van cho phep cac FRAGMENT IP cua 1 goi PCM (~3528 bytes,
+        // vuot MTU Wi-Fi ~1500 bytes nen luon bi chia lam nhieu manh) hoac
+        // cac goi ke tiep nhau DEN SAI THU TU khi mang Wi-Fi bi jitter nhe -
+        // May A ghep lai PCM theo dung thu tu NHAN DUOC (khong phai thu tu
+        // GUI), tao buoc nhay bien do dot ngot trong dang song -> nghe nhu
+        // tieng ret/xe.
+        //
+        // ordered = true: BAT BUOC voi du lieu PCM lien tuc theo thoi gian -
+        // WebRTC/SCTP se tu dam bao cac manh/goi duoc GIAO DUNG THU TU da
+        // GUI, loai bo hoan toan nguyen nhan dao lon dang song noi tren.
+        //
+        // maxRetransmits = 0: KHONG retry khi mat goi - vi da bat ordered,
+        // neu con cho phep retransmit thi 1 goi bi mat se khien WebRTC GIU
+        // LAI moi goi PCM ĐẾN SAU no (de dam bao thu tu) cho đen khi goi mat
+        // đuoc gui lai thanh cong hoac het han - gay tich luy do tre lien
+        // tuc, hoan toan sai voi yeu cau do tre thap cua karaoke realtime.
+        // Voi audio lien tuc, mat 1 chunk ~40ms roi BO QUA (drop) va tiep
+        // tuc voi chunk moi nhat luon tot hon la cho retry lam tre ca hang
+        // doi phia sau.
         val init = DataChannel.Init().apply {
-            ordered = false
-            maxRetransmits = DATA_CHANNEL_MAX_RETRANSMITS
+            ordered = true
+            maxRetransmits = 0
         }
         localDataChannel = pc.createDataChannel(CHANNEL_LABEL, init)
 
@@ -271,12 +289,24 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
-        val byteBuffer = ByteBuffer.allocateDirect(size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (i in 0 until size) {
-            byteBuffer.putShort(buffer[i])
+        // ✅ SUA (xem giai thich day du o khai bao truong sendByteBuffer
+        // phia tren): tai su dung 1 DirectByteBuffer duy nhat, chi cap phat
+        // lai NEU kich thuoc can thiet vuot qua dung luong buffer hien co.
+        val bytesNeeded = size * 2
+        var bBuf = sendByteBuffer
+        if (bBuf == null || bBuf.capacity() < bytesNeeded) {
+            bBuf = ByteBuffer.allocateDirect(bytesNeeded).order(ByteOrder.LITTLE_ENDIAN)
+            sendByteBuffer = bBuf
         }
-        byteBuffer.flip()
-        channel.send(DataChannel.Buffer(byteBuffer, true))
+        bBuf.clear()
+        for (i in 0 until size) {
+            bBuf.putShort(buffer[i])
+        }
+        // flip(): dat limit = position hien tai (= bytesNeeded, DUNG ke ca
+        // khi capacity buffer lon hon bytesNeeded do lan truoc chunk to
+        // hon), roi dua position ve 0 de channel.send() doc dung tu dau.
+        bBuf.flip()
+        channel.send(DataChannel.Buffer(bBuf, true))
     }
 
     fun handleRemoteAnswer(clientId: String, sdp: String) {

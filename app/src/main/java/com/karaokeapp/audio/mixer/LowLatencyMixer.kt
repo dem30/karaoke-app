@@ -256,7 +256,35 @@ class LowLatencyMixer(
         // van giu nguyen lam luoi an toan cho cac cu giat CPU that su lon,
         // TARGET_QUEUE_SAMPLES moi la muc do tre "binh thuong" ma he thong
         // se hoi tu ve.
-        private const val TARGET_QUEUE_SAMPLES = CHUNK_SIZE * 2
+        //
+        // ✅ SUA (fix "May B qua mang bi ret/giat con May A tai cho luon
+        // muot" - nguyen nhan goc: mic LOCAL (AudioRecord doc PCM tai cho,
+        // cung xung nhip phan cung voi AudioTrack phat ra) co nhip buffer
+        // gan nhu tuyet doi deu dan ~40ms/lan, HOAN TOAN KHAC voi mic REMOTE
+        // (di qua Wi-Fi - co luc 10ms da co goi, co luc 80ms khong co goi
+        // nao, roi 2 goi don dap den cung luc = "network jitter" binh
+        // thuong cua bat ky mang khong day nao). TRUOC DAY ca 2 loai nguon
+        // dung CHUNG 1 nguong TARGET_QUEUE_SAMPLES=80ms - khi 2 goi remote
+        // don dap ve cung luc, hang doi remote vuot 80ms va bi trimToTarget()
+        // CAT NGAY, roi vai chuc ms sau mang tre lai thi hang doi remote bi
+        // CAN (underrun) - ket qua vua ret (do cat/noi lien tuc) vua giat/
+        // lag. Nguon local thi khong bao gio roi vao tinh trang nay vi nhip
+        // vao gan nhu hang so, nen luon muot.
+        //
+        // Sua: tach rieng 2 nguong - nguon local van giu 80ms (that chat, vi
+        // khong can dem nhieu cho 1 nguon on dinh tuyet doi), con nguon
+        // remote duoc noi long len 160ms (gap doi) de co du "khong gian dem"
+        // hap thu jitter mang Wi-Fi binh thuong ma KHONG bi trimToTarget()
+        // cat cut dau/duoi lien tuc. Danh doi: do tre cua giong hat qua mang
+        // tang them ~80ms so voi truoc - chap nhan duoc de doi lay am thanh
+        // muot, khong ret/giat (co the tinh chinh lai neu can bang latency
+        // khac trong qua trinh test thuc te).
+        private const val LOCAL_TARGET_QUEUE_SAMPLES = CHUNK_SIZE * 2   // ~80ms - mic tai cho (AudioRecord), jitter gan bang 0
+        private const val REMOTE_TARGET_QUEUE_SAMPLES = CHUNK_SIZE * 4  // ~160ms - mic qua Wi-Fi/WebRTC, can dem nhieu hon de hap thu jitter mang
+
+        // Giu lai ten cu lam alias cho muc dung o musicBuffer (nguon local,
+        // khong qua mang) de khong phai doi cho khac trong file.
+        private const val TARGET_QUEUE_SAMPLES = LOCAL_TARGET_QUEUE_SAMPLES
 
         const val SOURCE_LOCAL_MIC = "local_mic"
 
@@ -534,7 +562,17 @@ class LowLatencyMixer(
                 vocalChunksReuse.clear()
                 vocalLensReuse.clear()
                 for ((sourceId, ringBuffer) in vocalBuffers) {
-                    ringBuffer.trimToTarget(TARGET_QUEUE_SAMPLES)
+                    // ✅ SUA (xem KDoc day du o LOCAL_TARGET_QUEUE_SAMPLES/
+                    // REMOTE_TARGET_QUEUE_SAMPLES o tren): phan biet nguon
+                    // mic tai cho (jitter ~0, giu nguong chat 80ms) va nguon
+                    // qua mang WebRTC (jitter Wi-Fi, can nguong long hon
+                    // 160ms de khong bi cat cut dau/duoi lien tuc).
+                    val target = if (sourceId == SOURCE_LOCAL_MIC) {
+                        LOCAL_TARGET_QUEUE_SAMPLES
+                    } else {
+                        REMOTE_TARGET_QUEUE_SAMPLES
+                    }
+                    ringBuffer.trimToTarget(target)
                     val scratch = getVocalScratch(sourceId)
                     val len = ringBuffer.drain(scratch, CHUNK_SIZE)
                     vocalChunksReuse.add(scratch)
