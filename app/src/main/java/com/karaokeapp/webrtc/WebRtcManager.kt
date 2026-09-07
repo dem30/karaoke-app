@@ -1,3 +1,4 @@
+
 package com.karaokeapp.webrtc
 
 import android.content.Context
@@ -9,23 +10,19 @@ import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 /**
  * Phase 5 - Quan tri ket noi WebRTC LAN cho karaoke.
  *
- * ⚠️ LUA CHON KIEN TRUC: dung DataChannel (khong dung AudioTrack/MediaStreamTrack
+ * ⚠ LUA CHON KIEN TRUC: dung DataChannel (khong dung AudioTrack/MediaStreamTrack
  * chuan cua WebRTC) de truyen PCM THO (ShortArray) truc tiep. Ly do: toan bo
  * pipeline hien tai (Mixer, Limiter, EQ...) deu thao tac truc tiep tren
  * ShortArray PCM tho - dung AudioTrack chuan cua WebRTC se bat buoc phai
  * giai ma Opus roi tu tay lay lai PCM qua 1 lop API rieng (AudioDeviceModule
  * tuy bien), phuc tap hon nhieu so voi loi ich mang lai o quy mo 2-3 may LAN.
  *
- * ⚠️ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
+ * ⚠ DANH DOI CAN BIET: PCM 44.1kHz/16-bit khong nen chiem ~688kbps lien tuc
  * (so voi Opus nen duoc con ~24-32kbps) - chap nhan duoc tren Wi-Fi LAN.
  *
  * ✅ CAP NHAT (fix "tieng ret ret cua Mic B qua mang, trong khi Mic A tai
@@ -51,26 +48,36 @@ import kotlin.math.max
  * ca. Neu sau nay van con nghe ret ret ro sau khi test, co the thu tang
  * len maxRetransmits=2 (danh doi them chut do tre de on dinh hon nua).
  *
- * ⚠️ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
- * nhu PLAN.md muc 7 mo ta - moi client co 1 JitterQueue PCM RIENG
+ * ⚠ GIOI HAN HIEN TAI: chi thiet ke cho DUNG 2 MAY (1 Mixer + 1 Mic tu xa)
+ * nhu PLAN.md muc 7 mo ta - moi client co 1 scratch buffer PCM RIENG
  * (ConcurrentHashMap theo clientId) de tranh dua du lieu (race) NEU sau nay
  * mo rong len 3+ may gui PCM dong thoi; nhung cac phan khac (vi du
  * WebRtcManager dung 1 `localDataChannel` DUY NHAT o phia May B) van gia
  * dinh 1-mic-1-peer, chua ho tro 1 may B gui toi NHIEU May A cung luc (khong
  * nam trong pham vi Phase 5 theo PLAN).
  *
- * ✅ CAP NHAT (fix "loa nghe co luc bi cham" - jitter buffer + PLC): phia
- * May A (Host) GIO day KHONG con phat PCM ngay lap tuc khi DataChannel
- * nhan duoc (nhip nhan bat dinh, phu thuoc mang) - thay vao do chunk duoc
- * xep vao 1 hang doi (JitterQueue) va mot ticker rieng (playoutExecutor)
- * phat ra DEU DAN moi ~40ms, "bu" (Packet Loss Concealment) bang du lieu
- * cu khi chunk chua kip den thay vi de loa cam giac "khuyu/cham" dot ngot.
- * ⚠️ HE QUA: onRemotePcmChunk GIO duoc goi tu thread cua playoutExecutor
- * (mot ScheduledExecutorService rieng), KHONG con la thread callback goc
- * cua DataChannel.Observer.onMessage() nhu truoc - noi nao dang lang nghe
- * callback nay (vi du Mixer) can dam bao code cua no thread-safe cho truong
- * hop nay (thuong da dung vi PCM van la du lieu tho can duoc xu ly ngay,
- * khong lien quan UI thread).
+ * ⚠ QUAN TRONG (bai hoc rut ra tu 1 lan sua SAI truoc day - GIU LAI de
+ * khong lap lai): WebRtcManager KHONG duoc tu y them jitter-buffer/hang doi
+ * "phat theo nhip dinh ky" cua RIENG NO o phia nhan (Host/May A). Ly do:
+ * `LowLatencyMixer` (noi tieu thu onRemotePcmChunk, xem PlaybackCaptureService)
+ * DA CO SAN 1 ShortRingBuffer 200ms/nguon + co che trimToTarget() chu dong
+ * giu do tre on dinh o ~80ms VOI crossfade muot moi ~40ms/vong lap mixer -
+ * day CHINH LA jitter buffer cua he thong, dat o dung tang phu hop (noi co
+ * toan canh ca vocal LAN Music, co the can bang chung). Tung co 1 ban thu
+ * them JitterQueue + ScheduledExecutorService rieng NGAY TAI WebRtcManager
+ * (truoc khi du lieu toi Mixer) - hau qua: 2 tang buffer doc lap, khong biet
+ * ve nhau, danh nhau lien tuc (tang cua WebRtcManager ap 1 nhip tieu thu CO
+ * DINH 40ms/tick trong khi du lieu thuc te den khong deu do ban chat mang +
+ * thread callback cua WebRTC), dan den JitterQueue lien tuc bao "vuot gioi
+ * han" va XOA NHAM chunk HOP LE dung luc mang hoan toan binh thuong (da xac
+ * nhan qua log thuc te: RemoteTiming cho thay khong mat goi, nhung
+ * JitterBuffer-Overflow van bao xoa hang tram lan/vai giay) - ket qua La May
+ * B "khong nghe duoc gi" du du lieu van dang toi day du. BAI HOC: onMessage
+ * cua DataChannel.onDataChannel() PHAI tiep tuc goi onRemotePcmChunk TRUC
+ * TIEP, DONG BO, NGAY LAP TUC (khong hang doi/khong ticker rieng) - de
+ * nguyen ban chat "callback ngay khi co du lieu", giao het viec "lam muot
+ * theo thoi gian" cho LowLatencyMixer, noi da giai quyet dung va co kiem
+ * chung qua log thuc te.
  */
 class WebRtcManager(private val context: Context) {
 
@@ -85,48 +92,33 @@ class WebRtcManager(private val context: Context) {
         // neu test thuc te van con nghe ret sau ban sua nay.
         private const val DATA_CHANNEL_MAX_RETRANSMITS = 1
 
-        // ✅ MOI (fix "loa nghe cham/giat lup bup" khi co jitter mang):
-        // JITTER_BUFFER_TARGET_CHUNKS = so chunk PCM (~40ms/chunk) giu lai
-        // TRONG HANG DOI truoc khi bat dau phat, thay vi phat NGAY chunk dau
-        // tien vua nhan duoc. Muc dich: hap thu dao dong do tre mang
-        // (jitter) - neu 1 chunk den tre ~40-80ms do Wi-Fi nghen tam thoi,
-        // hang doi da co san du du lieu de "lap khoang trong" ma KHONG lam
-        // rong tai audio callback. Danh doi: them ~2*40ms=80ms do tre co
-        // dinh (dat chap nhan duoc cho karaoke LAN, van << 200ms nguong
-        // nghe ro tre). Neu can giam do tre hon nua (chi mang rat on dinh),
-        // co the giam xuong 1; neu van con nghe giat tren mang xau, tang len 3.
-        private const val JITTER_BUFFER_TARGET_CHUNKS = 2
-
-        // Chu ky "tick" phat 1 chunk tu hang doi ra ngoai (khop voi nhip
-        // gui thuc te ~40ms/chunk cua MicInput ben May B).
-        private const val PLAYOUT_TICK_MS = 40L
-
-        // ✅ MOI (Packet Loss Concealment - PLC don gian): khi den luot phat
-        // nhung hang doi RONG (chua kip nhan chunk moi, hoac chunk that su
-        // bi mat vinh vien du da retransmit), thay vi phat im lang dot ngot
-        // (nghe nhu "tach") hoac bo qua hoan toan (nghe nhu "giat/nhay
-        // thoi gian"), PHAT LAP LAI chunk GAN NHAT da phat, nhan bien do
-        // dan xuong qua moi lan lap (tranh tieng "ru ru" deu deu neu mat
-        // nhieu chunk lien tiep). Toi da lap PLC_MAX_CONCEALED_CHUNKS lan
-        // truoc khi chuyen han sang im lang (mat qua lau thi im lang van
-        // tot hon la phat 1 am thanh lap lai khong lien quan keo dai).
+        // ✅ MOI (Packet Loss Concealment - PLC don gian, KHONG dung hang
+        // doi): khi 1 chunk PCM den voi seq NHAY CACH (bo lo >=1 seq so voi
+        // seq truoc do - phat hien duoc do bi mat vinh vien du da
+        // retransmit, hoac do retransmit den QUA TRE nen bi OrderGuard loai
+        // truoc day), thay vi de Mixer nhan 1 khoang trong PCM dot ngot
+        // (nghe nhu "tach"), CHEN THEM 1 chunk "bu" (lap lai chunk GAN NHAT
+        // da phat, giam bien do) NGAY TRUOC chunk that vua nhan - lap tuc,
+        // KHONG cho/khong hang doi. Gioi han so lan bu LIEN TIEP (neu mat
+        // qua nhieu chunk lien tuc, ngung bu de tranh tieng lap vo nghia
+        // keo dai - im lang luc do con tot hon).
         private const val PLC_MAX_CONCEALED_CHUNKS = 3
         // He so nhan bien do moi lan PLC lap lai (0.6 = giam ~4dB/lan).
         private const val PLC_ATTENUATION_FACTOR = 0.6
 
         // ✅ MOI (fix "giu lai loi roi phat don dap sau 5-10 giay khi mang
-        // nghen" - day la loi NGHIEM TRONG hon ca jitter, xay ra o TANG GUI
-        // chu khong phai tang nhan): DataChannel.send() la NON-BLOCKING - no
-        // KHONG BAO GIO tu choi hay bao loi khi mang cham/nghen, ma AM THAM
-        // xep chunk vao 1 hang doi noi bo cua chinh thu vien WebRTC (SCTP
-        // send buffer, doc duoc qua channel.bufferedAmount()). Neu May B cu
-        // tiep tuc goi send() moi 40ms bat ke mang co theo kip hay khong,
-        // hang doi noi bo nay CU LON DAN LEN (hang tram chunk neu nghen keo
-        // dai vai giay) - roi khi mang thong tro lai, TOAN BO so do duoc xa
-        // ra CUNG LUC, khien May A nhan duoc 1 chuoi dai am thanh CU dong
-        // dap - dung la hien tuong "giu loi roi phat lai sau 5-10s" nguoi
-        // dung phan anh. Day KHONG lien quan gi den JitterQueue/PLC o Host -
-        // loi nay xay ra TRUOC do, ngay tai diem gui.
+        // nghen" - day la nguyen nhan CHINH gay cam giac "cham/tre" nguoi
+        // dung phan anh, KHONG lien quan gi den PLC o tren): DataChannel.
+        // send() la NON-BLOCKING - no KHONG BAO GIO tu choi hay bao loi khi
+        // mang cham/nghen, ma AM THAM xep chunk vao 1 hang doi noi bo cua
+        // chinh thu vien WebRTC (SCTP send buffer, doc duoc qua
+        // channel.bufferedAmount()). Neu May B cu tiep tuc goi send() moi
+        // 40ms bat ke mang co theo kip hay khong, hang doi noi bo nay CU LON
+        // DAN LEN (hang tram chunk neu nghen keo dai vai giay) - roi khi
+        // mang thong tro lai, TOAN BO so do duoc xa ra CUNG LUC, khien May A
+        // nhan duoc 1 chuoi dai am thanh CU dong dap - dung la hien tuong
+        // "giu loi roi phat lai tre hang giay" nguoi dung phan anh. Day xay
+        // ra O TANG GUI (May B), TRUOC KHI du lieu di vao mang.
         //
         // Voi audio REAL-TIME (karaoke), du lieu tre qua muc nay coi nhu VO
         // GIA TRI - phat no ra sau vai giay con TE HON la bo han (nghe lech
@@ -135,24 +127,11 @@ class WebRtcManager(private val context: Context) {
         // hon SEND_BUFFER_DROP_THRESHOLD_MS mili-giay audio, CHU DONG BO
         // chunk MOI NAY, KHONG goi send() - de hang doi tu rut xuong thay vi
         // phinh to them. Nguong tinh DONG (dua tren size*2 byte/chunk thuc
-        // te, xem sendPcmChunkFromMic()) thay vi hang so byte cung, vi
-        // KHONG the biet truoc chinh xac sample rate/chunk size cua
-        // MicInput tu file nay.
+        // te trong sendPcmChunkFromMic(), gia dinh nhip gui ~40ms/chunk)
+        // thay vi hang so byte cung, vi KHONG the biet truoc chinh xac
+        // sample rate/chunk size cua MicInput tu file nay.
         private const val SEND_BUFFER_DROP_THRESHOLD_MS = 200L
-
-        // ✅ MOI (phong thu 2 cho cung 1 loai loi "giu roi phat don dap" -
-        // lan nay o PHIA NHAN thay vi phia gui): JitterQueue.pendingChunks
-        // VE LY THUYET van co the phinh to neu playoutExecutor bi tre tam
-        // thoi (vi du GC pause, thread bi block) hoac neu nhieu chunk DEN
-        // DON DAP cung luc (vi du sau khi May B tu phuc hoi tu 1 dot nghen
-        // gui rieng). Neu KHONG gioi han, hang doi nay co the tich luy hang
-        // chuc/hang tram chunk CU roi ticker se phat het chung LIEN TUC
-        // (khong dung nhac) de "duoi kip" - nghe cung giong y het trieu
-        // chung "giu loi roi phat don dap" nguoi dung mo ta, chi khac vi tri
-        // xay ra (Nhan thay vi Gui). Gioi han: neu pendingChunks vuot qua
-        // muc nay, XOA CHUNK CU NHAT (seq nho nhat) truoc khi them chunk
-        // moi - uu tien du lieu MOI hon cho karaoke real-time.
-        private const val JITTER_QUEUE_MAX_CHUNKS = JITTER_BUFFER_TARGET_CHUNKS + (SEND_BUFFER_DROP_THRESHOLD_MS / PLAYOUT_TICK_MS).toInt() + 2
+        private const val ASSUMED_SEND_INTERVAL_MS = 40L
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -166,14 +145,30 @@ class WebRtcManager(private val context: Context) {
     // May B luu DataChannel gui audio ve A
     private var localDataChannel: DataChannel? = null
 
-    // ⚠️ Bo dem so goi bi loai do den QUA TRE (retransmit den sau khi da
-    // phat qua jitter buffer) - xem chi tiet trong unpackAndDeliverPcm().
-    private var outOfOrderDropCount = 0
-    // ✅ MOI: dem so chunk bi xoa o phia NHAN do JitterQueue vuot gioi han
-    // kich thuoc - xem JITTER_QUEUE_MAX_CHUNKS.
-    private var jitterQueueOverflowDropCount = 0
+    // ✅ SUA (khac code mau goc): MOI clientId co 1 scratch buffer RIENG,
+    // KHONG dung chung 1 buffer cho moi client - buffer dung chung se bi
+    // GHI DE/DUA DU LIEU neu 2 client gui PCM gan nhu dong thoi (callback
+    // onMessage cua WebRTC co the chay tren cac thread khac nhau tuy
+    // PeerConnection). Voi dung 2 may (1 mic tu xa) nhu Phase 5 mo ta thi
+    // khong xay ra dua, nhung sua san de an toan neu mo rong len 3+ may.
+    private val pcmScratchBuffers = ConcurrentHashMap<String, ShortArray>()
 
-    // Callback nhan PCM tu mic remote tren May A
+    // ⚠ MOI (Packet Loss Concealment - xem PLC_MAX_CONCEALED_CHUNKS o tren
+    // va giai thich day du trong unpackAndDeliverPcm()): trang thai PLC cho
+    // TUNG clientId - seq cuoi cung DA PHAT, chunk PCM cuoi cung DA PHAT
+    // (de lam nguon "bu" neu chunk ke tiep bi mat), va so lan da bu LIEN
+    // TIEP (de biet khi nao dung bu).
+    private val lastDeliveredSeq = ConcurrentHashMap<String, Int>()
+    private val lastDeliveredChunk = ConcurrentHashMap<String, ShortArray>()
+    private val concealedCountInARow = ConcurrentHashMap<String, Int>()
+    private var outOfOrderDropCount = 0
+    private var concealedChunkCount = 0
+
+    // Callback nhan PCM tu mic remote tren May A. ⚠ Duoc goi TRUC TIEP,
+    // DONG BO tu thread callback cua DataChannel.Observer.onMessage() - xem
+    // giai thich "bai hoc rut ra" o KDoc dau file ve ly do KHONG dung hang
+    // doi/ticker rieng o day (LowLatencyMixer da lo phan "lam muot theo thoi
+    // gian" o tang xa hon).
     var onRemotePcmChunk: ((clientId: String, buffer: ShortArray, size: Int) -> Unit)? = null
 
     // ✅ MOI (CHAN DOAN TAM THOI - do nhip GUI PCM thuc te tu chinh May B,
@@ -192,7 +187,7 @@ class WebRtcManager(private val context: Context) {
     // noi bo cua WebRTC da qua day - xem SEND_BUFFER_DROP_THRESHOLD_MS.
     private var sendBufferOverflowDropCount = 0
 
-    // ⚠️ MOI (fix loi phat hien khi phan tich maxRetransmits=1 + ordered=false
+    // ⚠ MOI (fix loi phat hien khi phan tich maxRetransmits=1 + ordered=false
     // - xem giai thich day du o unpackAndDeliverPcm()): DataChannel voi
     // ordered=false KHONG dam bao thu tu den. Khi 1 goi bi mat va duoc gui
     // lai (retransmit), goi KE TIEP (gui sau nhung khong bi mat) rat co the
@@ -202,43 +197,8 @@ class WebRtcManager(private val context: Context) {
     // gui (May B, 1 chieu duy nhat -> khong can AtomicInteger/lock).
     private var outgoingSeq: Int = 0
 
-    // ✅ MOI (Jitter Buffer - xem giai thich day du o JITTER_BUFFER_TARGET_CHUNKS):
-    // moi clientId co 1 hang doi RIENG, sap xep theo seq (java.util.TreeMap
-    // trong long PriorityQueue-nhu), giu cac chunk PCM da nhan nhung CHUA
-    // phat ra ngoai. mot "playout scheduler" rieng (xem playoutExecutor ben
-    // duoi) se tick dinh ky ~40ms/lan, lay 1 chunk ra khoi hang doi (theo
-    // dung seq) va goi onRemotePcmChunk - TACH RIENG nhip NHAN (bat dinh,
-    // phu thuoc mang) khoi nhip PHAT (deu dan, tu hang doi), day chinh la
-    // co che hap thu jitter.
-    private val jitterQueues = ConcurrentHashMap<String, JitterQueue>()
-
-    // Scheduler dung chung cho TAT CA client (moi client 1 task rieng, chia
-    // se 1 thread pool nho - khong can 1 thread/client vi cong viec rat nhe).
-    private var playoutExecutor: ScheduledExecutorService? = null
-    private val playoutTasks = ConcurrentHashMap<String, ScheduledFuture<*>>()
-
-    /**
-     * Trang thai jitter-buffer + PLC (Packet Loss Concealment) cho 1 clientId.
-     * KHONG thread-safe noi bo (moi field chi duoc doc/ghi tu 1 thread duy
-     * nhat: onMessage cua DataChannel ghi vao pendingChunks, playoutExecutor
-     * tick doc/xoa) - dung 1 lock don gian (synchronized tren chinh object
-     * nay) de tranh dua giua 2 nguon do WebRTC co the goi onMessage tren
-     * thread khac voi thread cua ScheduledExecutorService.
-     */
-    private class JitterQueue {
-        // seq -> PCM data, TU DONG sap xep theo seq tang dan (can cho viec
-        // lay ra DUNG thu tu du chunk den khong dung thu tu do mang).
-        val pendingChunks = sortedMapOf<Int, ShortArray>()
-        var nextSeqToPlay: Int? = null // null = chua bat dau phat (dang cho du JITTER_BUFFER_TARGET_CHUNKS)
-        var lastPlayedChunk: ShortArray? = null
-        var lastPlayedSize: Int = 0
-        var concealedCountInARow: Int = 0
-        var hasStartedPlayback: Boolean = false
-    }
-
     init {
         initializeFactory()
-        playoutExecutor = Executors.newScheduledThreadPool(1)
     }
 
     private fun initializeFactory() {
@@ -285,7 +245,7 @@ class WebRtcManager(private val context: Context) {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             if (audioManager.mode != AudioManager.MODE_NORMAL) {
                 CaptureLogBus.log(
-                    "[WebRtcManager-$tag] ⚠️ AudioManager.mode bi doi thanh " +
+                    "[WebRtcManager-$tag] ⚠ AudioManager.mode bi doi thanh " +
                         "${audioManager.mode} (co the do ADM cua WebRTC) - tra ve MODE_NORMAL."
                 )
                 audioManager.mode = AudioManager.MODE_NORMAL
@@ -366,7 +326,7 @@ class WebRtcManager(private val context: Context) {
             sendChannelNotOpenSkipCount++
             if (sendChannelNotOpenSkipCount % 25 == 0) {
                 CaptureLogBus.log(
-                    "[RemoteTiming-SendSide] ⚠️ DataChannel KHONG o trang thai OPEN " +
+                    "[RemoteTiming-SendSide] ⚠ DataChannel KHONG o trang thai OPEN " +
                         "(state=${channel.state()}) - da bo qua $sendChannelNotOpenSkipCount lan gui."
                 )
             }
@@ -378,21 +338,19 @@ class WebRtcManager(private val context: Context) {
         // MOI, kiem tra hang doi gui NOI BO cua chinh thu vien WebRTC
         // (channel.bufferedAmount(), don vi byte) da tich luy bao nhieu du
         // lieu CHUA kip gui di qua mang. Neu con so nay da tuong duong
-        // nhieu hon SEND_BUFFER_DROP_THRESHOLD_MS mili-giay audio (suy ra tu
-        // kich thuoc 1 chunk hien tai: size sample * 2 byte/sample, gia
-        // dinh nhip gui ~40ms/chunk - xem PLAYOUT_TICK_MS), nghia la mang da
-        // NGHEN THUC SU (khong phai roi 1 goi don le nua) - CHU DONG BO
-        // CHUNK MOI NAY, KHONG goi channel.send(), thay vi de WebRTC tiep
-        // tuc xep chong len hang doi. Day chinh la diem khac biet quyet
-        // dinh: bo NGAY LUC NAY (mat 1 khoang am thanh ngan, giong nhu tin
-        // hieu yeu) thay vi de no bi "giu lai" roi xa ra tre hang giay sau.
+        // nhieu hon SEND_BUFFER_DROP_THRESHOLD_MS mili-giay audio, nghia la
+        // mang da NGHEN THUC SU (khong phai roi 1 goi don le nua) - CHU
+        // DONG BO CHUNK MOI NAY, KHONG goi channel.send(), thay vi de WebRTC
+        // tiep tuc xep chong len hang doi. Day chinh la diem khac biet
+        // quyet dinh: bo NGAY LUC NAY (mat 1 khoang am thanh ngan) thay vi
+        // de no bi "giu lai" roi xa ra tre hang giay sau.
         val bufferedBytes = try {
             channel.bufferedAmount()
         } catch (e: Exception) {
             0L
         }
         val bytesPerChunk = (size * 2).coerceAtLeast(1)
-        val approxMsBuffered = (bufferedBytes * PLAYOUT_TICK_MS) / bytesPerChunk
+        val approxMsBuffered = (bufferedBytes * ASSUMED_SEND_INTERVAL_MS) / bytesPerChunk
         if (approxMsBuffered >= SEND_BUFFER_DROP_THRESHOLD_MS) {
             sendBufferOverflowDropCount++
             if (sendBufferOverflowDropCount % 10 == 0) {
@@ -414,7 +372,7 @@ class WebRtcManager(private val context: Context) {
             val gapMs = (now - lastSendNanoTime) / 1_000_000L
             if (gapMs >= 150L) {
                 CaptureLogBus.log(
-                    "[RemoteTiming-SendSide] ⚠️ May B: khoang trong giua 2 lan GUI PCM = ${gapMs}ms " +
+                    "[RemoteTiming-SendSide] ⚠ May B: khoang trong giua 2 lan GUI PCM = ${gapMs}ms " +
                         "(binh thuong ~40ms/lan) - neu thay dong nay, nghia la CHINH MicInput/thread " +
                         "cua May B bi nghen, KHONG phai loi mang/DataChannel."
                 )
@@ -437,7 +395,7 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
-        // ⚠️ SUA: them 4 byte seq (Int) o DAU buffer, TRUOC phan PCM - xem
+        // ⚠ SUA: them 4 byte seq (Int) o DAU buffer, TRUOC phan PCM - xem
         // giai thich day du o khai bao outgoingSeq/unpackAndDeliverPcm().
         val seq = outgoingSeq
         outgoingSeq++ // tran (overflow) ve Int.MIN_VALUE sau ~2.7 ty goi la
@@ -518,178 +476,97 @@ class WebRtcManager(private val context: Context) {
     }
 
     /**
-     * ✅ SUA (nang cap tu ban "phat ngay lap tuc + drop-neu-sai-thu-tu" cu
-     * len JITTER BUFFER + PLC - xem giai thich day du o JITTER_BUFFER_TARGET_CHUNKS,
-     * class JitterQueue, ensurePlayoutTicker() va playoutTick() phia tren):
+     * ⚠ SUA LOI (phat hien khi ra soat lai maxRetransmits=1 + ordered=false
+     * o getRtcConfig()/startClientPeer()): DataChannel ordered=false KHONG
+     * dam bao chunk den DUNG thu tu da GUI. Neu 1 chunk (goi N) bi mat tren
+     * mang, WebRTC se GUI LAI no (maxRetransmits=1) - nhung viec gui lai can
+     * 1 khoang thoi gian (phat hien mat + round-trip), trong luc do chunk
+     * N+1 (gui SAU nhung KHONG bi mat) hoan toan co the DEN TRUOC ban
+     * gui-lai cua chunk N.
      *
-     * VAN DE CUA BAN CU: ordered=false KHONG dam bao chunk den DUNG thu tu
-     * da GUI, va moi khi phat hien sai thu tu (thuong do 1 goi bi
-     * retransmit), ban cu DROP HOAN TOAN chunk do - tao ra 1 khoang trong
-     * PCM dot ngot (nghe nhu "tach/khuyu" 1 nhip), CHINH LA nguyen nhan
-     * chinh gay cam giac "loa bi cham" nguoi dung phan anh.
-     *
-     * HAM NAY GIO CHI LAM 1 VIEC: giai ma seq + PCM tho tu byteBuffer, roi
-     * XEP VAO JitterQueue cua clientId tuong ung (co kiem tra chong chen
-     * nguoc chunk qua cu). KHONG con phat truc tiep onRemotePcmChunk tai
-     * day nua - viec do da chuyen sang playoutTick() chay dinh ky rieng
-     * biet, cho phep "dem" mot chut du lieu (JITTER_BUFFER_TARGET_CHUNKS)
-     * truoc khi phat, va "bu" (PLC) khi chunk chua kip den thay vi im lang
-     * dot ngot.
+     * ✅ CAP NHAT (PLC thay the drop don thuan - xem PLC_MAX_CONCEALED_CHUNKS):
+     * ham nay VAN phat TRUC TIEP, DONG BO ngay khi nhan duoc chunk hop le
+     * (KHONG hang doi/khong cho - xem "bai hoc rut ra" o KDoc dau file).
+     * Diem khac voi ban dau: khi phat hien seq NHAY CACH (bo lo >=1 chunk so
+     * voi seq da phat gan nhat), CHEN 1 chunk "bu" (lap chunk truoc do, giam
+     * bien do dan) NGAY TRUOC khi phat chunk that - thay vi de 1 khoang
+     * trong PCM dot ngot. Chunk den QUA TRE (seq <= seq da phat, tuc ban
+     * retransmit den sau khi vi tri cua no da duoc "bu" hoac da bi 1 chunk
+     * moi hon vuot qua) van bi loai NHU CU - khong the chen nguoc thoi gian.
      */
     private fun unpackAndDeliverPcm(clientId: String, byteBuffer: ByteBuffer) {
         byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
         if (byteBuffer.remaining() < 4) {
-            CaptureLogBus.log("[WebRTC-Host] ⚠️ Chunk PCM tu $clientId qua ngan (thieu header seq) - bo qua.")
+            CaptureLogBus.log("[WebRTC-Host] ⚠ Chunk PCM tu $clientId qua ngan (thieu header seq) - bo qua.")
             return
         }
         val seq = byteBuffer.int
         val shortCount = byteBuffer.remaining() / 2
-        val chunk = ShortArray(shortCount)
-        for (i in 0 until shortCount) {
-            chunk[i] = byteBuffer.short
-        }
 
-        // ✅ SUA (thay the co che "phat ngay lap tuc" cu bang jitter buffer -
-        // xem giai thich day du o JITTER_BUFFER_TARGET_CHUNKS va class
-        // JitterQueue phia tren): CHUNK NHAN duoc GIO CHI duoc XEP VAO HANG
-        // DOI theo seq, KHONG con goi onRemotePcmChunk truc tiep tai day
-        // nua - viec PHAT thuc su duoc mot ticker rieng (ensurePlayoutTicker())
-        // dam nhiem theo nhip DEU ~40ms, doc hoc tu hang doi nay.
-        val queue = jitterQueues.getOrPut(clientId) { JitterQueue() }
-        synchronized(queue) {
-            // Neu chunk nay qua CU (seq <= seq da tung phat), day la ban
-            // retransmit den SAU 1 chunk moi hon da duoc phat roi - khong
-            // the "chen nguoc thoi gian" vao hang doi nua, bo di (giu dung
-            // tinh than OrderGuard cu, chi khac la kiem tra so voi seq DA
-            // PHAT thay vi seq DA NHAN).
-            val playedBoundary = queue.nextSeqToPlay
-            if (playedBoundary != null && (seq - playedBoundary) < 0) {
-                outOfOrderDropCount++
-                if (outOfOrderDropCount % 25 == 0) {
-                    CaptureLogBus.log(
-                        "[RemoteTiming-OrderGuard] ⚠️ Da bo $outOfOrderDropCount chunk PCM tu $clientId " +
-                            "den QUA TRE (seq=$seq, da phat toi seq=$playedBoundary) - " +
-                            "ban retransmit den sau chunk moi hon da phat, khong the chen nguoc."
-                    )
-                }
-                return
-            }
-            queue.pendingChunks[seq] = chunk
-
-            // ✅ MOI (xem giai thich day du o JITTER_QUEUE_MAX_CHUNKS): neu
-            // hang doi vuot qua gioi han, XOA CAC CHUNK CU NHAT (seq nho
-            // nhat) cho toi khi ve lai duoi gioi han - dam bao ticker
-            // KHONG BAO GIO phai "chay dua" phat hang chuc chunk ton dong,
-            // uu tien giu du lieu MOI (gan voi thoi diem hien tai) hon.
-            while (queue.pendingChunks.size > JITTER_QUEUE_MAX_CHUNKS) {
-                val oldestSeq = queue.pendingChunks.firstKey()
-                queue.pendingChunks.remove(oldestSeq)
-                jitterQueueOverflowDropCount++
-                // Nhay nextSeqToPlay toi ngay sau chunk vua bi xoa, tranh
-                // ticker con co gang "cho" 1 seq da khong con trong hang doi.
-                val currentBoundary = queue.nextSeqToPlay
-                if (currentBoundary == null || (oldestSeq - currentBoundary) >= 0) {
-                    queue.nextSeqToPlay = oldestSeq + 1
-                }
-            }
-            if (jitterQueueOverflowDropCount > 0 && jitterQueueOverflowDropCount % 10 == 0) {
+        val lastSeq = lastDeliveredSeq[clientId]
+        if (lastSeq != null && (seq - lastSeq) <= 0) {
+            outOfOrderDropCount++
+            if (outOfOrderDropCount % 25 == 0) {
                 CaptureLogBus.log(
-                    "[JitterBuffer-Overflow] 🚨 $clientId: hang doi nhan vuot gioi han " +
-                        "($JITTER_QUEUE_MAX_CHUNKS chunk) $jitterQueueOverflowDropCount lan - " +
-                        "da xoa chunk CU de tranh phat don dap khi ticker duoi kip."
+                    "[RemoteTiming-OrderGuard] ⚠ Da bo $outOfOrderDropCount chunk PCM den " +
+                        "TRE/SAI THU TU tu $clientId (seq=$seq, seq cuoi da phat=$lastSeq) - " +
+                        "day la ban gui-lai (retransmit) den sau chunk moi hon, bo de tranh dao thu tu am thanh."
                 )
-            }
-        }
-        ensurePlayoutTicker(clientId)
-    }
-
-    /**
-     * ✅ MOI (Playout Ticker - phan "phat ra" cua jitter buffer): dam bao co
-     * 1 task dinh ky (~PLAYOUT_TICK_MS/lan) dang chay cho clientId nay, doc
-     * TUAN TU tung chunk PCM tu JitterQueue va goi onRemotePcmChunk - nhip
-     * phat nay DEU DAN, TACH BIET hoan toan khoi nhip NHAN chunk qua mang
-     * (von co the dao dong do jitter). Idempotent: goi nhieu lan chi tao 1
-     * task duy nhat cho moi clientId (putIfAbsent).
-     */
-    private fun ensurePlayoutTicker(clientId: String) {
-        val executor = playoutExecutor ?: return
-        if (playoutTasks.containsKey(clientId)) return
-        val future = executor.scheduleAtFixedRate({
-            playoutTick(clientId)
-        }, 0L, PLAYOUT_TICK_MS, TimeUnit.MILLISECONDS)
-        val existing = playoutTasks.putIfAbsent(clientId, future)
-        if (existing != null) {
-            // Task khac da tao truoc do trong luc ta dang tao - huy ban thua.
-            future.cancel(false)
-        }
-    }
-
-    /**
-     * 1 "nhip" phat cho 1 clientId, chay tren playoutExecutor (KHONG chay
-     * tren thread WebRTC nhan goi). Logic:
-     *  1) Chua du du lieu de bat dau (< JITTER_BUFFER_TARGET_CHUNKS chunk
-     *     dau tien) -> cho, khong phat gi ca (tranh bat dau qua som roi
-     *     ngay lap tuc bi doi/PLC do chua kip tich luy dem).
-     *  2) Co chunk dung seq can phat -> phat that (PLC counter ve 0).
-     *  3) KHONG co chunk dung seq (dang cho, hoac chunk that su da mat vinh
-     *     vien sau ca retransmit) -> PLC: phat lap chunk gan nhat, giam dan
-     *     bien do, toi da PLC_MAX_CONCEALED_CHUNKS lan lien tiep; qua nguong
-     *     do thi ngung han (khong con gi de "lap" tranh tieng on lap vo nghia).
-     */
-    private fun playoutTick(clientId: String) {
-        val queue = jitterQueues[clientId] ?: return
-        val (toPlay, size, isConcealed) = synchronized(queue) {
-            if (!queue.hasStartedPlayback) {
-                if (queue.pendingChunks.size < JITTER_BUFFER_TARGET_CHUNKS) {
-                    return@synchronized Triple(null, 0, false)
-                }
-                queue.hasStartedPlayback = true
-                queue.nextSeqToPlay = queue.pendingChunks.firstKey()
-            }
-
-            val seqToPlay = queue.nextSeqToPlay
-            val exact = if (seqToPlay != null) queue.pendingChunks.remove(seqToPlay) else null
-            if (exact != null) {
-                queue.lastPlayedChunk = exact
-                queue.lastPlayedSize = exact.size
-                queue.concealedCountInARow = 0
-                queue.nextSeqToPlay = (seqToPlay!!) + 1
-                return@synchronized Triple(exact, exact.size, false)
-            }
-
-            // Khong co chunk dung seq: thu PLC neu con "quota" va co du lieu
-            // gan nhat de lap lai.
-            val lastChunk = queue.lastPlayedChunk
-            if (lastChunk != null && queue.concealedCountInARow < PLC_MAX_CONCEALED_CHUNKS) {
-                queue.concealedCountInARow++
-                val attenuation = Math.pow(PLC_ATTENUATION_FACTOR, queue.concealedCountInARow.toDouble())
-                val concealed = ShortArray(queue.lastPlayedSize) { i ->
-                    (lastChunk[i] * attenuation).toInt().toShort()
-                }
-                // Van tang nextSeqToPlay de khi chunk that (seq bi "bo lo")
-                // cuoi cung cung den (vi du qua retransmit tre), no se bi
-                // OrderGuard loai vi qua cu - dung, vi ta da "bu" no bang PLC
-                // roi, khong the phat lai lan 2 (se nghe nhu echo/lap).
-                queue.nextSeqToPlay = (seqToPlay ?: 0) + 1
-                return@synchronized Triple(concealed, concealed.size, true)
-            }
-
-            // Het quota PLC va/hoac chua co du lieu nao de lap - im lang,
-            // nhung VAN tang nextSeqToPlay de khong bi ket cung 1 vi tri mai.
-            queue.nextSeqToPlay = (seqToPlay ?: 0) + 1
-            Triple(null, 0, false)
-        }
-
-        if (toPlay == null) {
-            if (isConcealed) {
-                CaptureLogBus.log("[JitterBuffer-PLC] ⚠️ $clientId: mat chunk, dang bu bang du lieu cu.")
             }
             return
         }
-        if (isConcealed) {
-            CaptureLogBus.log("[JitterBuffer-PLC] 🩹 $clientId: phat chunk BU (lap+giam bien do) do chunk that chua den kip.")
+
+        // ✅ SUA: lay/tao scratch buffer RIENG cho clientId nay - xem giai
+        // thich day du o khai bao pcmScratchBuffers phia tren.
+        var scratch = pcmScratchBuffers[clientId]
+        if (scratch == null || scratch.size < shortCount) {
+            scratch = ShortArray(shortCount)
+            pcmScratchBuffers[clientId] = scratch
         }
-        onRemotePcmChunk?.invoke(clientId, toPlay, size)
+        for (i in 0 until shortCount) {
+            scratch[i] = byteBuffer.short
+        }
+
+        // ✅ MOI (PLC - xem giai thich day du o KDoc ham nay va
+        // PLC_MAX_CONCEALED_CHUNKS): neu seq nay NHAY CACH so voi seq da
+        // phat gan nhat (vi du seq=105 nhung lastSeq=103 -> mat/bo lo dung
+        // 1 chunk co seq=104), CHEN 1 chunk "bu" NGAY TRUOC khi phat chunk
+        // that su nay - lap lai noi dung chunk GAN NHAT da phat thanh cong,
+        // giam bien do de tranh nghe nhu "vong lap" ro rang. CHI bu 1 lan
+        // cho MOI khoang trong (du khoang trong co the > 1 seq) de tranh keo
+        // dai am thanh gia tao - neu he thong retransmit + bu nay van khong
+        // du, im lang ngan con hop ly hon la lap qua nhieu.
+        if (lastSeq != null) {
+            val gap = seq - lastSeq - 1
+            val lastChunk = lastDeliveredChunk[clientId]
+            val concealedSoFar = concealedCountInARow[clientId] ?: 0
+            if (gap > 0 && lastChunk != null && concealedSoFar < PLC_MAX_CONCEALED_CHUNKS) {
+                concealedChunkCount++
+                val attenuation = Math.pow(PLC_ATTENUATION_FACTOR, (concealedSoFar + 1).toDouble())
+                val concealedSize = lastChunk.size
+                val concealed = ShortArray(concealedSize) { i ->
+                    (lastChunk[i] * attenuation).toInt().toShort()
+                }
+                concealedCountInARow[clientId] = concealedSoFar + 1
+                if (concealedChunkCount % 25 == 0) {
+                    CaptureLogBus.log(
+                        "[PLC] 🩹 $clientId: mat/bo lo $gap chunk (seq $lastSeq -> $seq) - " +
+                            "da bu $concealedChunkCount chunk (tong) bang du lieu cu giam bien do."
+                    )
+                }
+                onRemotePcmChunk?.invoke(clientId, concealed, concealedSize)
+            } else {
+                concealedCountInARow[clientId] = 0
+            }
+        }
+
+        lastDeliveredSeq[clientId] = seq
+        // Luu BAN SAO (KHONG luu truc tiep scratch, vi scratch se bi GHI DE
+        // o lan goi ke tiep cho CUNG clientId nay) de dung lam nguon "bu"
+        // cho lan mat goi ke tiep.
+        lastDeliveredChunk[clientId] = scratch.copyOf(shortCount)
+
+        onRemotePcmChunk?.invoke(clientId, scratch, shortCount)
     }
 
     fun addRemoteIceCandidate(clientId: String, sdpMid: String, sdpMLineIndex: Int, candidate: String) {
@@ -702,12 +579,18 @@ class WebRtcManager(private val context: Context) {
             close()
             dispose()
         }
-        // ✅ SUA (thay the don pcmScratchBuffers/lastDeliveredSeq cu bang don
-        // jitter buffer + playout task moi): huy task phat dinh ky va xoa
-        // hang doi cua client vua roi phong, tranh ro ri nho/task chay vo
-        // ich neu co nhieu client noi/roi lien tuc trong 1 phien dai.
-        playoutTasks.remove(clientId)?.cancel(false)
-        jitterQueues.remove(clientId)
+        // ✅ MOI: don luon scratch buffer + trang thai PLC cua client vua
+        // roi phong, tranh ro ri nho neu co nhieu client noi/roi lien tuc
+        // trong 1 phien dai.
+        pcmScratchBuffers.remove(clientId)
+        // ⚠ MOI (dong bo voi fix seq-order o unpackAndDeliverPcm()): don
+        // luon seq cuoi da phat cua client vua roi - neu client nay ket noi
+        // lai voi 1 outgoingSeq MOI bat dau tu 0 (WebRtcManager moi ben May
+        // B), seq cu con luu lai se khien MOI chunk dau tien cua phien moi
+        // bi coi la "tre/sai thu tu" va bi bo oan.
+        lastDeliveredSeq.remove(clientId)
+        lastDeliveredChunk.remove(clientId)
+        concealedCountInARow.remove(clientId)
     }
 
     fun closeAll() {
@@ -718,9 +601,10 @@ class WebRtcManager(private val context: Context) {
             pc.dispose()
         }
         peerConnections.clear()
-        playoutTasks.forEach { (_, future) -> future.cancel(false) }
-        playoutTasks.clear()
-        jitterQueues.clear()
+        pcmScratchBuffers.clear()
+        lastDeliveredSeq.clear()
+        lastDeliveredChunk.clear()
+        concealedCountInARow.clear()
 
         // ✅ FIX (xem giai thich o khai bao truong `factory`/`audioDeviceModule`
         // phia tren): TRUOC DAY closeAll() chi don PeerConnection/DataChannel,
@@ -735,28 +619,16 @@ class WebRtcManager(private val context: Context) {
         try {
             factory?.dispose()
         } catch (e: Exception) {
-            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi dispose PeerConnectionFactory: ${e.message}")
+            CaptureLogBus.log("[WebRtcManager] ⚠ Loi khi dispose PeerConnectionFactory: ${e.message}")
         }
         factory = null
 
         try {
             audioDeviceModule?.release()
         } catch (e: Exception) {
-            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi release AudioDeviceModule: ${e.message}")
+            CaptureLogBus.log("[WebRtcManager] ⚠ Loi khi release AudioDeviceModule: ${e.message}")
         }
         audioDeviceModule = null
-
-        // ✅ MOI (dong bo voi fix ro ri factory/ADM da co san o tren): don
-        // luon thread pool cua jitter-buffer playout ticker - neu khong,
-        // moi lan tao WebRtcManager moi (Ket noi lai/quet QR lai) se "mo"
-        // 1 thread pool moi ma KHONG BAO GIO tat ban cu, tich luy dan qua
-        // nhieu lan ket noi lai giong nhu van de factory/ADM da tung gap.
-        try {
-            playoutExecutor?.shutdownNow()
-        } catch (e: Exception) {
-            CaptureLogBus.log("[WebRtcManager] ⚠️ Loi khi shutdown playoutExecutor: ${e.message}")
-        }
-        playoutExecutor = null
     }
 }
 
