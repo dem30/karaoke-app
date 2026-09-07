@@ -10,6 +10,7 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -100,6 +101,18 @@ class PlaybackCaptureService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var musicInput: MusicInput? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ✅ MOI (fix "Mic B qua WebRTC bi giat/re thanh cum 150-400ms du May B
+    // gui deu - xac nhan qua log [RemoteTiming-SendSide] gui deu ~40ms trong
+    // khi [RemoteTiming] o May A nhan giat cuc"): KHONG co WifiLock nao trong
+    // toan bo code truoc day, khien chip Wi-Fi cua may TU DONG vao power-save
+    // mode (dac biet luc man hinh tat) - goi tin van duoc gui/nhan dung
+    // (SCTP/DataChannel khong bao loi gi), nhung antenna chi "thuc day" theo
+    // chu ky DTIM/beacon interval (thuong ~100-300ms) de gom/phat goi dang
+    // cho, tao dung kieu "im lang roi don cuc" da quan sat duoc. Giu WifiLock
+    // trong suot phien Mixer Test (May A dang nhan PCM tu May B qua Wi-Fi) -
+    // song song voi WakeLock da co san o tren.
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private var micInput: MicInput? = null
     private var mixer: LowLatencyMixer? = null
@@ -513,6 +526,49 @@ class PlaybackCaptureService : Service() {
             }
         } catch (e: Exception) {
             logBoth("❌ Khong the release WakeLock: ${e.message}", isError = true)
+        }
+    }
+
+    /**
+     * ✅ MOI (xem giai thich day du o khai bao field wifiLock phia tren):
+     * WIFI_MODE_FULL_LOW_LATENCY (API 29+) uu tien do tre thap hon ca
+     * WIFI_MODE_FULL_HIGH_PERF - fallback ve HIGH_PERF cho may cu hon.
+     */
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MixerWifiLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            wifiLock?.let {
+                if (!it.isHeld) {
+                    it.acquire()
+                    logBoth("🔒 Da kich hoat WifiLock (chong Wi-Fi vao power-save khi nhan PCM tu May B).")
+                }
+            }
+        } catch (e: Exception) {
+            logBoth("❌ Khong the acquire WifiLock: ${e.message}", isError = true)
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    logBoth("🔓 Da giai phong WifiLock.")
+                }
+            }
+        } catch (e: Exception) {
+            logBoth("❌ Khong the release WifiLock: ${e.message}", isError = true)
         }
     }
 
@@ -1075,6 +1131,7 @@ class PlaybackCaptureService : Service() {
 
         startForeground(NOTIFICATION_ID, buildNotification("Dang khoi dong..."))
         acquireWakeLock()
+        acquireWifiLock()
 
         logBoth("Service started. intent=$intent, hasExtras=${intent?.extras != null}")
 
@@ -1139,6 +1196,7 @@ class PlaybackCaptureService : Service() {
     override fun onDestroy() {
         stopCurrentSessionIfAny()
         releaseWakeLock()
+        releaseWifiLock()
         logBoth("Service destroyed")
         super.onDestroy()
     }

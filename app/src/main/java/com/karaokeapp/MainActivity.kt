@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -135,6 +136,18 @@ class MainActivity : AppCompatActivity() {
 
         @Volatile
         private var wirelessMicInput: MicInput? = null
+
+        // ✅ MOI (fix "Mic B qua WebRTC bi giat/re thanh cum 150-400ms" - xem
+        // giai thich day du o WifiLock ben PlaybackCaptureService.kt, vai
+        // tro May A): may B (vai tro Mic khong day) GUI PCM deu dan (da xac
+        // nhan qua log [RemoteTiming-SendSide]), nhung neu chip Wi-Fi cua
+        // CHINH may B roi vao power-save mode giua chung, cac goi van duoc
+        // gui() dung nhip nhung antenna chi thuc su phat song theo chu ky
+        // beacon/DTIM - tao ra dung do tre 150-400ms May A do duoc. Giu
+        // WifiLock trong suot phien Mic khong day, doc lap voi WifiLock ben
+        // PlaybackCaptureService (moi may giu wifi cua chinh no).
+        @Volatile
+        private var wifiLock: WifiManager.WifiLock? = null
 
         @Volatile
         private var micSessionGeneration = 0
@@ -1056,6 +1069,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     return@onConnected
                 }
+                acquireMicWifiLock()
                 val mic = MicInput(this)
                 wirelessMicInput = mic
                 mic.startCapture(onPcmChunk = { buffer, size ->
@@ -1090,7 +1104,52 @@ class MainActivity : AppCompatActivity() {
         signalingClient = null
         webRtcManager?.closeAll()
         webRtcManager = null
+        releaseMicWifiLock()
         Toast.makeText(this, "Da ngat ket noi Mic", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * ✅ MOI (xem giai thich day du o khai bao field wifiLock trong companion
+     * object phia tren): giu Wi-Fi cua CHINH may B o che do hieu nang cao
+     * trong suot phien gui Mic khong day, tranh chip Wi-Fi tu dong vao
+     * power-save mode gay tre goi PCM giua chung.
+     */
+    private fun acquireMicWifiLock() {
+        try {
+            if (wifiLock == null) {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifiManager.createWifiLock(mode, "KaraokeApp::MicWifiLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            wifiLock?.let {
+                if (!it.isHeld) {
+                    it.acquire()
+                    CaptureLogBus.log("[Mic] 🔒 Da kich hoat WifiLock (chong Wi-Fi vao power-save khi gui PCM).")
+                }
+            }
+        } catch (e: Exception) {
+            CaptureLogBus.log("[Mic] ❌ Khong the acquire WifiLock: ${e.message}")
+        }
+    }
+
+    private fun releaseMicWifiLock() {
+        try {
+            wifiLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    CaptureLogBus.log("[Mic] 🔓 Da giai phong WifiLock.")
+                }
+            }
+        } catch (e: Exception) {
+            CaptureLogBus.log("[Mic] ❌ Khong the release WifiLock: ${e.message}")
+        }
     }
 
     override fun onDestroy() {
