@@ -928,7 +928,27 @@ class PlaybackCaptureService : Service() {
         mixer = mix
         micInput = mic
         finalMixLimiter = finalLimiterInstance
-        activeMixerInstance = mix
+        // ✅ FIX ("May A tu thoat/crash gan nhu tuc thi ngay khi ICE bao
+        // CONNECTED va khung audio dau tien tu May B chuan bi toi" - xac
+        // nhan qua log thuc te: log dung dot ngot NGAY TAI dong "Trang thai
+        // ket noi ICE: CONNECTED", dung luc Mixer Test dang chay song):
+        // pushRemoteVocalChunk() (goi tu LUONG WEBRTC NATIVE, khac han main
+        // thread) doc activeMixerInstance BEN TRONG synchronized(
+        // vocalPushLock) - nhung dong gan gia tri o day TRUOC DAY lai gan
+        // TRUC TIEP, KHONG nam trong cung khoi synchronized do. synchronized
+        // chi tao duoc "memory barrier" (dam bao thread khac THAY duoc gia
+        // tri moi + trang thai noi bo day du cua object) khi CA HAI phia
+        // (ghi va doc) cung dung CHUNG 1 lock - o day chi 1 phia khoa, phia
+        // kia ghi tu do, nen luong WebRTC co the doc phai activeMixerInstance
+        // CU (null) hoac te hon - tham chieu toi object LowLatencyMixer o
+        // trang thai CHUA "publish" xong (thieu happens-before sau .apply {
+        // start() }) -> hanh vi khong xac dinh ngay khi goi mix.pushVocal()
+        // dong ke tiep trong pushRemoteVocalChunk(). Sua: bao dong gan nay
+        // trong CUNG mot khoi synchronized(vocalPushLock) voi noi doc, dam
+        // bao luong WebRTC luon thay dung trang thai moi nhat.
+        synchronized(vocalPushLock) {
+            activeMixerInstance = mix
+        }
 
         // ✅ SUA (Phase 6 - bo HowlGuard): khong con reset bien howl* (da go
         // bo hoan toan). Thay vao do, reset state DSP NOI BO (filter/
@@ -1069,13 +1089,23 @@ class PlaybackCaptureService : Service() {
 
         micInput?.stopCapture()
         micInput = null
+        // ✅ FIX (cung nguyen nhan/giai thich voi noi gan activeMixerInstance
+        // = mix o startMixerTestInternal() phia tren, xem giai thich day du
+        // o do): dat activeMixerInstance = null TRUOC khi goi mixer?.stop()
+        // (thay vi SAU nhu ban cu) - dong het "cua so" race: neu luong WebRTC
+        // (dang co the dung goi pushRemoteVocalChunk()) doc activeMixerInstance
+        // dung vao khoang giua luc code o day dang stop() mixer, no se thay
+        // NULL ngay va return som (dong 491) thay vi van con giu tham chieu
+        // toi 1 LowLatencyMixer dang/da bi dung giua chung.
+        synchronized(vocalPushLock) {
+            activeMixerInstance = null
+        }
         mixer?.stop()
         mixer = null
         mixerOutputRouter?.stop()
         mixerOutputRouter = null
         finalMixLimiter?.reset()
         finalMixLimiter = null
-        activeMixerInstance = null
 
         // ✅ SUA (Phase 6): KHONG con xoa vocalChannels o day - lam vay se
         // mat het volume/EQ nguoi dung da chinh moi lan Tat/Bat Mixer Test
