@@ -67,6 +67,42 @@ class WebRtcManager(private val context: Context) {
         // le. Dat thanh hang so o day de de dang chinh lai (vi du thu 2)
         // neu test thuc te van con nghe ret sau ban sua nay.
         private const val DATA_CHANNEL_MAX_RETRANSMITS = 1
+
+        // ✅ MOI (fix "ret/ro/lag Mic B" ban 2 - sau khi da LOAI TRU Wi-Fi
+        // that (ping giua 2 may muot), CPU May A (avgLoopGap mixer van
+        // ~40ms on dinh du da tat het app nen), va nhip GUI cua May B (log
+        // RemoteTiming-SendSide sach, gap lon nhat chi 43-62ms): 3 nghi
+        // pham do deu bi loai bang so lieu thuc te. Dau hieu con lai - cua
+        // so 3s nhieu luc NHAN DUOC NHIEU HON so chunk ky vong (vd 101/78,
+        // 83/75) - cho thay du lieu KHONG MAT, chi bi mot tang nao do GIU
+        // LAI roi XA CUC BO. Nghi pham hop ly nhat: chinh SCTP (thu vien
+        // usrsctp ben trong libwebrtc, noi DataChannel chay ben tren) co co
+        // che kieu Nagle - gom nhieu goi NHO gui lien tiep lai truoc khi
+        // thuc su day xuong mang, thay vi day ngay tung goi. Voi tan suat
+        // GUI cu ~25 lan/giay (moi lan chi ~7KB PCM tho, gia tri byte RAT
+        // NHO so voi 1 goi mang thong thuong), day chinh la kieu traffic de
+        // bi "giu lai cho gom" nhat.
+        //
+        // Sua: GOM nhieu chunk PCM nho lai (vd 2 chunk 40ms -> 1 chunk
+        // 80ms) TRUOC khi thuc su goi channel.send() - giam so LAN GOI
+        // send()/giay xuong con 1 nua, giam ap luc len co che gom cua SCTP.
+        // Danh doi: do tre giong hat cua May B tang them ~40ms (= 1 chu ky
+        // gom them) - chap nhan duoc de doi lay het ret/ro. Neu sau khi
+        // test van con hien tuong, thu tang len GOM_3_CHUNK (120ms) bang
+        // cach doi SEND_BATCH_SAMPLES thanh CHUNK_SAMPLES_40MS * 3.
+        //
+        // ⚠️ LUU Y: gia tri nay la SO SAMPLE (khong phai ms) vi ham
+        // sendPcmChunkFromMic() lam viec truc tiep tren ShortArray PCM,
+        // KHONG biet sample rate cua nguon goi vao - gia dinh CHUNG voi
+        // toan bo pipeline con lai la 44100Hz (giong SAMPLE_RATE trong
+        // LowLatencyMixer.kt). Neu sau nay doi sample rate, phai doi ca
+        // hang so nay.
+        private const val SEND_BATCH_SAMPLES = 3528 // 3528/44100 = 80ms
+
+        // Dung de tinh "ky vong bao nhieu lan gui/cua so" trong log chan
+        // doan SendSide - PHAI khop voi SEND_BATCH_SAMPLES o tren (doi 1
+        // trong 2 ma quen doi cai kia se lam log chan doan bao sai lech).
+        private const val SEND_BATCH_INTERVAL_MS = 80L
     }
 
     private var factory: PeerConnectionFactory? = null
@@ -103,6 +139,30 @@ class WebRtcManager(private val context: Context) {
     private var sendMaxGapMsInWindow = 0L
     private var sendWindowStartNanoTime = 0L
     private var sendChannelNotOpenSkipCount = 0
+
+    // ✅ MOI (gom chunk truoc khi gui - xem giai thich day du o KDoc
+    // SEND_BATCH_SAMPLES phia tren): buffer TICH LUY PCM ben phia May B,
+    // CHI 1 producer duy nhat goi vao (thread capture mic) nen KHONG can
+    // @Synchronized - neu sau nay co > 1 nguon goi sendPcmChunkFromMic()
+    // dong thoi tren cung 1 instance thi PHAI them khoa o day.
+    //
+    // Kich thuoc gap 2 lan SEND_BATCH_SAMPLES: du cho truong hop 1 lan goi
+    // vao co size LON HON binh thuong (vd MicInput doi buffer size), tranh
+    // phai cap phat lai giua chung (cap phat lai o hot path se gay GC
+    // giong dung van de da sua trong LowLatencyMixer.kt).
+    private var sendAccumulator = ShortArray(SEND_BATCH_SAMPLES * 2)
+    private var sendAccumulatedCount = 0
+
+    // ⚠️ CAN NHAC (DA THU roi BO): tung dinh tai su dung 1 ByteBuffer duy
+    // nhat cho moi lan gui de giam cap phat - NHUNG khong the chac chan
+    // channel.send() cua thu vien WebRTC copy du lieu ra khoi buffer NGAY
+    // LAP TUC (dong bo) hay chi giu tham chieu roi xu ly bat dong bo o
+    // thread khac (SCTP). Neu la truong hop sau, ghi de buffer o lan gui
+    // TIEP THEO truoc khi lan gui TRUOC do thuc su duoc thu vien doc xong
+    // se lam HONG DU LIEU dang bay (nghe con te hon ca ret/ro hien tai).
+    // Danh doi lai an toan: MOI lan gui van allocateDirect() rieng (xem
+    // sendBatchToDataChannel()) - tan suat gio chi con ~12-13 lan/giay (sau
+    // khi gom chunk) nen chi phi cap phat khong dang ngai nhu truoc.
 
     init {
         initializeFactory()
@@ -221,9 +281,53 @@ class WebRtcManager(private val context: Context) {
     }
 
     /**
-     * May B gui truc tiep tung chunk PCM thu duoc tu Mic sang May A qua WebRTC.
+     * May B goi ham nay moi lan MicInput tra ve 1 chunk PCM (~40ms) - KHONG
+     * con gui thang xuong DataChannel nhu truoc. Xem giai thich day du o
+     * KDoc SEND_BATCH_SAMPLES: gio se GOM lai thanh chunk lon hon
+     * (SEND_BATCH_SAMPLES) roi moi thuc su gui qua sendBatchToDataChannel()
+     * - giam so LAN GOI channel.send()/giay, giam ap luc len co che gom
+     * cua SCTP (nghi ngo la nguyen nhan goc cua tieng ret/ro/lag Mic B).
+     *
+     * ⚠️ QUAN TRONG: ham nay gio co the KHONG gui gi ca trong 1 lan goi (chi
+     * tich luy vao accumulator) - hoan toan binh thuong, KHONG phai loi. Du
+     * lieu se duoc gui o 1 trong nhung lan goi sau, khi accumulator du
+     * SEND_BATCH_SAMPLES.
      */
     fun sendPcmChunkFromMic(buffer: ShortArray, size: Int) {
+        if (size <= 0) return
+
+        // Dam bao accumulator du cho o TRUONG HOP HIEM (1 lan goi vao co
+        // size bat thuong lon) - tuong tu cach pcmScratchBuffers.getOrPut()
+        // tu lon o unpackAndDeliverPcm(), tranh IndexOutOfBounds thay vi
+        // gia dinh size luon co dinh.
+        val needed = sendAccumulatedCount + size
+        if (needed > sendAccumulator.size) {
+            sendAccumulator = sendAccumulator.copyOf(needed)
+        }
+        System.arraycopy(buffer, 0, sendAccumulator, sendAccumulatedCount, size)
+        sendAccumulatedCount += size
+
+        // Co the du du lieu cho NHIEU HON 1 batch neu 1 lan goi vao qua
+        // lon (hiem) - xa het cac batch day du truoc, phan le con lai o
+        // duoi SEND_BATCH_SAMPLES thi giu lai cho lan goi sau.
+        while (sendAccumulatedCount >= SEND_BATCH_SAMPLES) {
+            sendBatchToDataChannel(sendAccumulator, SEND_BATCH_SAMPLES)
+            val remaining = sendAccumulatedCount - SEND_BATCH_SAMPLES
+            if (remaining > 0) {
+                System.arraycopy(sendAccumulator, SEND_BATCH_SAMPLES, sendAccumulator, 0, remaining)
+            }
+            sendAccumulatedCount = remaining
+        }
+    }
+
+    /**
+     * Gui THUC SU 1 batch PCM (dung SEND_BATCH_SAMPLES sample) qua
+     * DataChannel - noi DUY NHAT con dung channel.send(). Toan bo logic
+     * chan doan SendSide (lastSendNanoTime/sendCountInWindow/v.v.) gio do
+     * NHIP GOI HAM NAY (tuc nhip batch ~80ms), KHONG con phai nhip goi
+     * sendPcmChunkFromMic() (~40ms) nhu truoc ban gom chunk.
+     */
+    private fun sendBatchToDataChannel(buffer: ShortArray, size: Int) {
         val channel = localDataChannel ?: return
         if (channel.state() != DataChannel.State.OPEN) {
             // ✅ MOI (chan doan): dem so lan bi bo qua do channel CHUA/KHONG
@@ -242,15 +346,18 @@ class WebRtcManager(private val context: Context) {
 
         // ✅ MOI (chan doan - xem giai thich day du o khai bao cac bien
         // lastSendNanoTime/sendCountInWindow phia tren): do nhip GUI thuc te
-        // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang.
+        // tu chinh May B, TRUOC khi du lieu di vao DataChannel/mang. Sau ban
+        // gom chunk, nhip ky vong la SEND_BATCH_INTERVAL_MS (~80ms), KHONG
+        // con la 40ms nhu truoc.
         val now = System.nanoTime()
         if (lastSendNanoTime != 0L) {
             val gapMs = (now - lastSendNanoTime) / 1_000_000L
-            if (gapMs >= 150L) {
+            if (gapMs >= SEND_BATCH_INTERVAL_MS * 3) {
                 CaptureLogBus.log(
                     "[RemoteTiming-SendSide] ⚠️ May B: khoang trong giua 2 lan GUI PCM = ${gapMs}ms " +
-                        "(binh thuong ~40ms/lan) - neu thay dong nay, nghia la CHINH MicInput/thread " +
-                        "cua May B bi nghen, KHONG phai loi mang/DataChannel."
+                        "(binh thuong ~${SEND_BATCH_INTERVAL_MS}ms/lan sau khi gom chunk) - neu thay " +
+                        "dong nay, nghia la CHINH MicInput/thread cua May B bi nghen, KHONG phai loi " +
+                        "mang/DataChannel."
                 )
             }
             sendMaxGapMsInWindow = max(sendMaxGapMsInWindow, gapMs)
@@ -260,10 +367,10 @@ class WebRtcManager(private val context: Context) {
         if (sendWindowStartNanoTime == 0L) sendWindowStartNanoTime = now
         val windowElapsedMs = (now - sendWindowStartNanoTime) / 1_000_000L
         if (windowElapsedMs >= 3000L) {
-            val expectedCount = (windowElapsedMs / 40L).toInt()
+            val expectedCount = (windowElapsedMs / SEND_BATCH_INTERVAL_MS).toInt()
             CaptureLogBus.log(
                 "[RemoteTiming-SendSide] 📊 May B trong ${windowElapsedMs}ms qua: " +
-                    "da GUI $sendCountInWindow chunk (ky vong ~$expectedCount), " +
+                    "da GUI $sendCountInWindow chunk ${SEND_BATCH_INTERVAL_MS}ms (ky vong ~$expectedCount), " +
                     "gap lon nhat=${sendMaxGapMsInWindow}ms."
             )
             sendCountInWindow = 0
@@ -271,6 +378,10 @@ class WebRtcManager(private val context: Context) {
             sendWindowStartNanoTime = now
         }
 
+        // ⚠️ CO Y GIU allocateDirect() MOI moi lan goi (KHONG tai su dung 1
+        // buffer chung) - xem giai thich day du o KDoc canh bao ngay tren
+        // khai bao sendAccumulator: uu tien AN TOAN du lieu hon toi uu GC,
+        // vi tan suat gio chi con ~12-13 lan/giay sau khi gom chunk.
         val byteBuffer = ByteBuffer.allocateDirect(size * 2).order(ByteOrder.LITTLE_ENDIAN)
         for (i in 0 until size) {
             byteBuffer.putShort(buffer[i])
