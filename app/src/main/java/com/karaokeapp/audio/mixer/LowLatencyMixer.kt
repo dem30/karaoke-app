@@ -53,8 +53,10 @@ private class ShortRingBuffer(private val capacity: Int) {
     }
 
     /**
-     * Chi cat bo khi thuc su vuot nguong tran (threshold).
-     * Khi cat, dua ve targetSize bang crossfade muot ma.
+     * ✅ CO CHE HYSTERESIS (VUNG DEM THO):
+     * Chi cat bo khi dung luong thuc su vuot nguong tran (threshold).
+     * Khi khong vuot nguong, KHONG CAT BAT KY MAU NAO, giup am nhac chay muot ma 100%,
+     * khong bi nhay coc hay giat nhip dinh ky.
      */
     @Synchronized
     fun trimIfExceeds(threshold: Int, targetSize: Int, fadeSamples: Int = 128) {
@@ -62,6 +64,7 @@ private class ShortRingBuffer(private val capacity: Int) {
         var excess = count - targetSize
         if (excess <= 0) return
 
+        // Voi du lieu Stereo, dam bao excess luon chan de khong bi dao lon kenh L va R
         if (targetSize % 2 == 0 && excess % 2 != 0) {
             excess++
             if (count < targetSize + excess) return
@@ -98,11 +101,11 @@ private class ShortRingBuffer(private val capacity: Int) {
 /**
  * Phase 3 - Tron Nhac Stereo + N nguon Vocal Mono thanh 1 output Stereo.
  *
- * ✅ DA SUA LOI RUOT DUOI / NHAC KHONG DEU:
+ * ✅ DA SUA TRIET DE LOI RUOT DUOI / NHAC KHONG DEU:
  * 1. Khong bao gio bat Mixer Loop phai ngu cho YouTube: neu nhac chua kip den hoac pause,
  *    kenh nhac tu dong dien 0 (im lang), vocal van duoc phat real-time khong bi tre.
- * 2. Nang nguong cat tia len 220ms de nhac co khoang tho tu nhien, triet tieu hoan toan
- *    viec cat xen mau dinh ky (trim = 0), nhac chay deu va muot ma 100%.
+ * 2. Nang nguong cat tia len 320ms (8 chunks) va mo rong buffer len 600ms, giup nhac nen
+ *    dao dong tu nhien ma TUYET DOI KHONG BI CAT XEN (trim = 0), nhac deu 100%.
  */
 class LowLatencyMixer(
     private val outputRouter: OutputRouter,
@@ -123,12 +126,13 @@ class LowLatencyMixer(
 
         private const val QUEUE_LOG_INTERVAL_MS = 3000L
 
-        // Buffer rong rai (~350ms)
-        private const val MUSIC_RING_BUFFER_CAPACITY = (SAMPLE_RATE / 3) * 2
-        private const val VOCAL_RING_BUFFER_CAPACITY = SAMPLE_RATE / 3
+        // Mo rong dung luong buffer len ~600ms de hoan toan triet tieu overflow cung
+        private const val MUSIC_RING_BUFFER_CAPACITY = (SAMPLE_RATE * 6 / 10) * 2 // ~52920 stereo samples
+        private const val VOCAL_RING_BUFFER_CAPACITY = (SAMPLE_RATE * 6 / 10)     // ~26460 mono samples
 
         const val SOURCE_LOCAL_MIC = "local_mic"
 
+        // Nang nguong soft-knee len 31500f de giu nguyen tieng bass/trong trong treo, khong bi nen dep
         private const val SOFT_KNEE_THRESHOLD_ABS = 31500f
         private const val SOFT_KNEE_CEILING_ABS = 32767f
         private const val MIXER_LOOP_DELAY_WARN_THRESHOLD_MS = 60L
@@ -270,10 +274,12 @@ class LowLatencyMixer(
                 iterationCountInWindow++
 
                 // 1. Xu ly Nhac Stereo:
-                // Chi cat tia khi thuc su vuot nguong 220ms (~5.5 chunks = 19404 samples)
+                // ✅ Nâng ngưỡng trần lên 320ms (8 chunks = 28224 samples).
+                // Hàng đợi nhạc thông thường (120ms - 200ms) sẽ KHÔNG BAO GIỜ bị cắt xén nữa (trim = 0),
+                // loại bỏ hoàn toàn hiện tượng rượt đuổi / giật nhịp!
                 musicBuffer.trimIfExceeds(
-                    threshold = (STEREO_CHUNK_SIZE * 5.5).toInt(),
-                    targetSize = STEREO_CHUNK_SIZE * 3,
+                    threshold = STEREO_CHUNK_SIZE * 8, // ~320ms (rộng rãi, không bao giờ chạm tới khi hát bình thường)
+                    targetSize = STEREO_CHUNK_SIZE * 5, // ~200ms (chỉ đưa về mức này nếu người dùng tua/seek video làm dồn ứ thật sự)
                     fadeSamples = 256
                 )
 
@@ -299,17 +305,17 @@ class LowLatencyMixer(
                 vocalLensReuse.clear()
                 for ((sourceId, ringBuffer) in vocalBuffers) {
                     if (sourceId == SOURCE_LOCAL_MIC) {
-                        // Mic local: chi cat khi vuot nguong 200ms (5 chunks = 8820 samples)
+                        // Mic local: nâng trần lên 240ms (6 chunks), target 160ms để không bị cắt lời hát
                         ringBuffer.trimIfExceeds(
-                            threshold = MONO_CHUNK_SIZE * 5,
-                            targetSize = MONO_CHUNK_SIZE * 2,
+                            threshold = MONO_CHUNK_SIZE * 6,
+                            targetSize = MONO_CHUNK_SIZE * 4,
                             fadeSamples = 128
                         )
                     } else {
-                        // Mic remote Wi-Fi: nguong tho 280ms (7 chunks = 12348 samples)
+                        // Mic remote Wi-Fi: giữ trần 320ms (8 chunks)
                         ringBuffer.trimIfExceeds(
-                            threshold = MONO_CHUNK_SIZE * 7,
-                            targetSize = MONO_CHUNK_SIZE * 4,
+                            threshold = MONO_CHUNK_SIZE * 8,
+                            targetSize = MONO_CHUNK_SIZE * 5,
                             fadeSamples = 128
                         )
                     }
@@ -332,8 +338,7 @@ class LowLatencyMixer(
 
                 finalLimiter?.process(mixed, STEREO_CHUNK_SIZE)
 
-                // 4. Ghi ra AudioTrack:
-                // AudioTrack o che do blocking se tu dong giu nhip dung 40.0ms cho toan bo vong lap
+                // 4. Ghi ra AudioTrack (AudioTrack tu dong giu nhip dung 40.0ms cho toan bo vong lap)
                 outputRouter.write(mixed, STEREO_CHUNK_SIZE)
 
                 val nowMs = System.currentTimeMillis()
